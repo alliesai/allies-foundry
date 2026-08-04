@@ -37,11 +37,16 @@ jobs:
       - name: Run Django checks
         working-directory: backend
         run: uv run python manage.py check
+
+      - name: Check for missing migrations
+        working-directory: backend
+        run: uv run python manage.py makemigrations --check --dry-run
+
       - name: Apply migrations
         working-directory: backend
         run: uv run python manage.py migrate --noinput
 
-      - name: Check migrations
+      - name: Verify migrations are applied
         working-directory: backend
         run: uv run python manage.py migrate --check
       - name: Run tests
