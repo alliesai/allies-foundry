@@ -31,10 +31,11 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     outputs:
-      fastlane_sha: ${{ steps.record.outputs.fastlane_sha }}
+      fastlane_sha: ${{ needs.validate.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.validate.outputs.source_sha }}
           fetch-depth: 0
           token: ${{ secrets.PROMOTION_TOKEN }}
       - name: Configure Git
@@ -44,24 +45,23 @@ jobs:
       - name: Merge Fastlane into prod and tag release
         env:
           VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^v[0-9]+(\.[0-9]+)*([.-][A-Za-z0-9]+(\.[A-Za-z0-9]+)*)?$ ]] || { echo "Invalid version: $VERSION" >&2; exit 1; }
           git fetch origin --tags
           if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then echo "Tag already exists: $VERSION" >&2; exit 1; fi
           git checkout -B prod origin/prod
-          git merge origin/prod-fastlane --no-ff -m "chore: promote prod-fastlane → prod"
+          git merge "$SOURCE_SHA" --no-ff -m "chore: promote prod-fastlane → prod"
           git tag -a "$VERSION" -m "Release $VERSION"
           git push --atomic origin prod "$VERSION"
-      - name: Record Fastlane source SHA
-        id: record
-        run: echo "fastlane_sha=$(git rev-parse origin/prod-fastlane)" >> "$GITHUB_OUTPUT"
   backmerge:
     needs: promote
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.promote.outputs.fastlane_sha }}
           fetch-depth: 0
           token: ${{ secrets.PROMOTION_TOKEN }}
       - name: Open back-merge PR into dev
