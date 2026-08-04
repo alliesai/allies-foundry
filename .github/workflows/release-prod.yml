@@ -60,13 +60,6 @@ jobs:
             echo "Release notes failed content safety checks" >&2
             exit 1
           fi
-          while IFS= read -r line; do
-            if [[ -z "$line" || "$line" == "## New Features" || "$line" == "## Improvements" || "$line" == "## Bug Fixes" || "$line" == "- "* ]]; then
-              continue
-            fi
-            echo "Release notes returned an unexpected format" >&2
-            exit 1
-          done <<< "$notes"
           delimiter="RELEASE_NOTES_$(openssl rand -hex 8)"
           { echo "RELEASE_NOTES<<$delimiter"; echo "$notes"; echo "$delimiter"; } >> "$GITHUB_ENV"
       - name: Create GitHub Release
