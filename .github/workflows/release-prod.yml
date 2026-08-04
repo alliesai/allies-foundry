@@ -52,14 +52,21 @@ jobs:
             max_tokens: 600
           }')
           response=$(curl -fsS https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $OPENROUTER_API_KEY" -H "Content-Type: application/json" -H "X-Title: Allies release notes" -d "$payload")
-          notes=$(jq -er '.choices[0].message.content' <<< "$response")
-          notes=$(printf '%s' "$notes" | tr -d '\r')
-          [ -n "$notes" ] || { echo "Empty release notes returned" >&2; exit 1; }
-          [ "${#notes}" -le 12000 ] || { echo "Release notes exceed the size limit" >&2; exit 1; }
-          if printf '%s' "$notes" | grep -Eiq '(^|[^[:alnum:]])(ignore|disregard)[[:space:]]+(all|any|the|previous|above|these)[[:space:]]+(instructions|prompts)|system[[:space:]]+prompt|developer[[:space:]]+message|api[[:space:]]+key|private[[:space:]]+key|javascript:|<script|BEGIN[[:space:]].*PRIVATE[[:space:]]+KEY'; then
-            echo "Release notes failed content safety checks" >&2
-            exit 1
+          notes=$(jq -er '.choices[0].message.content' <<< "$response" | tr -d '\r')
+          fallback_notes=$'## Improvements\n- Release notes were generated with a safe fallback; see the associated commits for details.'
+          use_fallback=false
+          if [ -z "$notes" ] || [ "${#notes}" -gt 12000 ]; then use_fallback=true; fi
+          if printf '%s' "$notes" | grep -Eiq '(^|[^[:alnum:]])(ignore|disregard)[[:space:]]+(all|any|the|previous|above|these)[[:space:]]+(instructions|prompts)|system[[:space:]]+prompt|developer[[:space:]]+message|api[[:space:]]+key|private[[:space:]]+key|javascript:|<script|BEGIN[[:space:]].*PRIVATE[[:space:]]+KEY|https?://|www\.|\]\(|<[^>]*>'; then
+            use_fallback=true
           fi
+          while IFS= read -r line; do
+            if [[ -z "$line" || "$line" =~ ^##[[:space:]]+(New[[:space:]]+Features|Improvements|Bug[[:space:]]+Fixes)[[:space:]]*$ || "$line" =~ ^-[[:space:]]+.+$ ]]; then
+              continue
+            fi
+            use_fallback=true
+            break
+          done <<< "$notes"
+          if [ "$use_fallback" = true ]; then notes="$fallback_notes"; fi
           delimiter="RELEASE_NOTES_$(openssl rand -hex 8)"
           { echo "RELEASE_NOTES<<$delimiter"; echo "$notes"; echo "$delimiter"; } >> "$GITHUB_ENV"
       - name: Create GitHub Release
