@@ -404,6 +404,25 @@ def test_unresolved_leases_are_profile_scoped_but_different_profiles_can_overlap
         make_lease(make_attempt(same_profile_execution), token="token-third")
 
 
+def test_lease_creation_reports_generic_constraint_conflict(workspace, profiles):
+    first_attempt = make_attempt(make_execution(workspace, profiles[0]))
+    make_lease(first_attempt, token="duplicate-token")
+    second_attempt = make_attempt(
+        make_execution(workspace, profiles[1], key="request-2")
+    )
+
+    with pytest.raises(
+        RuntimeConflictError,
+        match="lease creation conflicts with an existing lease",
+    ):
+        create_lease(
+            second_attempt.id,
+            "duplicate-token",
+            timezone.now() + timedelta(minutes=1),
+            workspace.machine_generation,
+        )
+
+
 def test_create_lease_hashes_hex_shaped_raw_tokens(workspace, profiles):
     raw_token = "a" * 64
     attempt = make_attempt(make_execution(workspace, profiles[0]))

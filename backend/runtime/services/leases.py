@@ -162,7 +162,9 @@ def _create_lease_from_digest(
                 state=state,
             )
     except IntegrityError as exc:
-        raise RuntimeConflictError("profile already has an unresolved lease") from exc
+        raise RuntimeConflictError(
+            "lease creation conflicts with an existing lease"
+        ) from exc
 
 
 def authorize_attempt_mutation(
