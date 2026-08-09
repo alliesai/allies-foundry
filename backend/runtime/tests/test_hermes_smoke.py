@@ -234,6 +234,38 @@ def test_provider_lifecycle_adapter_retains_reserved_names_on_post_binding_failu
     assert adapter._reserved_volume_name == names.volume
 
 
+def test_provider_lifecycle_cleanup_promotes_binding_ids_after_inspection_failure():
+    class BrokenInspectProvider(FakeProvider):
+        def inspect_machine_by_id(self, app_name, machine_id):
+            raise RuntimeError("machine inspection unavailable")
+
+    provider = BrokenInspectProvider(machine())
+    adapter = ProviderLifecycleSmokeIntegration(
+        provider,
+        FakeLifecycle(binding()),
+        WORKSPACE_ID,
+        build_hermes_runtime_spec(
+            runtime_image="registry.example/runtime@sha256:" + "a" * 64
+        ),
+    )
+    reserved = adapter.reserve("promote-binding-ids")
+    with pytest.raises(RuntimeError, match="inspection unavailable"):
+        adapter.provision("promote-binding-ids")
+
+    ledger = owned_ledger()
+    ledger.record_snapshot(reserved)
+    result = asyncio.run(adapter.cleanup(ledger, deadline=9999999999))
+
+    assert result.status == "complete"
+    assert ledger.resources == {
+        "app": "app-id",
+        "volume": "volume-id",
+        "machine": "machine-id",
+    }
+    assert ("stop", "machine-id") in provider.calls
+    assert ("destroy", "machine-id") in provider.calls
+
+
 def test_provider_lifecycle_adapter_rejects_existing_smoke_namespace():
     class ExistingAppProvider(FakeProvider):
         def inspect_app(self, name, organization=None):

@@ -103,10 +103,20 @@ class UnixSocketCredentialResolver:
             client.settimeout(self.timeout)
             client.connect(self.socket_path)
             client.sendall((str(reference) + "\n").encode("utf-8"))
-            value = client.recv(4097)
-            if not value or len(value) > 4096:
+            received = bytearray()
+            value = None
+            while len(received) < 4097:
+                chunk = client.recv(4097 - len(received))
+                if not chunk:
+                    break
+                received.extend(chunk)
+                newline = received.find(b"\n")
+                if newline >= 0:
+                    value = bytes(received[: newline + 1])
+                    break
+            if value is None or not value or len(value) > 4096:
                 raise HermesAuthenticationError(
-                    "Hermes credential socket returned no credential"
+                    "Hermes credential socket returned an incomplete credential"
                 )
             try:
                 text = value.decode("utf-8")

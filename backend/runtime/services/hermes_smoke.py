@@ -398,6 +398,15 @@ class ProviderLifecycleSmokeIntegration:
     ) -> CleanupResult:
         """Stop/destroy only recorded IDs; 404 is an idempotent success."""
 
+        # A lifecycle binding is authoritative even when the post-binding
+        # inspection below fails. Promote those IDs over the provisional names
+        # reserved before provisioning so cleanup never falls back to deleting
+        # an unresolved name after the provider has returned real identities.
+        if self._binding is not None:
+            ledger.record("app", self._binding.app_ref)
+            ledger.record("volume", self._binding.volume_ref)
+            ledger.record("machine", self._binding.machine_ref)
+
         if not self._app_name:
             return CleanupResult(
                 "complete", (check("cleanup_owned_resources", "pass"),)
@@ -419,11 +428,20 @@ class ProviderLifecycleSmokeIntegration:
 
     def _clean_machine(self, machine_id: str) -> None:
         try:
-            machine = self._inspect_machine(machine_id)
+            try:
+                machine = self._inspect_machine(machine_id)
+            except Exception:
+                # Once lifecycle returned this exact ID, ownership is already
+                # established. If inspection is temporarily unavailable, use
+                # the authoritative ID directly; provisional names still
+                # fail closed below because they have no binding proof.
+                if self._binding is None or machine_id != self._binding.machine_ref:
+                    raise
+                machine = None
             if machine is None and machine_id == self._reserved_machine_name:
                 raise RuntimeError("smoke Machine ID could not be reconciled")
             resolved_id = machine.id if machine is not None else machine_id
-            if machine is not None and machine.state not in {
+            if machine is None or machine.state not in {
                 MachineState.STOPPED,
                 MachineState.DESTROYED,
             }:

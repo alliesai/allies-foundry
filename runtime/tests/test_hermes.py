@@ -59,6 +59,17 @@ class FakeCredentialSocket:
         self.closed = True
 
 
+class FragmentedCredentialSocket(FakeCredentialSocket):
+    def __init__(self):
+        super().__init__()
+        self.chunks = [b"test-", b"only-key\n"]
+        self.limits = []
+
+    def recv(self, limit):
+        self.limits.append(limit)
+        return self.chunks.pop(0) if self.chunks else b""
+
+
 def _client(monkeypatch, response):
     settings = load_settings({"HERMES_CREDENTIAL_REF": "ref://test"})
     calls = []
@@ -93,6 +104,22 @@ def test_unix_socket_credential_resolver_keeps_reference_opaque(monkeypatch):
     assert resolver(CredentialReference("vault://proof/key")) == "test-only-key"
     assert fake.connected == "/run/test.sock"
     assert fake.sent == b"vault://proof/key\n"
+    assert fake.closed
+
+
+def test_unix_socket_credential_resolver_reassembles_fragmented_response(monkeypatch):
+    import socket
+
+    fake = FragmentedCredentialSocket()
+    monkeypatch.setattr(socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(socket, "SOCK_STREAM", 2, raising=False)
+    monkeypatch.setattr(socket, "socket", lambda *args: fake)
+    resolver = UnixSocketCredentialResolver("/run/test.sock")
+
+    from allies_runtime.config import CredentialReference
+
+    assert resolver(CredentialReference("vault://proof/key")) == "test-only-key"
+    assert fake.limits == [4097, 4092]
     assert fake.closed
 
 
