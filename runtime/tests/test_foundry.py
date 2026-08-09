@@ -735,6 +735,17 @@ async def test_worker_validation_stop_and_fenced_claim():
 
 
 @pytest.mark.asyncio
+async def test_worker_run_contains_an_externally_cancelled_slot():
+    foundry, _ = client(None)
+    worker = FoundryWorker(foundry, FakeHermesClient())
+    task = asyncio.create_task(asyncio.sleep(1))
+    worker._active.add(task)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert await worker.run(max_turns=1) == (None,)
+
+
+@pytest.mark.asyncio
 async def test_worker_uses_non_incremental_hermes_fallback_and_handles_cancelled_task():
     class LegacyHermes(FakeHermesClient):
         stream_profile_incremental = None

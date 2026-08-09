@@ -122,6 +122,12 @@ def _claim_next_execution_once(
             raise RuntimeIdempotencyConflictError(
                 "claim_id belongs to a retired machine generation"
             )
+        # Once the original lease has expired, returning its deterministic
+        # token only hands the worker a claim that every mutation will reject.
+        # Let the caller drop the ambiguous reservation and request a fresh
+        # claim instead; the expired lease remains fenced by normal reclaim.
+        if lease.expires_at <= timezone.now():
+            return None
         return _claim_from_records(replay, lease)
 
     # Candidate IDs are read without locks.  Once a candidate is selected, all

@@ -276,6 +276,16 @@ def test_claim_replay_cannot_return_a_retired_generation(runtime_setup):
     assert claim is not None
 
 
+def test_expired_claim_replay_returns_no_stale_lease(runtime_setup):
+    _workspace, _profile, _execution, issued = runtime_setup
+    context = authenticate_runtime_token(issued.raw_token)
+    claim = claim_next_execution(context, uuid4(), 1)
+    Lease.objects.filter(pk=claim.lease_id).update(
+        expires_at=timezone.now() - timedelta(seconds=1)
+    )
+    assert claim_next_execution(context, claim.claim_id, 1) is None
+
+
 def test_non_retryable_failure_is_failed_not_succeeded(runtime_setup):
     _workspace, _profile, execution, issued = runtime_setup
     context = authenticate_runtime_token(issued.raw_token)

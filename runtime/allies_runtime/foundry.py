@@ -924,8 +924,11 @@ class FoundryWorker:
                 for task in done:
                     try:
                         results.append(task.result())
+                    except asyncio.CancelledError:
+                        results.append(None)
                     except Exception:  # noqa: BLE001 - one failed slot must not stop peers
                         results.append(None)
+                self._active.difference_update(done)
                 empty = 0
                 continue
             if self._ambiguous_claims:
