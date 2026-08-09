@@ -24,6 +24,7 @@ from runtime.providers import (
     ProviderError,
     ProviderNotFoundError,
     ProviderTerminalError,
+    ProviderUnsupportedTopologyError,
     WorkspaceResourceNames,
     deterministic_resource_names,
 )
@@ -193,7 +194,7 @@ def compose_live_smoke(
     if bootstrap_factory is None:
         raise LiveCompositionError("secure_profile_bootstrap_required")
     try:
-        from allies_runtime.config import load_settings
+        from allies_runtime.config import SettingsError, load_settings
         from allies_runtime.hermes import (
             TEST_CREDENTIAL_PREFIX,
             HermesClient,
@@ -214,7 +215,10 @@ def compose_live_smoke(
         )
     except (TypeError, ValueError) as exc:
         raise LiveCompositionError("workspace_id_invalid") from exc
-    settings = load_settings(values)
+    try:
+        settings = load_settings(values)
+    except SettingsError as exc:
+        raise LiveCompositionError("settings_validation_failed") from exc
     provider = (
         provider_factory(
             api_token=values["FLY_API_TOKEN"], multi_container_enabled=True
@@ -229,8 +233,14 @@ def compose_live_smoke(
         raise LiveCompositionError("provider_capability_gate_missing")
     try:
         preflight()
-    except Exception as exc:
+    except ProviderUnsupportedTopologyError as exc:
         raise LiveCompositionError("multi_container_capability_required") from exc
+    except ProviderError as exc:
+        # Preserve the provider's sanitized classification so an auth,
+        # timeout, or API failure is not reported as a capability problem.
+        raise LiveCompositionError(f"provider_preflight_{exc.code}") from exc
+    except Exception as exc:
+        raise LiveCompositionError("provider_preflight_failed") from exc
     spec = build_hermes_runtime_spec(
         runtime_image=runtime_image,
         runtime_credential_ref=values.get("HERMES_CREDENTIAL_REF"),
@@ -490,22 +500,25 @@ class ProviderLifecycleSmokeIntegration:
             # endpoint is idempotent and can distinguish an already-gone ID.
             self.provider.delete_volume(self._app_name, volume_ref)
             return
-        matches = [
-            volume
-            for volume in volumes
-            if volume.id == volume_ref or volume.name == volume_ref
-        ]
-        if not matches:
-            if volume_ref == self._reserved_volume_name:
-                raise RuntimeError("smoke Volume ID could not be reconciled")
-            # The lifecycle may have returned an authoritative volume ID that
-            # is no longer visible in the list response.  Attempt that ID
-            # directly; a provider 404 remains an idempotent ledger success.
-            self.provider.delete_volume(self._app_name, volume_ref)
-            return
-        if len(matches) > 1 and not any(volume.id == volume_ref for volume in matches):
-            raise RuntimeError("smoke volume ownership is ambiguous")
-        self.provider.delete_volume(self._app_name, matches[0].id)
+        exact_id = next((volume for volume in volumes if volume.id == volume_ref), None)
+        if exact_id is not None:
+            target = exact_id
+        else:
+            name_matches = tuple(
+                volume for volume in volumes if volume.name == volume_ref
+            )
+            if not name_matches:
+                if volume_ref == self._reserved_volume_name:
+                    raise RuntimeError("smoke Volume ID could not be reconciled")
+                # The lifecycle may have returned an authoritative volume ID that
+                # is no longer visible in the list response.  Attempt that ID
+                # directly; a provider 404 remains an idempotent ledger success.
+                self.provider.delete_volume(self._app_name, volume_ref)
+                return
+            if len(name_matches) > 1:
+                raise RuntimeError("smoke volume ownership is ambiguous")
+            target = name_matches[0]
+        self.provider.delete_volume(self._app_name, target.id)
 
     @staticmethod
     def _has_required_containers(machine: Any) -> bool:

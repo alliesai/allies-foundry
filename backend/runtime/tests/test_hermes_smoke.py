@@ -12,6 +12,7 @@ from runtime.providers import (
     MachineHealth,
     MachineRecord,
     MachineState,
+    ProviderTimeoutError,
     deterministic_resource_names,
 )
 from runtime.services.hermes_smoke import (
@@ -389,6 +390,37 @@ def test_provider_lifecycle_adapter_marks_unresolved_reserved_resources_incomple
     assert result.status == "incomplete"
 
 
+def test_provider_lifecycle_cleanup_prefers_exact_volume_id_over_name_collision():
+    class CollidingVolumeProvider(FakeProvider):
+        def list_volumes(self, app_name):
+            return [
+                type(
+                    "Volume",
+                    (),
+                    {"id": "volume-id", "name": "other-volume"},
+                )(),
+                type(
+                    "Volume",
+                    (),
+                    {"id": "other-id", "name": "volume-id"},
+                )(),
+            ]
+
+    provider = CollidingVolumeProvider(machine())
+    adapter = ProviderLifecycleSmokeIntegration(
+        provider,
+        FakeLifecycle(binding()),
+        WORKSPACE_ID,
+        build_hermes_runtime_spec(
+            runtime_image="registry.example/runtime@sha256:" + "2" * 64
+        ),
+    )
+    adapter._app_name = "allies-ws-test"
+    adapter._clean_volume("volume-id")
+    assert ("delete-volume", "volume-id") in provider.calls
+    assert ("delete-volume", "other-id") not in provider.calls
+
+
 def live_env():
     return {
         "FND004_LIVE_SMOKE": "1",
@@ -473,4 +505,32 @@ def test_live_composition_requires_opaque_reference_and_runtime_image():
             bootstrap_factory=lambda: object(),
             credential_resolver=lambda _: "test-only-key",
             provider_factory=lambda **kwargs: FakeProvider(machine()),
+        )
+
+
+def test_live_composition_classifies_provider_preflight_failures():
+    class FailingProvider(FakeProvider):
+        def preflight(self):
+            raise ProviderTimeoutError("Fly preflight timed out")
+
+    with pytest.raises(
+        LiveCompositionError, match="provider_preflight_provider_timeout"
+    ):
+        compose_live_smoke(
+            WORKSPACE_ID,
+            env=live_env(),
+            provider_factory=lambda **kwargs: FailingProvider(machine()),
+            bootstrap_factory=lambda: object(),
+            credential_resolver=lambda _: "test-only-key",
+        )
+
+
+def test_live_composition_classifies_settings_validation_failures():
+    with pytest.raises(LiveCompositionError, match="settings_validation_failed"):
+        compose_live_smoke(
+            WORKSPACE_ID,
+            env={**live_env(), "HERMES_REQUEST_TIMEOUT": "61"},
+            provider_factory=lambda **kwargs: FakeProvider(machine()),
+            bootstrap_factory=lambda: object(),
+            credential_resolver=lambda _: "test-only-key",
         )
