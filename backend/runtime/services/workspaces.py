@@ -510,7 +510,14 @@ class WorkspaceLifecycle:
                     MachineState.STOPPED,
                     MachineState.DESTROYED,
                 ):
-                    self.provider.stop_machine(app_name, previous)
+                    try:
+                        self.provider.stop_machine(app_name, previous)
+                    except ProviderNotFoundError:
+                        # A stop can succeed before its response is lost.  A
+                        # 404 for the recorded Machine is therefore an
+                        # idempotent success, not a terminal replacement
+                        # failure.
+                        existing = None
                     self._wait_machine_stopped(
                         app_name,
                         previous,
@@ -536,7 +543,12 @@ class WorkspaceLifecycle:
                         volume_id,
                         claim,
                     )
-                    self.provider.destroy_machine(app_name, previous)
+                    try:
+                        self.provider.destroy_machine(app_name, previous)
+                    except ProviderNotFoundError:
+                        # The recorded Machine is already gone; continue to
+                        # the authoritative Volume-detachment reconciliation.
+                        pass
             volume = self._volume_by_id(app_name, volume_id, spec)
             if volume.attached_machine_id:
                 if volume.attached_machine_id != previous:
@@ -637,11 +649,16 @@ class WorkspaceLifecycle:
         self, app_name: str, machine_id: str
     ) -> MachineRecord | None:
         inspect = getattr(self.provider, "inspect_machine_by_id", None)
-        if inspect:
-            return inspect(app_name, machine_id)
-        # Protocol implementations may only support deterministic-name lookup;
-        # use the recorded ID as a safe best-effort fallback.
-        return self.provider.inspect_machine(app_name, machine_id)
+        try:
+            if inspect:
+                return inspect(app_name, machine_id)
+            # Protocol implementations may only support deterministic-name
+            # lookup; use the recorded ID as a safe best-effort fallback.
+            return self.provider.inspect_machine(app_name, machine_id)
+        except ProviderNotFoundError:
+            # A provider 404 is the authoritative absence signal for a
+            # recorded Machine and is safe to reconcile as already gone.
+            return None
 
     def _wait_healthy(
         self,

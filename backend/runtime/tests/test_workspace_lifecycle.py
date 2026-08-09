@@ -12,6 +12,7 @@ from runtime.providers import (
     MachineRecord,
     MachineState,
     OwnershipMetadata,
+    ProviderNotFoundError,
     ProviderOwnershipError,
     VolumeRecord,
     deterministic_resource_names,
@@ -35,6 +36,8 @@ class FakeProvider:
         self.stop_ack_only = False
         self.stop_inspections = 0
         self.reject_destroy_while_running = False
+        self.stop_404_after_inspect = False
+        self.destroy_404_after_inspect = False
 
     def ensure_app(self, spec):
         self.calls.append("ensure_app")
@@ -107,6 +110,9 @@ class FakeProvider:
 
     def stop_machine(self, app_name, machine_id):
         self.calls.append("stop_machine")
+        if self.stop_404_after_inspect:
+            self._remove_machine(machine_id)
+            raise ProviderNotFoundError("Machine already stopped")
         if self.stop_ack_only:
             return self.machines[machine_id]
         return self._set_machine(machine_id, MachineState.STOPPED)
@@ -120,16 +126,10 @@ class FakeProvider:
             MachineState.DESTROYED,
         ):
             raise AssertionError("destroyed a Machine before it stopped")
-        self.machines.pop(machine_id, None)
-        self.volume = VolumeRecord(
-            self.volume.id,
-            self.volume.name,
-            self.volume.app_name,
-            self.volume.region,
-            self.volume.size_gb,
-            None,
-            self.volume.ownership,
-        )
+        if self.destroy_404_after_inspect:
+            self._remove_machine(machine_id)
+            raise ProviderNotFoundError("Machine already destroyed")
+        self._remove_machine(machine_id)
 
     def wait_machine(self, app_name, machine_id, *, timeout_seconds):
         self.calls.append("wait_machine")
@@ -169,6 +169,18 @@ class FakeProvider:
         )
         self.machines[machine_id] = machine
         return machine
+
+    def _remove_machine(self, machine_id):
+        self.machines.pop(machine_id, None)
+        self.volume = VolumeRecord(
+            self.volume.id,
+            self.volume.name,
+            self.volume.app_name,
+            self.volume.region,
+            self.volume.size_gb,
+            None,
+            self.volume.ownership,
+        )
 
 
 def spec():
@@ -253,6 +265,34 @@ def test_replace_waits_for_authoritative_stop_before_destroying_machine():
 
     assert replaced.machine_generation == 2
     assert provider.stop_inspections >= 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stop_404_after_inspection_is_reconciled_as_already_gone():
+    provider = FakeProvider()
+    provider.stop_404_after_inspect = True
+    lifecycle = WorkspaceLifecycle(provider, sleep=lambda _: None, jitter=False)
+    initial = Workspace.objects.create(id=WORKSPACE_ID, tenant_ref="tenant-stop-404")
+
+    lifecycle.ensure_workspace(initial.id, spec())
+    replaced = lifecycle.replace_machine(initial.id, spec(), 1)
+
+    assert replaced.machine_generation == 2
+    assert "destroy_machine" not in provider.calls
+
+
+@pytest.mark.django_db(transaction=True)
+def test_destroy_404_after_inspection_is_reconciled_as_already_gone():
+    provider = FakeProvider()
+    provider.destroy_404_after_inspect = True
+    lifecycle = WorkspaceLifecycle(provider, sleep=lambda _: None, jitter=False)
+    initial = Workspace.objects.create(id=WORKSPACE_ID, tenant_ref="tenant-destroy-404")
+
+    lifecycle.ensure_workspace(initial.id, spec())
+    replaced = lifecycle.replace_machine(initial.id, spec(), 1)
+
+    assert replaced.machine_generation == 2
+    assert provider.calls.count("destroy_machine") == 1
 
 
 @pytest.mark.django_db(transaction=True)
