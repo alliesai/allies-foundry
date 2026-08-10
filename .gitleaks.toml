@@ -2,8 +2,3 @@ title = "Allies Foundry Gitleaks configuration"
 
 [extend]
 useDefault = true
-
-[[allowlists]]
-description = "Deterministic non-secret FND-006 profile-key test vector"
-regexTarget = "match"
-regexes = ['''ally-v1-12345678123456781234567812345678''']
