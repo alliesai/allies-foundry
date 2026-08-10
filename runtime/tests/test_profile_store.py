@@ -19,6 +19,7 @@ from allies_runtime.profile_store import (
     ProfileStore,
     ProfileStoreError,
     _process_is_alive,
+    _read_lock_metadata,
     derive_profile_key,
     inspect_profile,
     validate_profile_key,
@@ -851,6 +852,18 @@ def test_live_lock_check_does_not_signal_the_process_on_windows(monkeypatch):
     monkeypatch.setattr("allies_runtime.profile_store.os.kill", unexpected_kill)
 
     assert _process_is_alive(os.getpid()) is True
+    assert _process_is_alive(0) is False
+
+
+def test_lock_metadata_rejects_missing_and_invalid_shapes(tmp_path):
+    lock = tmp_path / "profile.lock"
+    assert _read_lock_metadata(lock) is None
+
+    lock.write_text("[]", encoding="ascii")
+    assert _read_lock_metadata(lock) is None
+
+    lock.write_text('{"pid":true,"nonce":"invalid"}', encoding="ascii")
+    assert _read_lock_metadata(lock) is None
 
 
 def test_profile_store_reports_lock_timeout(tmp_path):
