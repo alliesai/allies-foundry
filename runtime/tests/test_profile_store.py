@@ -10,6 +10,7 @@ from threading import Event, Lock
 
 import pytest
 
+import allies_runtime.profile_store as profile_store_module
 from allies_runtime.profile_store import (
     HERMES_PROFILE_DIRECTORIES,
     MANIFEST_NAME,
@@ -162,6 +163,37 @@ def test_read_api_key_rejects_symlinked_secret_file(tmp_path):
         pytest.skip("symlinks are unavailable")
 
     with pytest.raises(ProfileStoreError, match="profile API key is unavailable"):
+        store.read_api_key(seed.hermes_profile_key or "")
+
+
+def test_read_api_key_rejects_file_replaced_between_inspection_and_open(
+    tmp_path, monkeypatch
+):
+    store = make_store(tmp_path)
+    seed = make_seed()
+    store.materialize(seed)
+    profile = profile_path(store, seed)
+    env_path = profile / ".env"
+    replacement = profile / ".env-replacement"
+    original = profile / ".env-original"
+    replacement.write_text(
+        "API_SERVER_KEY=attacker-controlled-key-0123456789\n", encoding="utf-8"
+    )
+    replacement.chmod(0o600)
+    original_open = profile_store_module.os.open
+    replaced = False
+
+    def replace_before_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if Path(path) == env_path and not replaced:
+            replaced = True
+            env_path.replace(original)
+            replacement.replace(env_path)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(profile_store_module.os, "open", replace_before_open)
+
+    with pytest.raises(ProfileStoreError, match="API key is unavailable"):
         store.read_api_key(seed.hermes_profile_key or "")
 
 
@@ -853,6 +885,7 @@ def test_live_lock_check_does_not_signal_the_process_on_windows(monkeypatch):
 
     assert _process_is_alive(os.getpid()) is True
     assert _process_is_alive(0) is False
+    assert _process_is_alive(0x1_0000_0000) is True
 
 
 def test_lock_metadata_rejects_missing_and_invalid_shapes(tmp_path):
@@ -863,6 +896,11 @@ def test_lock_metadata_rejects_missing_and_invalid_shapes(tmp_path):
     assert _read_lock_metadata(lock) is None
 
     lock.write_text('{"pid":true,"nonce":"invalid"}', encoding="ascii")
+    assert _read_lock_metadata(lock) is None
+
+    lock.write_text(
+        '{"pid":4294967296,"nonce":"0123456789abcdef01234567"}', encoding="ascii"
+    )
     assert _read_lock_metadata(lock) is None
 
 

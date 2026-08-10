@@ -591,6 +591,8 @@ def _process_is_alive(pid: int) -> bool:
     """Return false only when the operating system confirms that ``pid`` is gone."""
 
     if os.name == "nt":
+        if pid > 0xFFFFFFFF:
+            return True
         return _windows_process_is_alive(pid)
 
     try:
@@ -622,7 +624,10 @@ def _windows_process_is_alive(pid: int) -> bool:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
 
-    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    try:
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    except (OverflowError, TypeError, ValueError):
+        return True
     if not handle:
         return ctypes.get_last_error() != invalid_parameter
     try:
@@ -648,7 +653,7 @@ def _read_lock_metadata(path: Path) -> tuple[int, str] | None:
     if (
         isinstance(pid, bool)
         or not isinstance(pid, int)
-        or pid <= 0
+        or not 0 < pid <= 0xFFFFFFFF
         or not isinstance(nonce, str)
         or not re.fullmatch(r"[0-9a-f]{24}", nonce)
     ):
@@ -824,12 +829,27 @@ class ProfileStore:
             with self._lock(key):
                 profile = self._profile_path(key)
                 env_path = profile / ".env"
-                if not _is_directory(profile) or not _is_regular_file(env_path):
+                if not _is_directory(profile):
                     raise ProfileStoreError("profile API key is unavailable")
                 info = env_path.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise ProfileStoreError("profile API key is unavailable")
                 if os.name != "nt" and info.st_mode & 0o077:
                     raise ProfileStoreError("profile API key is unavailable")
-                encoded = env_path.read_bytes()
+                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(env_path, flags)
+                try:
+                    opened = os.fstat(descriptor)
+                    if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(
+                        info, opened
+                    ):
+                        raise ProfileStoreError("profile API key is unavailable")
+                    if os.name != "nt" and opened.st_mode & 0o077:
+                        raise ProfileStoreError("profile API key is unavailable")
+                    encoded = os.read(descriptor, MAX_PROFILE_TEXT_BYTES + 1)
+                finally:
+                    os.close(descriptor)
                 if len(encoded) > MAX_PROFILE_TEXT_BYTES:
                     raise ProfileStoreError("profile API key is unavailable")
                 content = encoded.decode("utf-8")

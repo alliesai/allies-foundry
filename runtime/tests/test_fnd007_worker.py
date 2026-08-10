@@ -14,7 +14,11 @@ from allies_runtime.foundry import (
     StoppedReceipt,
     TerminalReceipt,
 )
-from allies_runtime.hermes import CancellableHermesStream, HermesEvent
+from allies_runtime.hermes import (
+    MAX_MESSAGE_BYTES,
+    CancellableHermesStream,
+    HermesEvent,
+)
 
 
 def claim(*, conversation_id: str | None = None, session_id: str | None = None):
@@ -202,8 +206,14 @@ async def test_bound_turn_rejects_conflicting_conversation_before_dispatch():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "message",
-    [None, "", {"text": "wrong"}, "x" * (256 * 1024 + 1)],
-    ids=["none", "empty", "mapping", "oversized"],
+    [
+        None,
+        "",
+        {"text": "wrong"},
+        "x" * (MAX_MESSAGE_BYTES + 1),
+        "é" * (MAX_MESSAGE_BYTES // 2 + 1),
+    ],
+    ids=["none", "empty", "mapping", "oversized-ascii", "oversized-multibyte"],
 )
 async def test_execution_message_must_be_a_bounded_string(message):
     foundry = RecordingFoundry()
@@ -289,6 +299,4 @@ async def test_unbound_turn_fails_if_session_operations_are_unavailable():
     result = await FoundryWorker(foundry, StreamOnlyHermes()).run_claim(claim())
 
     assert result.status == "failed"
-    assert [event["event_type"] for event in foundry.events] == [
-        "execution.dispatched"
-    ]
+    assert [event["event_type"] for event in foundry.events] == ["execution.dispatched"]

@@ -39,6 +39,7 @@ MAX_EVENTS = 512
 MAX_STREAM_BYTES = 4 * 1_048_576
 MAX_EVENT_BYTES = 256 * 1_024
 MAX_SAFE_TEXT_BYTES = 16 * 1024
+MAX_MESSAGE_BYTES = 16 * 1024
 DEFAULT_CREDENTIAL_SOCKET = "/run/allies-runtime/hermes-credential.sock"
 MAX_CREDENTIAL_SOCKET_PATH = 100
 TEST_CREDENTIAL_PREFIX = "test://fnd004/"
@@ -79,6 +80,18 @@ class HermesSession:
 class StableSessionIdentifiers:
     candidate_id: str
     session_key: str
+
+
+def validate_stream_message(message: str) -> str:
+    """Validate the one bounded UTF-8 message accepted by Hermes."""
+
+    try:
+        encoded = message.encode("utf-8")
+    except (AttributeError, UnicodeError):
+        raise ValueError("Hermes stream message must be bounded UTF-8 text") from None
+    if not message or len(encoded) > MAX_MESSAGE_BYTES:
+        raise ValueError("Hermes stream message must be bounded UTF-8 text")
+    return message
 
 
 def stable_session_identifiers(
@@ -185,7 +198,16 @@ class _IncrementalHTTPStream:
         if self.closed or self.done:
             raise StopAsyncIteration
         while True:
-            line = await asyncio.to_thread(self.response.readline, MAX_EVENT_BYTES + 1)
+            try:
+                line = await asyncio.to_thread(
+                    self.response.readline, MAX_EVENT_BYTES + 1
+                )
+            except TimeoutError as exc:
+                await self.aclose()
+                raise HermesTimeout("Hermes stream read timed out") from exc
+            except (OSError, ConnectionError) as exc:
+                await self.aclose()
+                raise HermesDisconnected("Hermes stream disconnected") from exc
             if not line:
                 if self.data_lines:
                     event = self._finish_event()
@@ -676,7 +698,7 @@ class HermesClient:
         if resolver is None:
             return await self._credential()
         try:
-            value = resolver(profile_id)
+            value = await asyncio.to_thread(resolver, profile_id)
             if inspect.isawaitable(value):
                 value = await value
         except HermesError:
@@ -846,8 +868,7 @@ class HermesClient:
 
         profile_id = _profile_path(profile_id)
         session_id = _session_path(session_id)
-        if not isinstance(message, str) or not message or len(message) > 16_384:
-            raise ValueError("Hermes stream message must be a bounded non-empty string")
+        message = validate_stream_message(message)
         try:
             token = await asyncio.wait_for(
                 self._profile_credential(profile_id), self.settings.stream_timeout
@@ -953,8 +974,7 @@ class HermesClient:
 
         profile_id = _profile_path(profile_id)
         session_id = _session_path(session_id)
-        if not isinstance(message, str) or not message or len(message) > 16_384:
-            raise ValueError("Hermes stream message must be a bounded non-empty string")
+        message = validate_stream_message(message)
         try:
             token = await asyncio.wait_for(
                 self._profile_credential(profile_id), self.settings.stream_timeout
@@ -992,6 +1012,7 @@ class HermesClient:
 
 __all__ = [
     "DEFAULT_CREDENTIAL_SOCKET",
+    "MAX_MESSAGE_BYTES",
     "TEST_CREDENTIAL_PREFIX",
     "CancellableHermesStream",
     "CredentialResolver",
@@ -1004,4 +1025,5 @@ __all__ = [
     "UnixSocketCredentialResolver",
     "stable_session_identifiers",
     "test_credential_for_reference",
+    "validate_stream_message",
 ]

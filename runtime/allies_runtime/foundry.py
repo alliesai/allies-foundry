@@ -22,7 +22,7 @@ from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from .errors import HermesError, HermesMalformedResponse
-from .hermes import HermesEvent, stable_session_identifiers
+from .hermes import HermesEvent, stable_session_identifiers, validate_stream_message
 
 MAX_CLAIM_SLOTS = 8
 LEASE_SECONDS = 60.0
@@ -1016,12 +1016,9 @@ class FoundryWorker:
         renewal: asyncio.Task[Any] | None = None
         sequence = 0
         try:
-            message = claim.payload.get("message")
-            if (
-                not isinstance(message, str)
-                or not message
-                or len(message.encode("utf-8")) > 256 * 1024
-            ):
+            try:
+                message = validate_stream_message(claim.payload.get("message"))
+            except ValueError:
                 raise InvalidRequestError("Execution message was invalid")
             input_conversation = claim.payload.get("cloud_conversation_ref")
             if claim.conversation_id is None:

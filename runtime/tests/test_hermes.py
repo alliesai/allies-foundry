@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from threading import Event
 from urllib.error import HTTPError
 
 import pytest
@@ -198,6 +199,29 @@ async def test_profile_session_create_uses_selected_profile_credential(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_profile_credential_resolution_does_not_block_the_event_loop():
+    started = Event()
+    release = Event()
+
+    def resolver(_profile_id):
+        started.set()
+        assert release.wait(1)
+        return "profile-a-key"
+
+    client = HermesClient(
+        load_settings({"HERMES_CREDENTIAL_REF": "ref://bootstrap"}),
+        lambda ref: "bootstrap-key",
+        profile_credential_resolver=resolver,
+    )
+    task = asyncio.create_task(client._profile_credential("ally-a"))
+
+    assert await asyncio.to_thread(started.wait, 0.5)
+    release.set()
+
+    assert await task == "profile-a-key"
+
+
+@pytest.mark.asyncio
 async def test_profile_session_conflict_requires_exact_inspection(monkeypatch):
     existing = FakeResponse(
         json.dumps(
@@ -368,6 +392,47 @@ async def test_incremental_stream_fails_closed_on_incomplete_unknown_or_changed_
     stream = _IncrementalHTTPStream(Response(), "ally-a", "s1")
     with pytest.raises(HermesMalformedResponse):
         [event async for event in stream]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (TimeoutError("private"), HermesTimeout),
+        (OSError("private"), HermesDisconnected),
+    ],
+    ids=["timeout", "disconnect"],
+)
+async def test_incremental_stream_classifies_and_closes_read_failures(
+    failure, expected
+):
+    class Response:
+        def __init__(self):
+            self.rows = iter(
+                [
+                    b"event: run.started\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                ]
+            )
+            self.closed = False
+
+        def readline(self, _limit):
+            try:
+                return next(self.rows)
+            except StopIteration:
+                raise failure from None
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    stream = _IncrementalHTTPStream(response, "ally-a", "s1")
+
+    with pytest.raises(expected):
+        await stream.__anext__()
+
+    assert response.closed is True
 
 
 def test_incremental_state_machine_rejects_each_invalid_transition():
