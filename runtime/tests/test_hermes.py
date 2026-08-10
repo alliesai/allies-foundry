@@ -289,7 +289,7 @@ async def test_incremental_stream_normalizes_safe_events_and_terminal_rotation()
                     b'data: {"session_id":"s1","run_id":"r1","tool_name":"terminal","preview":"drop"}\n',
                     b"\n",
                     b"event: assistant.completed\n",
-                    b'data: {"session_id":"s1","run_id":"r1","content":"drop"}\n',
+                    b'data: {"session_id":"s2","run_id":"r1","content":"drop"}\n',
                     b"\n",
                     b"event: run.completed\n",
                     b'data: {"session_id":"s2","run_id":"r1","completed":true,"messages":["drop"]}\n',
@@ -390,6 +390,11 @@ def test_incremental_state_machine_rejects_each_invalid_transition():
     current._normalize_event("run.started", {"session_id": "s1", "run_id": "r1"})
     with pytest.raises(HermesMalformedResponse, match="started out of order"):
         current._normalize_event("run.started", {"session_id": "s1", "run_id": "r1"})
+    with pytest.raises(HermesMalformedResponse, match="completion session"):
+        current._normalize_event(
+            "assistant.completed",
+            {"session_id": "bad/session", "run_id": "r1"},
+        )
     with pytest.raises(HermesError, match="turn failure"):
         current._normalize_event("error", {"session_id": "s1", "run_id": "r1"})
     with pytest.raises(HermesMalformedResponse, match="delta"):

@@ -309,12 +309,21 @@ class _IncrementalHTTPStream:
 
         if self.state != "running":
             raise HermesMalformedResponse("Hermes event arrived after run completion")
-        if name != "run.completed" and payload_session != self.session_id:
+        if name not in {"assistant.completed", "run.completed"} and (
+            payload_session != self.session_id
+        ):
             raise HermesMalformedResponse(
                 "Hermes event session identity did not match request"
             )
 
         if name in {"message.started", "assistant.completed"}:
+            if name == "assistant.completed" and (
+                not isinstance(payload_session, str)
+                or not _SESSION_ID.fullmatch(payload_session)
+            ):
+                raise HermesMalformedResponse(
+                    "Hermes assistant completion session was invalid"
+                )
             return None
         if name == "error":
             raise HermesError("Hermes reported a turn failure")
