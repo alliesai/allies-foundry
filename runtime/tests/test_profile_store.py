@@ -15,6 +15,7 @@ from allies_runtime.profile_store import (
     HERMES_PROFILE_DIRECTORIES,
     MANIFEST_NAME,
     ProfileCleanupStatus,
+    ProfileInputError,
     ProfileProvisionStatus,
     ProfileSeed,
     ProfileStore,
@@ -196,6 +197,29 @@ def test_read_api_key_rejects_file_replaced_between_inspection_and_open(
     with pytest.raises(ProfileStoreError, match="API key is unavailable"):
         store.read_api_key(seed.hermes_profile_key or "")
 
+    env_path.write_text("API_SERVER_KEY=short\n", encoding="utf-8")
+    env_path.chmod(0o600)
+    with pytest.raises(ProfileStoreError, match="API key is unavailable"):
+        store.read_api_key(seed.hermes_profile_key or "")
+
+    with pytest.raises(ProfileInputError):
+        store.read_api_key("bad/key")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-path regression")
+def test_read_api_key_rejects_opened_file_outside_profile(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    seed = make_seed()
+    store.materialize(seed)
+    monkeypatch.setattr(
+        profile_store_module,
+        "_windows_final_path",
+        lambda _descriptor: os.path.normcase(str(tmp_path / "outside.env")),
+    )
+
+    with pytest.raises(ProfileStoreError, match="API key is unavailable"):
+        store.read_api_key(seed.hermes_profile_key or "")
+
 
 def test_read_api_key_rejects_profile_directory_replaced_before_file_open(
     tmp_path, monkeypatch
@@ -219,17 +243,50 @@ def test_read_api_key_rejects_profile_directory_replaced_before_file_open(
         if Path(path) == profile / ".env" and not replaced:
             replaced = True
             profile.replace(original)
-            try:
-                profile.symlink_to(outside, target_is_directory=True)
-            except (NotImplementedError, OSError):
-                original.replace(profile)
-                pytest.skip("directory symlinks are unavailable")
+            outside.replace(profile)
         return original_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(profile_store_module.os, "open", replace_parent_before_open)
 
     with pytest.raises(ProfileStoreError, match="API key is unavailable"):
         store.read_api_key(seed.hermes_profile_key or "")
+
+
+def test_read_api_key_rejects_non_directory_profile_and_oversized_secret(tmp_path):
+    store = make_store(tmp_path)
+    seed = make_seed()
+    store.materialize(seed)
+    profile = profile_path(store, seed)
+    original = profile.with_name(f"{profile.name}-original")
+    profile.replace(original)
+    profile.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(ProfileStoreError, match="API key is unavailable"):
+        store.read_api_key(seed.hermes_profile_key or "")
+
+    profile.unlink()
+    original.replace(profile)
+    env_path = profile / ".env"
+    env_path.write_bytes(
+        b"API_SERVER_KEY=" + b"x" * profile_store_module.MAX_PROFILE_TEXT_BYTES + b"\n"
+    )
+    env_path.chmod(0o600)
+
+    with pytest.raises(ProfileStoreError, match="API key is unavailable"):
+        store.read_api_key(seed.hermes_profile_key or "")
+
+
+def test_read_api_key_sanitizes_profile_lock_timeout(tmp_path):
+    store = make_store(tmp_path, lock_timeout_seconds=0.01)
+    seed = make_seed()
+    store.materialize(seed)
+    local_lock = store._local_lock(seed.hermes_profile_key or "")
+    assert local_lock.acquire(timeout=0.01)
+    try:
+        with pytest.raises(ProfileStoreError, match="API key is unavailable"):
+            store.read_api_key(seed.hermes_profile_key or "")
+    finally:
+        local_lock.release()
 
 
 def test_repeat_and_machine_replacement_are_existing_and_stable(tmp_path):

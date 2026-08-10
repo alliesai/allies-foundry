@@ -620,6 +620,35 @@ def _read_bounded_descriptor(descriptor: int) -> bytes:
     return bytes(content)
 
 
+def _windows_final_path(descriptor: int) -> str:
+    """Return the normalized final path of an already-open Windows file."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32_768)
+    length = kernel32.GetFinalPathNameByHandleW(
+        msvcrt.get_osfhandle(descriptor), buffer, len(buffer), 0
+    )
+    if length == 0 or length >= len(buffer):
+        raise OSError("opened profile path could not be verified")
+    path = buffer.value
+    if path.startswith("\\\\?\\UNC\\"):
+        path = f"\\\\{path[8:]}"
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.abspath(path))
+
+
 def _read_profile_env(profile: Path) -> bytes:
     """Read ``.env`` without following a replaced profile directory on Linux."""
 
@@ -641,7 +670,12 @@ def _read_profile_env(profile: Path) -> bytes:
             ):
                 raise ProfileStoreError(unavailable)
             opened = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or not os.path.samestat(info, opened):
+            expected_path = os.path.normcase(os.path.abspath(profile / ".env"))
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or not os.path.samestat(info, opened)
+                or _windows_final_path(descriptor) != expected_path
+            ):
                 raise ProfileStoreError(unavailable)
             return _read_bounded_descriptor(descriptor)
         finally:
