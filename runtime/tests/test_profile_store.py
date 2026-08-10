@@ -117,6 +117,52 @@ def test_first_publish_exact_layout_manifest_and_secret_permissions(tmp_path):
     assert PROFILE_SECRET not in json.dumps(receipt.to_dict())
 
 
+def test_read_api_key_returns_only_the_selected_materialized_profile(tmp_path):
+    store = make_store(tmp_path, key_factory=lambda: "profile-a-secret")
+    first = make_seed()
+    second = make_seed(OTHER_PROFILE_ID, operation_id="provision-2")
+
+    store.materialize(first)
+    store.api_key_factory = lambda: "profile-b-secret"
+    store.materialize(second)
+
+    assert store.read_api_key(first.hermes_profile_key or "") == "profile-a-secret"
+    assert store.read_api_key(second.hermes_profile_key or "") == "profile-b-secret"
+
+
+def test_read_api_key_rejects_unsafe_or_incomplete_secret_files(tmp_path):
+    store = make_store(tmp_path)
+    seed = make_seed()
+    store.materialize(seed)
+    env_path = profile_path(store, seed) / ".env"
+
+    env_path.write_text("OPENAI_API_KEY=provider-only\n", encoding="utf-8")
+
+    with pytest.raises(
+        ProfileStoreError, match="profile API key is unavailable"
+    ) as error:
+        store.read_api_key(seed.hermes_profile_key or "")
+
+    assert PROFILE_SECRET not in str(error.value)
+
+
+def test_read_api_key_rejects_symlinked_secret_file(tmp_path):
+    store = make_store(tmp_path)
+    seed = make_seed()
+    store.materialize(seed)
+    env_path = profile_path(store, seed) / ".env"
+    target = tmp_path / "outside.env"
+    target.write_text("API_SERVER_KEY=outside-secret\n", encoding="utf-8")
+    env_path.unlink()
+    try:
+        env_path.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(ProfileStoreError, match="profile API key is unavailable"):
+        store.read_api_key(seed.hermes_profile_key or "")
+
+
 def test_repeat_and_machine_replacement_are_existing_and_stable(tmp_path):
     calls = 0
     calls_lock = Lock()

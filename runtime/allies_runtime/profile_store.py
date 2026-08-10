@@ -784,6 +784,43 @@ class ProfileStore:
             raise ProfileStoreError("profile path could not be verified") from None
         return path
 
+    def read_api_key(self, profile_key: str) -> str:
+        """Read one materialized profile's local Hermes API key."""
+
+        key = validate_profile_key(profile_key)
+        try:
+            with self._lock(key):
+                profile = self._profile_path(key)
+                env_path = profile / ".env"
+                if not _is_directory(profile) or not _is_regular_file(env_path):
+                    raise ProfileStoreError("profile API key is unavailable")
+                info = env_path.lstat()
+                if os.name != "nt" and info.st_mode & 0o077:
+                    raise ProfileStoreError("profile API key is unavailable")
+                encoded = env_path.read_bytes()
+                if len(encoded) > MAX_PROFILE_TEXT_BYTES:
+                    raise ProfileStoreError("profile API key is unavailable")
+                content = encoded.decode("utf-8")
+                values = []
+                for line in content.splitlines():
+                    name, separator, value = line.partition("=")
+                    if separator and name == "API_SERVER_KEY":
+                        values.append(value)
+                if len(values) != 1:
+                    raise ProfileStoreError("profile API key is unavailable")
+                try:
+                    return _validate_generated_key(values[0])
+                except ProfileStoreError:
+                    raise ProfileStoreError("profile API key is unavailable") from None
+        except ProfileInputError:
+            raise
+        except ProfileStoreError as exc:
+            if str(exc) == "profile API key is unavailable":
+                raise
+            raise ProfileStoreError("profile API key is unavailable") from None
+        except (OSError, UnicodeError):
+            raise ProfileStoreError("profile API key is unavailable") from None
+
     def _local_lock(self, key: str) -> threading.Lock:
         identity = (str(self.volume_root), key)
         with self._local_locks_guard:
