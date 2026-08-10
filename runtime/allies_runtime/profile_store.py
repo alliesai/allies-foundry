@@ -620,7 +620,9 @@ def _read_bounded_descriptor(descriptor: int) -> bytes:
     return bytes(content)
 
 
-def _windows_final_path(descriptor: int) -> str:
+def _windows_final_path(
+    descriptor: int,
+) -> str:  # pragma: no cover - Windows-specific implementation
     """Return the normalized final path of an already-open Windows file."""
 
     import ctypes
@@ -650,37 +652,48 @@ def _windows_final_path(descriptor: int) -> str:
 
 
 def _read_profile_env(profile: Path) -> bytes:
-    """Read ``.env`` without following a replaced profile directory on Linux."""
+    """Read ``.env`` through the current platform's anchored file API."""
 
     unavailable = "profile API key is unavailable"
     file_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     file_flags |= getattr(os, "O_NOFOLLOW", 0)
     if os.name == "nt":
-        profile_info = profile.lstat()
-        if not stat.S_ISDIR(profile_info.st_mode) or profile.resolve() != profile:
-            raise ProfileStoreError(unavailable)
-        env_path = profile / ".env"
-        info = env_path.lstat()
-        descriptor = os.open(env_path, file_flags)
-        try:
-            current_profile = profile.lstat()
-            if (
-                not os.path.samestat(profile_info, current_profile)
-                or profile.resolve() != profile
-            ):
-                raise ProfileStoreError(unavailable)
-            opened = os.fstat(descriptor)
-            expected_path = os.path.normcase(os.path.abspath(profile / ".env"))
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or not os.path.samestat(info, opened)
-                or _windows_final_path(descriptor) != expected_path
-            ):
-                raise ProfileStoreError(unavailable)
-            return _read_bounded_descriptor(descriptor)
-        finally:
-            os.close(descriptor)
+        return _read_profile_env_windows(profile, file_flags, unavailable)
+    return _read_profile_env_posix(profile, file_flags, unavailable)
 
+
+def _read_profile_env_windows(
+    profile: Path, file_flags: int, unavailable: str
+) -> bytes:  # pragma: no cover - Windows-specific implementation
+    profile_info = profile.lstat()
+    if not stat.S_ISDIR(profile_info.st_mode) or profile.resolve() != profile:
+        raise ProfileStoreError(unavailable)
+    env_path = profile / ".env"
+    info = env_path.lstat()
+    descriptor = os.open(env_path, file_flags)
+    try:
+        current_profile = profile.lstat()
+        if (
+            not os.path.samestat(profile_info, current_profile)
+            or profile.resolve() != profile
+        ):
+            raise ProfileStoreError(unavailable)
+        opened = os.fstat(descriptor)
+        expected_path = os.path.normcase(os.path.abspath(profile / ".env"))
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or not os.path.samestat(info, opened)
+            or _windows_final_path(descriptor) != expected_path
+        ):
+            raise ProfileStoreError(unavailable)
+        return _read_bounded_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_profile_env_posix(
+    profile: Path, file_flags: int, unavailable: str
+) -> bytes:  # pragma: no cover - POSIX-specific implementation
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_flags |= getattr(os, "O_NOFOLLOW", 0)
     directory = os.open(profile, directory_flags)
@@ -704,7 +717,9 @@ def _read_profile_env(profile: Path) -> bytes:
         os.close(directory)
 
 
-def _windows_process_is_alive(pid: int) -> bool:
+def _windows_process_is_alive(
+    pid: int,
+) -> bool:  # pragma: no cover - Windows-specific implementation
     """Query process state without using Windows ``os.kill`` semantics."""
 
     import ctypes
