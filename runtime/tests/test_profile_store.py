@@ -186,7 +186,10 @@ def test_read_api_key_rejects_file_replaced_between_inspection_and_open(
 
     def replace_before_open(path, flags, *args, **kwargs):
         nonlocal replaced
-        if Path(path) == env_path and not replaced:
+        opens_profile_env = Path(path) == env_path or (
+            Path(path) == Path(".env") and kwargs.get("dir_fd") is not None
+        )
+        if opens_profile_env and not replaced:
             replaced = True
             env_path.replace(original)
             replacement.replace(env_path)
@@ -240,7 +243,10 @@ def test_read_api_key_rejects_profile_directory_replaced_before_file_open(
 
     def replace_parent_before_open(path, flags, *args, **kwargs):
         nonlocal replaced
-        if Path(path) == profile / ".env" and not replaced:
+        opens_profile_env = Path(path) == profile / ".env" or (
+            Path(path) == Path(".env") and kwargs.get("dir_fd") is not None
+        )
+        if opens_profile_env and not replaced:
             replaced = True
             profile.replace(original)
             outside.replace(profile)
@@ -248,8 +254,14 @@ def test_read_api_key_rejects_profile_directory_replaced_before_file_open(
 
     monkeypatch.setattr(profile_store_module.os, "open", replace_parent_before_open)
 
-    with pytest.raises(ProfileStoreError, match="API key is unavailable"):
-        store.read_api_key(seed.hermes_profile_key or "")
+    if os.name == "nt":
+        with pytest.raises(ProfileStoreError, match="API key is unavailable"):
+            store.read_api_key(seed.hermes_profile_key or "")
+    else:
+        assert (
+            store.read_api_key(seed.hermes_profile_key or "")
+            == "profile-local-key-0123456789"
+        )
 
 
 def test_read_api_key_rejects_non_directory_profile_and_oversized_secret(tmp_path):
