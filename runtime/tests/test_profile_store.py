@@ -18,6 +18,7 @@ from allies_runtime.profile_store import (
     ProfileSeed,
     ProfileStore,
     ProfileStoreError,
+    _process_is_alive,
     derive_profile_key,
     inspect_profile,
     validate_profile_key,
@@ -840,6 +841,16 @@ def test_profile_store_does_not_steal_live_lock_after_stale_threshold(tmp_path):
     assert second_receipt.status is ProfileProvisionStatus.REPAIR_REQUIRED
     assert second_receipt.repair_code == "lock_timeout"
     assert first_receipt.status is ProfileProvisionStatus.CREATED
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process-query regression")
+def test_live_lock_check_does_not_signal_the_process_on_windows(monkeypatch):
+    def unexpected_kill(_pid, _signal):
+        pytest.fail("Windows liveness checks must not call os.kill")
+
+    monkeypatch.setattr("allies_runtime.profile_store.os.kill", unexpected_kill)
+
+    assert _process_is_alive(os.getpid()) is True
 
 
 def test_profile_store_reports_lock_timeout(tmp_path):
