@@ -197,6 +197,41 @@ def test_read_api_key_rejects_file_replaced_between_inspection_and_open(
         store.read_api_key(seed.hermes_profile_key or "")
 
 
+def test_read_api_key_rejects_profile_directory_replaced_before_file_open(
+    tmp_path, monkeypatch
+):
+    store = make_store(tmp_path)
+    seed = make_seed()
+    store.materialize(seed)
+    profile = profile_path(store, seed)
+    original = profile.with_name(f"{profile.name}-original")
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    (outside / ".env").write_text(
+        "API_SERVER_KEY=attacker-controlled-key-0123456789\n", encoding="utf-8"
+    )
+    (outside / ".env").chmod(0o600)
+    original_open = profile_store_module.os.open
+    replaced = False
+
+    def replace_parent_before_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if Path(path) == profile / ".env" and not replaced:
+            replaced = True
+            profile.replace(original)
+            try:
+                profile.symlink_to(outside, target_is_directory=True)
+            except (NotImplementedError, OSError):
+                original.replace(profile)
+                pytest.skip("directory symlinks are unavailable")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(profile_store_module.os, "open", replace_parent_before_open)
+
+    with pytest.raises(ProfileStoreError, match="API key is unavailable"):
+        store.read_api_key(seed.hermes_profile_key or "")
+
+
 def test_repeat_and_machine_replacement_are_existing_and_stable(tmp_path):
     calls = 0
     calls_lock = Lock()

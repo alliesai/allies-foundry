@@ -607,6 +607,69 @@ def _process_is_alive(pid: int) -> bool:
     return True
 
 
+def _read_bounded_descriptor(descriptor: int) -> bytes:
+    content = bytearray()
+    while len(content) <= MAX_PROFILE_TEXT_BYTES:
+        chunk = os.read(
+            descriptor,
+            min(64 * 1024, MAX_PROFILE_TEXT_BYTES + 1 - len(content)),
+        )
+        if not chunk:
+            break
+        content.extend(chunk)
+    return bytes(content)
+
+
+def _read_profile_env(profile: Path) -> bytes:
+    """Read ``.env`` without following a replaced profile directory on Linux."""
+
+    unavailable = "profile API key is unavailable"
+    file_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    file_flags |= getattr(os, "O_NOFOLLOW", 0)
+    if os.name == "nt":
+        profile_info = profile.lstat()
+        if not stat.S_ISDIR(profile_info.st_mode) or profile.resolve() != profile:
+            raise ProfileStoreError(unavailable)
+        env_path = profile / ".env"
+        info = env_path.lstat()
+        descriptor = os.open(env_path, file_flags)
+        try:
+            current_profile = profile.lstat()
+            if (
+                not os.path.samestat(profile_info, current_profile)
+                or profile.resolve() != profile
+            ):
+                raise ProfileStoreError(unavailable)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or not os.path.samestat(info, opened):
+                raise ProfileStoreError(unavailable)
+            return _read_bounded_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(profile, directory_flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(directory).st_mode):
+            raise ProfileStoreError(unavailable)
+        info = os.stat(".env", dir_fd=directory, follow_symlinks=False)
+        descriptor = os.open(".env", file_flags, dir_fd=directory)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or not os.path.samestat(info, opened)
+                or opened.st_mode & 0o077
+            ):
+                raise ProfileStoreError(unavailable)
+            return _read_bounded_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
 def _windows_process_is_alive(pid: int) -> bool:
     """Query process state without using Windows ``os.kill`` semantics."""
 
@@ -828,28 +891,7 @@ class ProfileStore:
         try:
             with self._lock(key):
                 profile = self._profile_path(key)
-                env_path = profile / ".env"
-                if not _is_directory(profile):
-                    raise ProfileStoreError("profile API key is unavailable")
-                info = env_path.lstat()
-                if not stat.S_ISREG(info.st_mode):
-                    raise ProfileStoreError("profile API key is unavailable")
-                if os.name != "nt" and info.st_mode & 0o077:
-                    raise ProfileStoreError("profile API key is unavailable")
-                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-                flags |= getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(env_path, flags)
-                try:
-                    opened = os.fstat(descriptor)
-                    if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(
-                        info, opened
-                    ):
-                        raise ProfileStoreError("profile API key is unavailable")
-                    if os.name != "nt" and opened.st_mode & 0o077:
-                        raise ProfileStoreError("profile API key is unavailable")
-                    encoded = os.read(descriptor, MAX_PROFILE_TEXT_BYTES + 1)
-                finally:
-                    os.close(descriptor)
+                encoded = _read_profile_env(profile)
                 if len(encoded) > MAX_PROFILE_TEXT_BYTES:
                     raise ProfileStoreError("profile API key is unavailable")
                 content = encoded.decode("utf-8")
