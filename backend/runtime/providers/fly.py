@@ -105,6 +105,7 @@ class FlyProvider:
         base_url: str | None = None,
         timeout_seconds: float = 10.0,
         multi_container_enabled: bool | None = None,
+        file_secrets_enabled: bool | None = None,
     ) -> None:
         if client is not None and (http_client is not None or transport is not None):
             raise TypeError("pass only one Fly HTTP client or transport")
@@ -126,6 +127,9 @@ class FlyProvider:
         if multi_container_enabled is None:
             multi_container_enabled = _env_flag("FLY_MULTI_CONTAINER_ENABLED")
         self.multi_container_enabled = bool(multi_container_enabled)
+        if file_secrets_enabled is None:
+            file_secrets_enabled = _env_flag("FLY_FILE_SECRETS_ENABLED")
+        self.file_secrets_enabled = bool(file_secrets_enabled)
 
     @property
     def topology_supported(self) -> bool:
@@ -140,6 +144,13 @@ class FlyProvider:
     # Names used by deployment preflight callers; all are the same pure gate.
     preflight = assert_topology_supported
     check_capabilities = assert_topology_supported
+
+    def assert_proof_capabilities(self) -> None:
+        self.assert_topology_supported()
+        if not self.file_secrets_enabled:
+            raise ProviderUnsupportedTopologyError(
+                "Fly runtime-container file secrets are not enabled"
+            )
 
     def inspect_app(
         self, name: str, organization: str | None = None

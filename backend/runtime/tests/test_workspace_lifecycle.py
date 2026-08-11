@@ -1,10 +1,25 @@
 from __future__ import annotations
 
-from uuid import UUID
+from datetime import timedelta
+from uuid import UUID, uuid4
 
 import pytest
+from django.utils import timezone
 
-from runtime.models import Workspace, WorkspaceProvisioningPhase
+from runtime.exceptions import RuntimeConflictError
+from runtime.models import (
+    Attempt,
+    AttemptStatus,
+    Execution,
+    ExecutionEvent,
+    ExecutionStatus,
+    Lease,
+    LeaseState,
+    RuntimeProfile,
+    RuntimeProfileLifecycleState,
+    Workspace,
+    WorkspaceProvisioningPhase,
+)
 from runtime.providers import (
     AppRecord,
     ContainerState,
@@ -20,6 +35,7 @@ from runtime.providers import (
 )
 from runtime.services.hermes_smoke import ProviderLifecycleSmokeIntegration
 from runtime.services.workspaces import (
+    ReplacementProofPrecondition,
     WorkspaceLifecycle,
     WorkspaceReplacementRequiredError,
     WorkspaceSpec,
@@ -327,6 +343,89 @@ def test_replace_fences_generation_preserves_volume_and_replays_same_source():
     assert provider.calls.index("stop_machine") < provider.calls.index(
         "destroy_machine"
     )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_replacement_proof_precondition_is_checked_before_generation_fence():
+    provider = FakeProvider()
+    lifecycle = WorkspaceLifecycle(provider, sleep=lambda _: None, jitter=False)
+    workspace = Workspace.objects.create(id=WORKSPACE_ID, tenant_ref="tenant-proof")
+    lifecycle.ensure_workspace(workspace.id, spec())
+    attempts = []
+    profiles = []
+    for index in range(2):
+        profile = RuntimeProfile.objects.create(
+            workspace=workspace,
+            ally_ref=f"ally-{index}",
+            hermes_profile_key=f"ally-proof-{index}",
+            lifecycle_state=RuntimeProfileLifecycleState.ACTIVE,
+            materialized_generation=1,
+        )
+        profiles.append(profile)
+        execution = Execution.objects.create(
+            workspace=workspace,
+            profile=profile,
+            idempotency_key=f"active-{index}",
+            input_payload={"message": "proof"},
+            status=ExecutionStatus.RUNNING,
+        )
+        attempt = Attempt.objects.create(
+            execution=execution,
+            number=1,
+            status=AttemptStatus.RUNNING,
+            machine_generation=1,
+        )
+        attempts.append(attempt)
+        Lease.objects.create(
+            attempt=attempt,
+            profile=profile,
+            token_digest=f"{index + 1}" * 64,
+            expires_at=timezone.now() + timedelta(minutes=5),
+            machine_generation=1,
+            state=LeaseState.ACTIVE,
+        )
+        for sequence, event_type in (
+            (1, "execution.dispatched"),
+            (2, "message.delta"),
+        ):
+            ExecutionEvent.objects.create(
+                attempt=attempt,
+                event_id=uuid4(),
+                stream_id=f"stream-{index}",
+                sequence=sequence,
+                event_type=event_type,
+                payload={"code": "proof_progress"},
+            )
+    queued = Execution.objects.create(
+        workspace=workspace,
+        profile=profiles[0],
+        idempotency_key="queued-same-profile",
+        input_payload={"message": "queued"},
+    )
+    precondition = ReplacementProofPrecondition(
+        tuple(attempt.id for attempt in attempts),
+        queued.id,
+    )
+
+    ExecutionEvent.objects.filter(
+        attempt=attempts[1], event_type="message.delta"
+    ).delete()
+    with pytest.raises(RuntimeConflictError, match="durable dispatch and progress"):
+        lifecycle.replace_machine(workspace.id, spec(), 1, precondition)
+    workspace.refresh_from_db()
+    assert workspace.machine_generation == 1
+    assert workspace.machine_ref == "machine-1"
+
+    ExecutionEvent.objects.create(
+        attempt=attempts[1],
+        event_id=uuid4(),
+        stream_id="stream-1",
+        sequence=2,
+        event_type="message.delta",
+        payload={"code": "proof_progress"},
+    )
+    replaced = lifecycle.replace_machine(workspace.id, spec(), 1, precondition)
+    assert replaced.machine_generation == 2
 
 
 @pytest.mark.django_db(transaction=True)

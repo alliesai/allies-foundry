@@ -22,6 +22,13 @@ from django.utils import timezone
 
 from runtime.exceptions import RuntimeConflictError, RuntimeValidationError
 from runtime.models import (
+    Attempt,
+    AttemptStatus,
+    Execution,
+    ExecutionEvent,
+    ExecutionStatus,
+    Lease,
+    LeaseState,
     RuntimeProfile,
     RuntimeProfileLifecycleState,
     Workspace,
@@ -165,6 +172,88 @@ class WorkspaceSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplacementProofPrecondition:
+    """Read-only proof state that must exist before generation fencing."""
+
+    active_attempt_ids: tuple[UUID, UUID]
+    queued_execution_id: UUID
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.active_attempt_ids, tuple)
+            or len(self.active_attempt_ids) != 2
+            or len(set(self.active_attempt_ids)) != 2
+            or not all(isinstance(item, UUID) for item in self.active_attempt_ids)
+        ):
+            raise RuntimeValidationError("exactly two active attempt IDs are required")
+        if not isinstance(self.queued_execution_id, UUID):
+            raise RuntimeValidationError("queued_execution_id must be a UUID")
+
+    def assert_satisfied(self, workspace: Workspace) -> None:
+        attempts = list(
+            Attempt.objects.select_related("execution__profile")
+            .filter(
+                pk__in=self.active_attempt_ids,
+                execution__workspace_id=workspace.id,
+                execution__status=ExecutionStatus.RUNNING,
+                status=AttemptStatus.RUNNING,
+                machine_generation=workspace.machine_generation,
+            )
+            .order_by("id")
+        )
+        if (
+            len(attempts) != 2
+            or len({item.execution.profile_id for item in attempts}) != 2
+        ):
+            raise RuntimeConflictError(
+                "replacement proof requires two active profile-scoped attempts"
+            )
+        attempt_ids = {item.id for item in attempts}
+        active_leases = set(
+            Lease.objects.filter(
+                attempt_id__in=attempt_ids,
+                state=LeaseState.ACTIVE,
+                machine_generation=workspace.machine_generation,
+                expires_at__gt=timezone.now(),
+            ).values_list("attempt_id", flat=True)
+        )
+        if active_leases != attempt_ids:
+            raise RuntimeConflictError(
+                "replacement proof attempts must have active generation leases"
+            )
+        dispatched = set(
+            ExecutionEvent.objects.filter(
+                attempt_id__in=attempt_ids,
+                event_type="execution.dispatched",
+            ).values_list("attempt_id", flat=True)
+        )
+        safe_progress = set(
+            ExecutionEvent.objects.filter(attempt_id__in=attempt_ids)
+            .exclude(event_type="execution.dispatched")
+            .values_list("attempt_id", flat=True)
+        )
+        if dispatched != attempt_ids or safe_progress != attempt_ids:
+            raise RuntimeConflictError(
+                "replacement proof attempts must have durable dispatch and progress"
+            )
+        queued = (
+            Execution.objects.filter(
+                pk=self.queued_execution_id,
+                workspace_id=workspace.id,
+                status=ExecutionStatus.QUEUED,
+            )
+            .only("profile_id")
+            .first()
+        )
+        if queued is None or queued.profile_id not in {
+            item.execution.profile_id for item in attempts
+        }:
+            raise RuntimeConflictError(
+                "replacement proof requires a same-profile queued execution"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceBinding:
     workspace_id: UUID
     app_ref: str
@@ -270,6 +359,7 @@ class WorkspaceLifecycle:
         workspace_id: UUID | str,
         spec: WorkspaceSpec,
         expected_source_generation: int,
+        proof_precondition: ReplacementProofPrecondition | None = None,
     ) -> WorkspaceBinding:
         workspace_id = _uuid(workspace_id)
         if (
@@ -283,6 +373,7 @@ class WorkspaceLifecycle:
                 workspace_id,
                 WorkspaceProvisioningKind.REPLACE,
                 expected_source_generation=expected_source_generation,
+                proof_precondition=proof_precondition,
             )
             if isinstance(operation, WorkspaceBinding):
                 return operation
@@ -317,6 +408,7 @@ class WorkspaceLifecycle:
         kind: str,
         *,
         expected_source_generation: int | None,
+        proof_precondition: ReplacementProofPrecondition | None = None,
     ) -> _Claim | WorkspaceBinding | None:
         now = self.clock()
 
@@ -357,6 +449,8 @@ class WorkspaceLifecycle:
                         raise WorkspaceStaleOperationError(
                             "replacement source generation is stale"
                         )
+                    if proof_precondition is not None:
+                        proof_precondition.assert_satisfied(workspace)
                     operation_id = uuid.uuid4()
                     target = source + 1
                     previous = workspace.machine_ref
@@ -963,8 +1057,14 @@ def replace_machine(
     workspace_id: UUID | str,
     spec: WorkspaceSpec,
     expected_source_generation: int,
+    proof_precondition: ReplacementProofPrecondition | None = None,
 ) -> WorkspaceBinding:
-    return _service().replace_machine(workspace_id, spec, expected_source_generation)
+    return _service().replace_machine(
+        workspace_id,
+        spec,
+        expected_source_generation,
+        proof_precondition,
+    )
 
 
 def _uuid(value: UUID | str) -> UUID:

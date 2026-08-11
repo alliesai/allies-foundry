@@ -7,6 +7,7 @@ import pytest
 from allies_runtime.errors import HermesMalformedResponse
 from allies_runtime.foundry import (
     EventReceipt,
+    FencedError,
     FoundryClaim,
     FoundryWorker,
     ResponseLossError,
@@ -143,6 +144,34 @@ async def test_first_turn_dispatches_once_binds_terminal_session_and_completes()
         "run_id": "run-1",
         "status": "completed",
     }
+
+
+@pytest.mark.asyncio
+async def test_proof_hold_keeps_stream_open_until_generation_fence():
+    class FencingFoundry(RecordingFoundry):
+        async def renew(self, attempt_id, lease_token):
+            raise FencedError("retired generation")
+
+    foundry = FencingFoundry()
+    proof_claim = claim()
+    proof_claim.payload["proof_hold_after_first_safe_event"] = True
+
+    result = await FoundryWorker(
+        foundry,
+        RecordingHermes(),
+        renew_interval=0.01,
+        lease_seconds=1,
+        stop_safety_margin=0.1,
+    ).run_claim(proof_claim)
+
+    assert result == StoppedReceipt("attempt-1", "failed", False)
+    assert [event["event_type"] for event in foundry.events] == [
+        "execution.dispatched",
+        "message.delta",
+    ]
+    assert foundry.binds == []
+    assert foundry.completes == []
+    assert foundry.stops == ["lease_lost"]
 
 
 @pytest.mark.asyncio

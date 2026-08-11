@@ -1085,6 +1085,8 @@ class FoundryWorker:
             )
             renewal = asyncio.create_task(self._renew_loop(claim, stream, lost))
             terminal: HermesEvent | None = None
+            proof_hold = claim.payload.get("proof_hold_after_first_safe_event") is True
+            held_after_safe_event = False
             async for event in stream:
                 if lost.is_set():
                     break
@@ -1133,6 +1135,11 @@ class FoundryWorker:
                         )
                     except FoundryError:
                         return None
+                if proof_hold and not held_after_safe_event:
+                    held_after_safe_event = True
+                    while not lost.is_set():
+                        await asyncio.sleep(min(self.renew_interval, 0.25))
+                    break
             if lost.is_set():
                 return await self.foundry.stopped(
                     claim.attempt_id, claim.lease_token, reason="lease_lost"
