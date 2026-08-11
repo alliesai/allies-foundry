@@ -1248,7 +1248,7 @@ class FoundryWorker:
         self,
         *,
         max_turns: int | None = None,
-        idle_cycles: int = 1,
+        idle_cycles: int | None = 1,
         idle_delay: float = 0.0,
     ) -> tuple[Any, ...]:
         """Poll until the requested number of turns has completed.
@@ -1258,7 +1258,7 @@ class FoundryWorker:
         """
         if max_turns is not None and (isinstance(max_turns, bool) or max_turns < 1):
             raise ValueError("max_turns must be positive")
-        if idle_cycles < 1:
+        if idle_cycles is not None and idle_cycles < 1:
             raise ValueError("idle_cycles must be positive")
         await self._reconcile_profiles(force=True)
         results: list[Any] = []
@@ -1323,7 +1323,7 @@ class FoundryWorker:
             if self._ambiguous_claims:
                 await asyncio.sleep(poll_delay)
                 continue
-            if empty >= idle_cycles or self._stopping:
+            if (idle_cycles is not None and empty >= idle_cycles) or self._stopping:
                 break
             await asyncio.sleep(poll_delay)
         if self._active:

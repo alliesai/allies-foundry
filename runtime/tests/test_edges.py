@@ -209,11 +209,11 @@ def test_pid1_entrypoint_main(monkeypatch, capsys):
     assert "different_profile_overlap" in capsys.readouterr().out
 
 
-def test_default_entrypoint_keeps_runtime_alive(monkeypatch):
+def test_default_entrypoint_runs_the_foundry_worker(monkeypatch):
     from allies_runtime import __main__
 
     monkeypatch.setattr(sys, "argv", ["allies-runtime"])
-    monkeypatch.setattr(__main__, "serve", lambda: 0)
+    monkeypatch.setattr(__main__, "runtime_entrypoint", lambda: 0)
     assert __main__.main() == 0
 
 

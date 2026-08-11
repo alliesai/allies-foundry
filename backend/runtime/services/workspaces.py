@@ -93,6 +93,9 @@ class WorkspaceSpec:
     hermes_image: str | None = None
     runtime_image: str | None = None
     runtime_credential_ref: OpaqueReference | str | None = None
+    foundry_origin: str | None = None
+    foundry_runtime_credential_ref: OpaqueReference | str | None = None
+    foundry_runtime_credential_secret_name: str | None = None
     volume_size_gb: int = 1
     filesystem: str = "ext4"
     containers: tuple[ContainerSpec, ...] | None = None
@@ -153,6 +156,11 @@ class WorkspaceSpec:
             mount=VolumeMount(volume_id),
             ownership=OwnershipMetadata(workspace_id, operation_id, generation),
             runtime_credential_ref=self.runtime_credential_ref,
+            foundry_origin=self.foundry_origin,
+            foundry_runtime_credential_ref=self.foundry_runtime_credential_ref,
+            foundry_runtime_credential_secret_name=(
+                self.foundry_runtime_credential_secret_name
+            ),
         )
 
 

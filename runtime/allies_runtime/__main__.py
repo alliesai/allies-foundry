@@ -8,7 +8,9 @@ import json
 import os
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from .composition import RuntimeComposition, compose_runtime, run_worker
 from .config import CredentialReference, SettingsError, load_settings
@@ -22,6 +24,7 @@ from .hermes import (
 from .smoke import run_smoke_sync
 
 _TEST_BOOTSTRAP_GRACE_SECONDS = 60.0
+_MAX_RUNTIME_CREDENTIAL_BYTES = 4096
 
 
 def worker_entrypoint(
@@ -32,7 +35,7 @@ def worker_entrypoint(
     hermes: Any | None = None,
     api_key_factory: Callable[[], str] | None = None,
     max_turns: int | None = None,
-    idle_cycles: int = 1,
+    idle_cycles: int | None = 1,
     idle_delay: float = 0.0,
 ) -> int:
     """Run the production worker through the explicit composition boundary."""
@@ -56,6 +59,86 @@ def worker_entrypoint(
     except KeyboardInterrupt:
         return 0
     return 0
+
+
+def file_credential_for_reference(reference: CredentialReference) -> str:
+    """Read a bounded runtime bearer from the Fly-mounted secret file."""
+
+    parsed = urlsplit(str(reference))
+    if parsed.scheme != "file" or parsed.netloc or parsed.query or parsed.fragment:
+        raise SettingsError(
+            "FOUNDRY_RUNTIME_CREDENTIAL_REF must be a local file reference"
+        )
+    path = Path(unquote(parsed.path))
+    secrets_root = Path("/run/secrets")
+    try:
+        path.relative_to(secrets_root)
+    except ValueError as exc:
+        raise SettingsError(
+            "FOUNDRY_RUNTIME_CREDENTIAL_REF must remain under /run/secrets"
+        ) from exc
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise SettingsError("Foundry runtime credential is unavailable") from exc
+    if not raw or len(raw) > _MAX_RUNTIME_CREDENTIAL_BYTES:
+        raise SettingsError("Foundry runtime credential has an invalid size")
+    try:
+        value = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise SettingsError("Foundry runtime credential must be UTF-8") from exc
+    if not value or "\r" in value or "\n" in value:
+        raise SettingsError("Foundry runtime credential is not a header value")
+    return value
+
+
+def runtime_entrypoint(
+    *,
+    env: dict[str, object] | None = None,
+    credential_resolver: Callable[..., Any] | None = None,
+    foundry_credential_resolver: Callable[[CredentialReference], str] | None = None,
+    foundry_factory: Callable[..., FoundryClient] = FoundryClient,
+    hermes: Any | None = None,
+    idle_cycles: int | None = None,
+) -> int:
+    """Probe Hermes, compose the production worker, and poll until fenced."""
+
+    values = dict(os.environ) if env is None else dict(env)
+    if not values.get("HERMES_CREDENTIAL_REF"):
+        return 1
+    try:
+        settings = load_settings(values)
+        if credential_resolver is None:
+            if str(settings.credential_ref).lower().startswith("test://fnd004/"):
+                credential_resolver = test_credential_for_reference
+            else:
+                credential_resolver = UnixSocketCredentialResolver(
+                    str(
+                        values.get(
+                            "HERMES_CREDENTIAL_SOCKET",
+                            DEFAULT_CREDENTIAL_SOCKET,
+                        )
+                    )
+                )
+        resolve_foundry = foundry_credential_resolver or file_credential_for_reference
+        runtime_token = resolve_foundry(settings.foundry_credential_ref)
+        foundry = foundry_factory(
+            base_url=settings.foundry_origin,
+            runtime_token=runtime_token,
+        )
+        hermes_client = hermes or HermesClient(settings, credential_resolver)
+    except (OSError, SettingsError, TypeError, ValueError):
+        return 1
+    if not asyncio.run(probe_readiness(hermes_client)):
+        return 1
+    return worker_entrypoint(
+        settings=settings,
+        foundry=foundry,
+        credential_resolver=credential_resolver,
+        hermes=hermes_client,
+        idle_cycles=idle_cycles,
+        idle_delay=0.25,
+    )
 
 
 async def probe_readiness(client: Any) -> bool:
@@ -136,8 +219,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.serve and args.smoke:
         parser.error("--serve and --smoke cannot be combined")
-    if args.serve or args.smoke is None:
+    if args.serve:
         return serve()
+    if args.smoke is None:
+        return runtime_entrypoint()
     result = run_smoke_sync(args.smoke)
     print(json.dumps(result.to_dict(), sort_keys=True))
     return (

@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
+from urllib.parse import urlsplit
 from uuid import UUID
 
 
@@ -200,6 +201,9 @@ class MachineSpec:
     mount: VolumeMount
     ownership: OwnershipMetadata
     runtime_credential_ref: OpaqueReference | str | None = None
+    foundry_origin: str | None = None
+    foundry_runtime_credential_ref: OpaqueReference | str | None = None
+    foundry_runtime_credential_secret_name: str | None = None
     public_services: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -228,6 +232,57 @@ class MachineSpec:
             OpaqueReference,
         ):
             raise ValueError("runtime credential must be an opaque reference")
+        foundry_values = (
+            self.foundry_origin,
+            self.foundry_runtime_credential_ref,
+            self.foundry_runtime_credential_secret_name,
+        )
+        if any(value is not None for value in foundry_values) and not all(
+            value is not None for value in foundry_values
+        ):
+            raise ValueError(
+                "Foundry runtime connection fields must be supplied together"
+            )
+        if self.foundry_origin is not None:
+            parsed = urlsplit(self.foundry_origin)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in ("", "/")
+            ):
+                raise ValueError("Foundry origin must be a plain HTTPS origin")
+        if isinstance(self.foundry_runtime_credential_ref, str):
+            object.__setattr__(
+                self,
+                "foundry_runtime_credential_ref",
+                OpaqueReference(self.foundry_runtime_credential_ref),
+            )
+        elif self.foundry_runtime_credential_ref is not None and not isinstance(
+            self.foundry_runtime_credential_ref,
+            OpaqueReference,
+        ):
+            raise ValueError("Foundry runtime credential must be an opaque reference")
+        if self.foundry_runtime_credential_ref is not None:
+            reference = urlsplit(self.foundry_runtime_credential_ref.reference)
+            if (
+                reference.scheme != "file"
+                or reference.netloc
+                or not reference.path.startswith("/run/secrets/")
+                or reference.query
+                or reference.fragment
+            ):
+                raise ValueError(
+                    "Foundry runtime credential must reference /run/secrets"
+                )
+            _identifier(
+                self.foundry_runtime_credential_secret_name,
+                "Foundry runtime credential secret name",
+                max_length=128,
+            )
         if not isinstance(self.public_services, tuple):
             object.__setattr__(self, "public_services", tuple(self.public_services))
         if self.public_services:

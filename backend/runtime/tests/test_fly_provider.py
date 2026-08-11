@@ -86,6 +86,11 @@ def machine_spec(generation: int = 1) -> MachineSpec:
         mount=VolumeMount("vol-01"),
         ownership=ownership(generation),
         runtime_credential_ref=OpaqueReference("vault://runtime/opaque-ref"),
+        foundry_origin="https://foundry.example.com",
+        foundry_runtime_credential_ref=OpaqueReference(
+            "file:///run/secrets/foundry-runtime-token"
+        ),
+        foundry_runtime_credential_secret_name="FND008_RUNTIME_G1",
     )
 
 
@@ -136,8 +141,16 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     assert config["containers"][1]["healthchecks"][0]["name"] == "allies-runtime"
     assert config["metadata"]["allies_machine_generation"] == "1"
     assert config["containers"][1]["env"] == {
-        "HERMES_CREDENTIAL_REF": "vault://runtime/opaque-ref"
+        "HERMES_CREDENTIAL_REF": "vault://runtime/opaque-ref",
+        "FOUNDRY_ORIGIN": "https://foundry.example.com",
+        "FOUNDRY_RUNTIME_CREDENTIAL_REF": ("file:///run/secrets/foundry-runtime-token"),
     }
+    assert config["containers"][1]["files"] == [
+        {
+            "guest_path": "/run/secrets/foundry-runtime-token",
+            "secret_name": "FND008_RUNTIME_G1",
+        }
+    ]
     assert result.health is not None
     assert result.health.containers == {
         "hermes": ContainerState.STARTED,
@@ -146,6 +159,7 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     serialized = json.dumps(payload)
     assert "fly-token-must-not-be-retained" not in serialized
     assert "plain-secret" not in serialized
+    assert "foundry-secret" not in serialized
     assert fake.calls[0].headers["Authorization"] == "<redacted>"
     assert fake.calls[0].timeout == 10.0
 

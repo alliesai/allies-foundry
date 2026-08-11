@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
 
 from allies_runtime import (
     RuntimeComposition,
+    __main__,
     compose_runtime,
     load_settings,
 )
-from allies_runtime.__main__ import worker_entrypoint
+from allies_runtime.__main__ import runtime_entrypoint, worker_entrypoint
+from allies_runtime.composition import run_worker
 from allies_runtime.fake import FakeHermesClient
 from allies_runtime.foundry import FoundryClient
 
@@ -140,3 +145,60 @@ def test_worker_entrypoint_composes_reconciliation_before_claims(tmp_path):
         / PROFILE_KEY
         / ".allies-profile.json"
     ).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_worker_can_keep_polling_until_the_worker_is_fenced():
+    calls = []
+
+    class Worker:
+        async def run(self, *, max_turns, idle_cycles, idle_delay):
+            calls.append((max_turns, idle_cycles, idle_delay))
+            return ()
+
+    composition = SimpleNamespace(worker=Worker())
+
+    assert await run_worker(composition, idle_cycles=None, idle_delay=0.25) == ()
+    assert calls == [(None, None, 0.25)]
+
+
+def test_runtime_entrypoint_resolves_foundry_secret_at_composition_boundary(
+    monkeypatch,
+):
+    captured = {}
+
+    def foundry_factory(*, base_url, runtime_token):
+        captured["foundry"] = (base_url, runtime_token)
+        return object()
+
+    def start_worker(**kwargs):
+        captured["worker"] = kwargs
+        return 0
+
+    monkeypatch.setattr(__main__, "worker_entrypoint", start_worker)
+    env = {
+        "HERMES_CREDENTIAL_REF": "vault://hermes/runtime",
+        "FOUNDRY_ORIGIN": "https://foundry.example.com",
+        "FOUNDRY_RUNTIME_CREDENTIAL_REF": "file:///run/secrets/foundry-token",
+        "VOLUME_ROOT": "/opt/data",
+        "VOLUME_MARKER_PATH": "/opt/data/proof",
+    }
+
+    assert (
+        runtime_entrypoint(
+            env=env,
+            credential_resolver=lambda _reference: "hermes-secret",
+            foundry_credential_resolver=lambda _reference: "foundry-secret",
+            foundry_factory=foundry_factory,
+            hermes=FakeHermesClient(),
+            idle_cycles=1,
+        )
+        == 0
+    )
+
+    assert captured["foundry"] == (
+        "https://foundry.example.com",
+        "foundry-secret",
+    )
+    assert captured["worker"]["idle_cycles"] == 1
+    assert "foundry-secret" not in repr(captured["worker"]["settings"])

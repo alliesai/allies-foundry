@@ -18,6 +18,23 @@ def test_settings_use_loopback_and_opaque_reference():
     assert settings.proof_slots >= 2
 
 
+def test_settings_accept_validated_foundry_runtime_connection():
+    settings = load_settings(
+        {
+            "FOUNDRY_ORIGIN": "https://foundry.example.com/",
+            "FOUNDRY_RUNTIME_CREDENTIAL_REF": (
+                "file:///run/secrets/foundry-runtime-token"
+            ),
+        }
+    )
+
+    assert settings.foundry_origin == "https://foundry.example.com"
+    assert settings.foundry_credential_ref == (
+        "file:///run/secrets/foundry-runtime-token"
+    )
+    assert "foundry-runtime-token" not in repr(settings.foundry_credential_ref)
+
+
 @pytest.mark.parametrize(
     "env",
     [
@@ -29,6 +46,10 @@ def test_settings_use_loopback_and_opaque_reference():
         {"VOLUME_MARKER_PATH": "/tmp/not-hermes"},
         {"HERMES_IMAGE": "hermes:latest"},
         {"HERMES_SOURCE_COMMIT": "not-a-commit"},
+        {"FOUNDRY_ORIGIN": "http://foundry.example.com"},
+        {"FOUNDRY_ORIGIN": "https://user:secret@foundry.example.com"},
+        {"FOUNDRY_ORIGIN": "https://foundry.example.com/api"},
+        {"FOUNDRY_RUNTIME_CREDENTIAL_REF": "runtime-secret"},
     ],
 )
 def test_settings_reject_unsafe_values(env):

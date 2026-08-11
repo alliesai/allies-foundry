@@ -12,6 +12,7 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from .domain import (
@@ -396,6 +397,26 @@ class FlyProvider:
                 item["env"] = {
                     "HERMES_CREDENTIAL_REF": spec.runtime_credential_ref.reference
                 }
+            if (
+                container.name == "allies-runtime"
+                and spec.foundry_runtime_credential_ref is not None
+            ):
+                item.setdefault("env", {}).update(
+                    {
+                        "FOUNDRY_ORIGIN": spec.foundry_origin,
+                        "FOUNDRY_RUNTIME_CREDENTIAL_REF": (
+                            spec.foundry_runtime_credential_ref.reference
+                        ),
+                    }
+                )
+                item["files"] = [
+                    {
+                        "guest_path": urlsplit(
+                            spec.foundry_runtime_credential_ref.reference
+                        ).path,
+                        "secret_name": spec.foundry_runtime_credential_secret_name,
+                    }
+                ]
             containers.append(item)
         return {
             "name": spec.name,

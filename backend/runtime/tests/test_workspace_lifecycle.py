@@ -40,6 +40,7 @@ class FakeProvider:
         self.reject_destroy_while_running = False
         self.stop_404_after_inspect = False
         self.destroy_404_after_inspect = False
+        self.last_machine_spec = None
 
     def ensure_app(self, spec):
         self.calls.append("ensure_app")
@@ -81,6 +82,7 @@ class FakeProvider:
 
     def ensure_machine(self, spec):
         self.calls.append("ensure_machine")
+        self.last_machine_spec = spec
         existing = self.inspect_machine(spec.app_name, spec.name)
         if existing:
             return existing
@@ -192,6 +194,9 @@ def spec():
         hermes_image="hermes@sha256:test",
         runtime_image="runtime@sha256:test",
         runtime_credential_ref="vault://runtime/test",
+        foundry_origin="https://foundry.example.com",
+        foundry_runtime_credential_ref="file:///run/secrets/foundry-runtime-token",
+        foundry_runtime_credential_secret_name="FND008_RUNTIME_G1",
     )
 
 
@@ -207,6 +212,10 @@ def test_ensure_is_idempotent_and_binds_one_machine():
     assert first == second
     assert first.machine_generation == 1
     assert len(provider.machines) == 1
+    assert provider.last_machine_spec.foundry_origin == "https://foundry.example.com"
+    assert provider.last_machine_spec.foundry_runtime_credential_secret_name == (
+        "FND008_RUNTIME_G1"
+    )
     assert provider.calls.count("ensure_app") == 1
     assert provider.calls.count("ensure_volume") == 1
 
