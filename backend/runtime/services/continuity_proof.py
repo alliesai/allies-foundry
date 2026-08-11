@@ -563,6 +563,10 @@ def run_machine_replacement_proof(
             except Exception:  # noqa: BLE001 - cleanup detail is intentionally bounded
                 cleanup_complete = False
         if mutated:
+            try:
+                _record_current_machine(config.workspace_id, resources)
+            except Exception:  # noqa: BLE001 - provider cleanup must still run
+                cleanup_complete = False
             cleanup_complete = (
                 _cleanup_provider_resources(provider, resources) and cleanup_complete
             )
@@ -687,11 +691,23 @@ def _session_map(profile_ids: tuple[UUID, UUID]) -> dict[UUID, str]:
 
 
 def _execution_text(execution_id: UUID) -> str:
+    successful_attempts = tuple(
+        Attempt.objects.filter(
+            execution_id=execution_id,
+            status=ExecutionStatus.SUCCEEDED,
+        ).values_list("id", flat=True)
+    )
+    if len(successful_attempts) != 1:
+        raise RuntimeError("successful_attempt_history_invalid")
     chunks: list[str] = []
-    for payload in ExecutionEvent.objects.filter(
-        attempt__execution_id=execution_id,
-        event_type="message.delta",
-    ).values_list("payload", flat=True):
+    for payload in (
+        ExecutionEvent.objects.filter(
+            attempt_id=successful_attempts[0],
+            event_type="message.delta",
+        )
+        .order_by("sequence")
+        .values_list("payload", flat=True)
+    ):
         if isinstance(payload, dict) and isinstance(payload.get("text"), str):
             chunks.append(payload["text"])
     return "".join(chunks)
@@ -721,8 +737,21 @@ def _default_old_token_probe(raw_token: str) -> bool:
 def _cleanup_provider_resources(provider: Any, resources: dict[str, str]) -> bool:
     complete = True
     app = resources.get("app")
-    machine = resources.get("replacement_machine") or resources.get("old_machine")
-    if app and machine:
+    machines = tuple(
+        dict.fromkeys(
+            machine
+            for key in ("current_machine", "replacement_machine", "old_machine")
+            if (machine := resources.get(key))
+        )
+    )
+    for machine in machines if app else ():
+        inspect = getattr(provider, "inspect_machine_by_id", None)
+        if inspect is not None:
+            try:
+                if inspect(app, machine) is None:
+                    continue
+            except Exception:  # noqa: BLE001 - still attempt authoritative cleanup
+                complete = False
         try:
             provider.stop_machine(app, machine)
         except ProviderNotFoundError:
@@ -750,6 +779,16 @@ def _cleanup_provider_resources(provider: Any, resources: dict[str, str]) -> boo
         except Exception:  # noqa: BLE001 - cleanup must report any provider failure
             complete = False
     return complete
+
+
+def _record_current_machine(workspace_id: UUID, resources: dict[str, str]) -> None:
+    machine_ref = (
+        Workspace.objects.filter(pk=workspace_id)
+        .values_list("machine_ref", flat=True)
+        .first()
+    )
+    if machine_ref:
+        resources["current_machine"] = machine_ref
 
 
 def _safe_failure_code(exc: Exception) -> str:

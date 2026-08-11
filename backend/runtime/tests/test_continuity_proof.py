@@ -30,6 +30,9 @@ from runtime.services.continuity_proof import (
     ProofCredentialBootstrap,
     ProofProfile,
     _assert_profile_fact_continuity,
+    _cleanup_provider_resources,
+    _execution_text,
+    _record_current_machine,
     run_machine_replacement_proof,
 )
 from runtime.services.profiles import ProfileSeed
@@ -264,6 +267,89 @@ def test_profile_fact_continuity_rejects_missing_or_cross_profile_output(
 
     with pytest.raises(RuntimeError, match="profile_fact_continuity_failed"):
         _assert_profile_fact_continuity(profiles, executions)
+
+
+@pytest.mark.django_db
+def test_execution_text_uses_only_ordered_successful_attempt_events(ready_workspace):
+    profile = RuntimeProfile.objects.create(
+        workspace=ready_workspace,
+        ally_ref="ally-output",
+        hermes_profile_key="ally-output",
+    )
+    execution = Execution.objects.create(
+        workspace=ready_workspace,
+        profile=profile,
+        idempotency_key="ordered-output",
+        input_payload={},
+        status=ExecutionStatus.SUCCEEDED,
+    )
+    failed = Attempt.objects.create(
+        execution=execution,
+        number=1,
+        status=AttemptStatus.FAILED,
+        machine_generation=1,
+    )
+    succeeded = Attempt.objects.create(
+        execution=execution,
+        number=2,
+        status=AttemptStatus.SUCCEEDED,
+        machine_generation=2,
+    )
+    for attempt, sequence, text in (
+        (failed, 1, "wrong-fact"),
+        (succeeded, 2, "two"),
+        (succeeded, 1, "one-"),
+    ):
+        ExecutionEvent.objects.create(
+            attempt=attempt,
+            event_id=uuid4(),
+            stream_id="ordered-output",
+            sequence=sequence,
+            event_type="message.delta",
+            payload={"text": text},
+        )
+
+    assert _execution_text(execution.id) == "one-two"
+
+
+@pytest.mark.django_db
+def test_cleanup_reconciles_and_removes_persisted_replacement_machine(
+    ready_workspace,
+):
+    class RecordingProvider:
+        def __init__(self):
+            self.stopped = []
+            self.destroyed = []
+
+        def stop_machine(self, app_ref, machine_ref):
+            self.stopped.append((app_ref, machine_ref))
+
+        def destroy_machine(self, app_ref, machine_ref):
+            self.destroyed.append((app_ref, machine_ref))
+
+        def delete_volume(self, _app_ref, _volume_ref):
+            return None
+
+        def delete_app(self, _app_ref):
+            return None
+
+    Workspace.objects.filter(pk=ready_workspace.id).update(machine_ref="machine-2")
+    resources = {
+        "app": ready_workspace.fly_app_ref,
+        "volume": ready_workspace.volume_ref,
+        "old_machine": "machine-1",
+    }
+    provider = RecordingProvider()
+
+    _record_current_machine(ready_workspace.id, resources)
+    assert _cleanup_provider_resources(provider, resources)
+
+    assert resources["current_machine"] == "machine-2"
+    assert provider.stopped == [
+        (ready_workspace.fly_app_ref, "machine-2"),
+        (ready_workspace.fly_app_ref, "machine-1"),
+    ]
+    assert provider.destroyed == provider.stopped
 
 
 @pytest.mark.django_db(transaction=True)
