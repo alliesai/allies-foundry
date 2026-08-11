@@ -34,6 +34,28 @@ $env:FLY_FILE_SECRETS_ENABLED = "1"
 These flags are assertions about capabilities you have verified. They do not
 enable a Fly feature by themselves.
 
+## Runtime image migration
+
+FND-008 intentionally changes the runtime image's default command. Earlier
+images started the passive Hermes readiness process (`python -m allies_runtime
+--serve`). The new default starts the Foundry worker (`python -m
+allies_runtime`) and exits if its required runtime configuration is absent.
+
+Before deploying the new image to an existing Machine, choose one path:
+
+- To activate the Foundry worker, supply `HERMES_CREDENTIAL_REF`,
+  `FOUNDRY_ORIGIN`, and `FOUNDRY_RUNTIME_CREDENTIAL_REF`, mount the referenced
+  Foundry bearer beneath `/run/secrets`, and confirm Hermes is reachable with
+  the configured credential resolver.
+- To preserve the legacy passive behavior temporarily, override the runtime
+  container command with `python -m allies_runtime --serve`. This compatibility
+  mode probes Hermes and remains available, but it does not claim or execute
+  Foundry work.
+
+Do not update an existing deployment to the new image without either the worker
+configuration or the explicit `--serve` override. Otherwise the runtime
+container will fail closed during startup.
+
 ## Run the proof
 
 Replace every angle-bracket value. Credential arguments are opaque references,
