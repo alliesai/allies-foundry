@@ -85,9 +85,16 @@ class RecordingHermes:
         self.failure = failure
         self.ensured = []
         self.streams = []
+        self.history_checks = []
 
     async def ensure_profile_session(self, profile_key, session_id):
         self.ensured.append((profile_key, session_id))
+
+    async def profile_session_matches_markers(
+        self, profile_key, session_id, expected, forbidden
+    ):
+        self.history_checks.append((profile_key, session_id, expected, forbidden))
+        return True
 
     async def stream_profile_incremental(
         self, profile_key, session_id, message, *, session_key
@@ -185,6 +192,45 @@ async def test_bound_turn_resumes_claimed_session_without_creating_one():
     assert hermes.ensured == []
     assert hermes.streams[0][1] == "session-1"
     assert foundry.binds[0]["expected_session_id"] == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_proof_turn_verifies_persisted_history_and_records_receipt():
+    foundry = RecordingFoundry()
+    hermes = RecordingHermes()
+    proof_claim = claim(conversation_id="cloud-1", session_id="session-1")
+    proof_claim.payload["proof_expected_history_marker"] = "copper lighthouse"
+    proof_claim.payload["proof_forbidden_history_marker"] = "blue orchard"
+
+    result = await FoundryWorker(foundry, hermes).run_claim(proof_claim)
+
+    assert result.status == "succeeded"
+    assert hermes.history_checks == [
+        ("ally-a", "session-1", "copper lighthouse", "blue orchard")
+    ]
+    assert foundry.completes[0]["receipt"] == {
+        "code": "ok",
+        "history_verified": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_proof_turn_fails_with_distinct_code_when_history_is_missing():
+    class MissingHistoryHermes(RecordingHermes):
+        async def profile_session_matches_markers(
+            self, profile_key, session_id, expected, forbidden
+        ):
+            return False
+
+    foundry = RecordingFoundry()
+    proof_claim = claim(conversation_id="cloud-1", session_id="session-1")
+    proof_claim.payload["proof_expected_history_marker"] = "copper lighthouse"
+    proof_claim.payload["proof_forbidden_history_marker"] = "blue orchard"
+
+    result = await FoundryWorker(foundry, MissingHistoryHermes()).run_claim(proof_claim)
+
+    assert result.status == "failed"
+    assert foundry.failures[0]["code"] == "history_continuity_failed"
 
 
 @pytest.mark.asyncio

@@ -168,6 +168,63 @@ async def test_health_sends_bearer_and_decodes_json(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_profile_session_history_confirms_persisted_marker(monkeypatch):
+    response = FakeResponse(
+        json.dumps(
+            {
+                "object": "list",
+                "session_id": "s1",
+                "data": [
+                    {
+                        "role": "user",
+                        "content": "Remember the copper lighthouse is north.",
+                    }
+                ],
+            }
+        ).encode()
+    )
+    client, calls = _client(monkeypatch, response)
+
+    assert await client.profile_session_matches_markers(
+        "ally-a",
+        "s1",
+        "the copper lighthouse is north",
+        "the blue orchard is east",
+    )
+    assert calls[0][0].endswith("/p/ally-a/api/sessions/s1/messages")
+    assert calls[0][1] == "Bearer test-only-key"
+    assert response.closed
+
+
+@pytest.mark.asyncio
+async def test_profile_session_history_rejects_peer_marker(monkeypatch):
+    response = FakeResponse(
+        json.dumps(
+            {
+                "object": "list",
+                "session_id": "s1",
+                "data": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "The copper lighthouse is north and the blue orchard "
+                            "is east."
+                        ),
+                    }
+                ],
+            }
+        ).encode()
+    )
+    client, _calls = _client(monkeypatch, response)
+
+    assert not await client.profile_session_matches_markers(
+        "ally-a",
+        "s1",
+        "the copper lighthouse is north",
+        "the blue orchard is east",
+    )
+    assert response.closed
+@pytest.mark.asyncio
 async def test_profile_session_create_uses_selected_profile_credential(monkeypatch):
     response = FakeResponse(
         json.dumps(
@@ -348,6 +405,42 @@ async def test_incremental_stream_normalizes_safe_events_and_terminal_rotation()
     assert events[2].payload["status"] == "completed"
     assert events[3].session_id == "s2"
     assert events[3].payload == {"run_id": "r1", "status": "completed"}
+
+
+@pytest.mark.asyncio
+async def test_incremental_stream_uses_final_content_when_provider_emits_no_deltas():
+    class Response:
+        def __init__(self):
+            self.rows = iter(
+                [
+                    b"event: run.started\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                    b"event: assistant.completed\n",
+                    b'data: {"session_id":"s1","run_id":"r1","content":"final answer"}\n',
+                    b"\n",
+                    b"event: run.completed\n",
+                    b'data: {"session_id":"s1","run_id":"r1","completed":true}\n',
+                    b"\n",
+                    b"event: done\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                ]
+            )
+
+        def readline(self, _limit):
+            return next(self.rows, b"")
+
+        def close(self):
+            return None
+
+    events = [event async for event in _IncrementalHTTPStream(Response(), "ally-a", "s1")]
+
+    assert [event.name for event in events] == [
+        "message.delta",
+        "execution.completed",
+    ]
+    assert events[0].payload == {"text": "final answer"}
 
 
 @pytest.mark.asyncio

@@ -80,6 +80,8 @@ def machine_spec(generation: int = 1) -> MachineSpec:
                 "hermes",
                 "registry.example/hermes@sha256:hermes",
                 command=("sh", "-c", "exec hermes gateway run --no-supervise"),
+                entrypoint=("/bin/sh",),
+                user="0",
                 environment={
                     "HERMES_ENV": "/run/secrets/hermes.env",
                     "GATEWAY_MULTIPLEX_PROFILES": "true",
@@ -165,7 +167,7 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     payload = fake.calls[0].json_body
     config = payload["config"]
     assert result.id == "machine-01"
-    assert payload["skip_launch"] is False
+    assert payload["skip_launch"] is True
     assert [item["name"] for item in config["containers"]] == [
         "hermes",
         "allies-runtime",
@@ -184,6 +186,8 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
         "-c",
         "exec hermes gateway run --no-supervise",
     ]
+    assert config["containers"][0]["entrypoint"] == ["/bin/sh"]
+    assert config["containers"][0]["user"] == "0"
     assert "command" not in config["containers"][0]
     assert config["containers"][0]["env"] == {
         "HERMES_ENV": "/run/secrets/hermes.env",
@@ -196,6 +200,8 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
         }
     ]
     assert config["metadata"]["allies_machine_generation"] == "1"
+    assert config["metadata"]["fly_platform_version"] == "v2"
+    assert config["metadata"]["fly_process_group"] == "app"
     assert config["containers"][1]["env"] == {
         "HERMES_CREDENTIAL_REF": "vault://runtime/opaque-ref",
         "FOUNDRY_ORIGIN": "https://foundry.example.com",
@@ -215,6 +221,14 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
             "secret_name": "FND008_RUNTIME_G1",
         },
     ]
+    assert config["containers"][0]["secrets"] == [
+        {"env_var": "FND008_HERMES_ENV", "name": "FND008_HERMES_ENV"}
+    ]
+    assert config["containers"][1]["secrets"] == [
+        {"env_var": "FND008_HERMES_KEY", "name": "FND008_HERMES_KEY"},
+        {"env_var": "FND008_OPENAI_KEY", "name": "FND008_OPENAI_KEY"},
+        {"env_var": "FND008_RUNTIME_G1", "name": "FND008_RUNTIME_G1"},
+    ]
     assert result.health is not None
     assert result.health.containers == {
         "hermes": ContainerState.STARTED,
@@ -226,6 +240,16 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     assert "foundry-secret" not in serialized
     assert fake.calls[0].headers["Authorization"] == "<redacted>"
     assert fake.calls[0].timeout == 10.0
+
+
+def test_machine_payload_includes_current_release_metadata():
+    fly = provider(FakeFlyTransport([]))
+    fly.set_release_metadata("rel_release123", "2")
+
+    metadata = fly.machine_payload(machine_spec())["config"]["metadata"]
+
+    assert metadata["fly_release_id"] == "rel_release123"
+    assert metadata["fly_release_version"] == "2"
 
 
 def test_container_file_secret_rejects_paths_outside_runtime_secret_root():
@@ -335,7 +359,11 @@ def test_attachment_conflict_is_typed_and_does_not_start_machine():
 
 def test_wait_and_start_ok_responses_map_to_machine_records():
     fake = FakeFlyTransport(
-        [TransportResponse(200, {"ok": True}), TransportResponse(200, {"ok": True})]
+        [
+            TransportResponse(200, {"ok": True}),
+            TransportResponse(200, fixture("machines.json")[0]),
+            TransportResponse(200, {"ok": True}),
+        ]
     )
     adapter = provider(fake)
     waited = adapter.wait_machine("app", "machine", timeout_seconds=10)
@@ -343,6 +371,19 @@ def test_wait_and_start_ok_responses_map_to_machine_records():
     assert waited.state.value == "started"
     assert started.state.value == "started"
     assert fake.calls[0].url.endswith("/machines/machine/wait?state=started&timeout=10")
+    assert fake.calls[1].url.endswith("/machines/machine")
+
+
+def test_wait_acknowledgement_preserves_authoritative_created_state():
+    machine = dict(fixture("machines.json")[0])
+    machine["state"] = "created"
+    fake = FakeFlyTransport(
+        [TransportResponse(200, {"ok": True}), TransportResponse(200, machine)]
+    )
+
+    waited = provider(fake).wait_machine("app", "machine-01", timeout_seconds=10)
+
+    assert waited.state is MachineState.CREATED
 
 
 @pytest.mark.parametrize(

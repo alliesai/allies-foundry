@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
@@ -16,6 +18,7 @@ from uuid import UUID
 from runtime.exceptions import RuntimeConflictError, RuntimeFencedError
 from runtime.models import (
     Attempt,
+    AttemptStatus,
     ConversationBinding,
     Execution,
     ExecutionEvent,
@@ -48,16 +51,12 @@ _CREDENTIAL_REF = "file:///run/secrets/foundry-runtime-token"
 HERMES_PROOF_CREDENTIAL_REF = "file:///run/secrets/hermes-api-key"
 OPENAI_PROOF_CREDENTIAL_REF = "file:///run/secrets/openai-api-key"
 _HERMES_KEY_PATH = "/run/secrets/hermes-api-key"
-_HERMES_PROOF_COMMAND = (
-    "sh",
-    "-c",
-    'API_SERVER_KEY="$(cat /run/secrets/hermes-api-key)"; export API_SERVER_KEY; exec hermes gateway run --no-supervise',
-)
 _SAFE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 _SAFE_FLY_SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _SAFE_BASE64 = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _FLY_CLI_TIMEOUT_SECONDS = 15
+_FLY_DEPLOY_TIMEOUT_SECONDS = 180
 _CLEANUP_TIMEOUT_SECONDS = 30
 _CLEANUP_POLL_SECONDS = 1
 
@@ -67,9 +66,17 @@ class ProofSecretStore(Protocol):
 
     def remove(self, app_ref: str, secret_name: str) -> None: ...
 
+    def remove_many(self, app_ref: str, secret_names: tuple[str, ...]) -> None: ...
+
 
 class ProofProgressDriver(Protocol):
     def __call__(self, stage: str, state: ProofRunState) -> None: ...
+
+
+class _FlySecretCommandError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class FlyCliSecretStore:
@@ -93,8 +100,101 @@ class FlyCliSecretStore:
         )
 
     def remove(self, app_ref: str, secret_name: str) -> None:
-        self._validate_secret_name(secret_name)
-        self._run(("secrets", "unset", secret_name, "--stage", "--app", app_ref))
+        self.remove_many(app_ref, (secret_name,))
+
+    def remove_many(self, app_ref: str, secret_names: tuple[str, ...]) -> None:
+        if not secret_names:
+            return
+        for secret_name in secret_names:
+            self._validate_secret_name(secret_name)
+        self._run(
+            ("secrets", "unset", *secret_names, "--app", app_ref),
+            timeout_seconds=_FLY_DEPLOY_TIMEOUT_SECONDS,
+        )
+        listed = self._run(("secrets", "list", "--app", app_ref, "--json"))
+        try:
+            payload = json.loads(listed.stdout)
+            remaining = {
+                str(item.get("Name") or item.get("name"))
+                for item in payload
+                if isinstance(item, dict)
+            }
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise _FlySecretCommandError("fly_secret_cleanup_verification_invalid") from exc
+        if remaining.intersection(secret_names):
+            raise _FlySecretCommandError("fly_secret_cleanup_incomplete")
+
+    def bootstrap_release(
+        self, app_ref: str, image: str, region: str
+    ) -> tuple[str, str]:
+        """Create the first Fly release so staged app secrets become active."""
+
+        if not _SAFE_SLUG.fullmatch(app_ref) or not _SAFE_SLUG.fullmatch(region):
+            raise ValueError("Fly release bootstrap identifiers are invalid")
+        if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image, re.IGNORECASE):
+            raise ValueError("Fly release bootstrap image must use an immutable digest")
+        descriptor, config_path = tempfile.mkstemp(suffix=".toml")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as config:
+                config.write(
+                    f'app = "{app_ref}"\n'
+                    f'primary_region = "{region}"\n\n'
+                    "[build]\n"
+                    f'image = "{image}"\n\n'
+                    "[experimental]\n"
+                    'entrypoint = ["/bin/sh", "-c", "sleep 1800"]\n\n'
+                    "[[vm]]\n"
+                    'memory = "256mb"\n'
+                    'cpu_kind = "shared"\n'
+                    "cpus = 1\n"
+                )
+            self._run(
+                (
+                    "deploy",
+                    "--config",
+                    config_path,
+                    "--app",
+                    app_ref,
+                    "--ha=false",
+                    "--yes",
+                ),
+                timeout_seconds=_FLY_DEPLOY_TIMEOUT_SECONDS,
+            )
+            return self._release_metadata(app_ref)
+        finally:
+            Path(config_path).unlink(missing_ok=True)
+
+    def deploy(self, app_ref: str) -> tuple[str, str]:
+        """Promote secrets staged after the app's first release."""
+
+        self._run(
+            ("secrets", "deploy", "--app", app_ref),
+            timeout_seconds=_FLY_DEPLOY_TIMEOUT_SECONDS,
+        )
+        return self._release_metadata(app_ref)
+
+    def _release_metadata(self, app_ref: str) -> tuple[str, str]:
+        completed = self._run(("machine", "list", "--app", app_ref, "--json"))
+        try:
+            machines = json.loads(completed.stdout)
+            candidates = [
+                (
+                    item["config"]["metadata"]["fly_release_id"],
+                    str(item["config"]["metadata"]["fly_release_version"]),
+                )
+                for item in machines
+                if item.get("config", {})
+                .get("metadata", {})
+                .get("fly_release_id")
+            ]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise _FlySecretCommandError("fly_release_metadata_invalid") from exc
+        if not candidates:
+            raise _FlySecretCommandError("fly_release_metadata_missing")
+        release_id, version = max(candidates, key=lambda item: int(item[1]))
+        if not re.fullmatch(r"rel_[A-Za-z0-9]+", release_id) or not version.isdigit():
+            raise _FlySecretCommandError("fly_release_metadata_invalid")
+        return release_id, version
 
     @staticmethod
     def _validate_secret_name(secret_name: str) -> None:
@@ -103,7 +203,13 @@ class FlyCliSecretStore:
         ):
             raise ValueError("Fly secret name is invalid")
 
-    def _run(self, args: tuple[str, ...], *, input_value: str | None = None) -> None:
+    def _run(
+        self,
+        args: tuple[str, ...],
+        *,
+        input_value: str | None = None,
+        timeout_seconds: float = _FLY_CLI_TIMEOUT_SECONDS,
+    ) -> subprocess.CompletedProcess[str]:
         try:
             completed = subprocess.run(
                 (self.executable, *args),
@@ -111,14 +217,33 @@ class FlyCliSecretStore:
                 text=True,
                 capture_output=True,
                 check=False,
-                timeout=_FLY_CLI_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Fly secret command timed out") from exc
+            code = (
+                "fly_secret_release_bootstrap_timeout"
+                if args[:1] == ("deploy",)
+                else "fly_secret_deploy_timeout"
+                if args[:2] == ("secrets", "deploy")
+                else "fly_secret_cleanup_timeout"
+                if args[:2] == ("secrets", "unset")
+                else "fly_secret_command_timeout"
+            )
+            raise _FlySecretCommandError(code) from exc
         except OSError as exc:
-            raise RuntimeError("Fly secret command is unavailable") from exc
+            raise _FlySecretCommandError("fly_secret_command_unavailable") from exc
         if completed.returncode != 0:
-            raise RuntimeError("Fly secret command failed")
+            code = (
+                "fly_secret_release_bootstrap_failed"
+                if args[:1] == ("deploy",)
+                else "fly_secret_deploy_failed"
+                if args[:2] == ("secrets", "deploy")
+                else "fly_secret_cleanup_failed"
+                if args[:2] == ("secrets", "unset")
+                else "fly_secret_command_failed"
+            )
+            raise _FlySecretCommandError(code)
+        return completed
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +252,7 @@ class ProofCredentialHandle:
     app_ref: str
     generation: int
     operation_id: UUID
-    credential_id: UUID
+    credential_id: UUID | None
     secret_name: str
     credential_ref: str
     raw_token: str = field(repr=False)
@@ -248,6 +373,7 @@ class ProofCredentialBootstrap:
         *,
         generation: int,
         operation_id: UUID,
+        issue: bool = True,
     ) -> ProofCredentialHandle:
         existing = self._handles.get(operation_id)
         if existing is not None:
@@ -257,40 +383,52 @@ class ProofCredentialBootstrap:
                 or existing.generation != generation
             ):
                 raise ValueError("proof credential operation was reused")
-            return existing
+            return self.issue(existing) if issue else existing
         token = self.token_factory()
         secret_name = f"ALLIES_FND008_G{generation}_{operation_id.hex[:16].upper()}"
         encoded = base64.b64encode(token.encode("utf-8")).decode("ascii")
         self.secret_store.stage(app_ref, secret_name, encoded)
-        try:
-            issued = self.credential_issuer(
-                workspace_id,
-                generation,
-                token,
-                operation_id,
-            )
-        except Exception:
-            self.secret_store.remove(app_ref, secret_name)
-            raise
         handle = ProofCredentialHandle(
             workspace_id=workspace_id,
             app_ref=app_ref,
             generation=generation,
             operation_id=operation_id,
-            credential_id=issued.credential.id,
+            credential_id=None,
             secret_name=secret_name,
             credential_ref=_CREDENTIAL_REF,
             raw_token=token,
         )
         self._handles[operation_id] = handle
-        return handle
+        return self.issue(handle) if issue else handle
+
+    def issue(self, handle: ProofCredentialHandle) -> ProofCredentialHandle:
+        existing = self._handles.get(handle.operation_id)
+        if existing != handle:
+            raise ValueError("proof credential handle is unavailable")
+        if handle.credential_id is not None:
+            return handle
+        try:
+            issued = self.credential_issuer(
+                handle.workspace_id,
+                handle.generation,
+                handle.raw_token,
+                handle.operation_id,
+            )
+        except Exception:
+            self.secret_store.remove(handle.app_ref, handle.secret_name)
+            self._handles.pop(handle.operation_id, None)
+            raise
+        active = replace(handle, credential_id=issued.credential.id)
+        self._handles[handle.operation_id] = active
+        return active
 
     def cleanup(self, handle: ProofCredentialHandle) -> None:
         failures: list[Exception] = []
-        try:
-            self.credential_revoker(handle.credential_id)
-        except Exception as exc:  # noqa: BLE001 - both cleanup legs must run
-            failures.append(exc)
+        if handle.credential_id is not None:
+            try:
+                self.credential_revoker(handle.credential_id)
+            except Exception as exc:  # noqa: BLE001 - both cleanup legs must run
+                failures.append(exc)
         try:
             self.secret_store.remove(handle.app_ref, handle.secret_name)
         except Exception as exc:  # noqa: BLE001 - both cleanup legs must run
@@ -299,6 +437,65 @@ class ProofCredentialBootstrap:
             self._handles.pop(handle.operation_id, None)
         if failures:
             raise RuntimeError("proof credential cleanup failed") from failures[0]
+
+
+def _cleanup_proof_credentials(
+    credential_bootstrap: ProofCredentialBootstrap,
+    handles: tuple[ProofCredentialHandle, ...],
+    dependency_bootstrap: ProofDependencyCredentialBootstrap | None,
+    dependency_handle: ProofDependencyCredentialHandle | None,
+) -> None:
+    """Revoke database credentials and batch Fly secret removal by store/app."""
+
+    failures: list[Exception] = []
+    groups: list[tuple[ProofSecretStore, str, list[str]]] = []
+
+    def add_secret(store: ProofSecretStore, app_ref: str, secret_name: str) -> None:
+        for existing_store, existing_app, names in groups:
+            if existing_store is store and existing_app == app_ref:
+                names.append(secret_name)
+                return
+        groups.append((store, app_ref, [secret_name]))
+
+    for handle in handles:
+        if handle.credential_id is not None:
+            try:
+                credential_bootstrap.credential_revoker(handle.credential_id)
+            except Exception as exc:  # noqa: BLE001 - all cleanup legs must run
+                failures.append(exc)
+        credential_bootstrap._handles.pop(handle.operation_id, None)
+        add_secret(
+            credential_bootstrap.secret_store,
+            handle.app_ref,
+            handle.secret_name,
+        )
+
+    if dependency_bootstrap is not None and dependency_handle is not None:
+        dependency_bootstrap._handle = None
+        add_secret(
+            dependency_bootstrap.secret_store,
+            dependency_handle.app_ref,
+            dependency_handle.provider_key_secret_name,
+        )
+        add_secret(
+            dependency_bootstrap.secret_store,
+            dependency_handle.app_ref,
+            dependency_handle.hermes_key_secret_name,
+        )
+
+    for store, app_ref, names in groups:
+        remove_many = getattr(store, "remove_many", None)
+        try:
+            if callable(remove_many):
+                remove_many(app_ref, tuple(names))
+            else:
+                for name in names:
+                    store.remove(app_ref, name)
+        except Exception as exc:  # noqa: BLE001 - provider cleanup must still run
+            failures.append(exc)
+
+    if failures:
+        raise RuntimeError("proof credential cleanup failed") from failures[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +589,8 @@ def run_machine_replacement_proof(
     provider: Any,
     credential_bootstrap: ProofCredentialBootstrap,
     dependency_credential_bootstrap: ProofDependencyCredentialBootstrap | None = None,
+    bootstrap_secrets: Callable[[str, str, str], Any] | None = None,
+    activate_staged_secrets: Callable[[str], Any] | None = None,
     progress: ProofProgressDriver | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
@@ -413,7 +612,12 @@ def run_machine_replacement_proof(
     failure_code: str | None = None
     cleanup_complete = True
     deadline = clock() + config.timeout_seconds
-    lifecycle = WorkspaceLifecycle(provider, sleep=sleep, jitter=False)
+    lifecycle = WorkspaceLifecycle(
+        provider,
+        sleep=sleep,
+        jitter=False,
+        phase_deadline_seconds=min(config.timeout_seconds, 180),
+    )
     state = ProofRunState(
         workspace_id=config.workspace_id,
         profile_ids=tuple(profile.profile_id for profile in config.profiles),
@@ -436,8 +640,12 @@ def run_machine_replacement_proof(
             or workspace.machine_generation != 0
         ):
             raise RuntimeError("workspace_not_fresh")
-        app = provider.ensure_app(config.workspace_spec.app_spec(config.workspace_id))
+        app_spec = config.workspace_spec.app_spec(config.workspace_id)
+        resources["app"] = app_spec.name
+        # App creation may succeed remotely even when its response is lost.
+        # From this point cleanup must reconcile the exact proof-owned name.
         mutated = True
+        app = provider.ensure_app(app_spec)
         resources["app"] = app.name
         if dependency_credential_bootstrap is not None:
             dependency_handle = dependency_credential_bootstrap.prepare(app.name)
@@ -449,8 +657,25 @@ def run_machine_replacement_proof(
             operation_id=UUID(bytes=secrets.token_bytes(16)),
         )
         handles.append(first_handle)
+        second_handle = credential_bootstrap.prepare(
+            workspace.id,
+            app.name,
+            generation=2,
+            operation_id=UUID(bytes=secrets.token_bytes(16)),
+            issue=False,
+        )
+        handles.append(second_handle)
         first_spec = _spec_for_handle(config, first_handle, dependency_handle)
+        if bootstrap_secrets is not None:
+            release_metadata = bootstrap_secrets(
+                app.name,
+                config.workspace_spec.runtime_image,
+                config.workspace_spec.region,
+            )
+            _set_provider_release_metadata(provider, release_metadata)
         first_binding = lifecycle.ensure_workspace(workspace.id, first_spec)
+        second_handle = credential_bootstrap.issue(second_handle)
+        handles[-1] = second_handle
         old_generation = first_binding.machine_generation
         resources.update(
             {
@@ -522,12 +747,19 @@ def run_machine_replacement_proof(
                 profile.profile_id,
                 f"{config.run_id}-active-{profile.alias}",
                 {
-                    "message": f"Recall the proof fact for {profile.alias}.",
+                    "message": (
+                        f"Keep this proof stream active for {profile.alias}. "
+                        f"The continuity marker is: {profile.recognizable_fact}"
+                    ),
                     "cloud_conversation_ref": f"{config.run_id}-{profile.alias}",
+                    "proof_expected_history_marker": profile.recognizable_fact,
+                    "proof_forbidden_history_marker": config.profiles[
+                        1 - index
+                    ].recognizable_fact,
                     "proof_hold_after_first_safe_event": True,
                 },
             )
-            for profile in config.profiles
+            for index, profile in enumerate(config.profiles)
         )
         queued = create_execution(
             workspace.id,
@@ -553,13 +785,6 @@ def run_machine_replacement_proof(
         )
         checks.append(ProofCheck("active_overlap", "pass", "two_streams_and_queue"))
 
-        second_handle = credential_bootstrap.prepare(
-            workspace.id,
-            app.name,
-            generation=old_generation + 1,
-            operation_id=UUID(bytes=secrets.token_bytes(16)),
-        )
-        handles.append(second_handle)
         second_spec = _spec_for_handle(config, second_handle, dependency_handle)
         replacement = lifecycle.replace_machine(
             workspace.id,
@@ -571,11 +796,23 @@ def run_machine_replacement_proof(
         if replacement.volume_ref != first_binding.volume_ref:
             raise RuntimeError("replacement_volume_changed")
         inspect_old = getattr(provider, "inspect_machine_by_id", None)
-        if (
-            inspect_old is None
-            or inspect_old(app.name, first_binding.machine_ref) is not None
-        ):
-            raise RuntimeError("old_machine_still_present")
+        if inspect_old is None:
+            raise RuntimeError("old_machine_inspection_unavailable")
+
+        def old_machine_destroyed() -> bool:
+            machine = inspect_old(app.name, first_binding.machine_ref)
+            return machine is None or machine.state is MachineState.DESTROYED
+
+        _wait_for(
+            "old_machine_destroyed",
+            state,
+            progress,
+            old_machine_destroyed,
+            deadline,
+            clock,
+            sleep,
+            config.poll_interval,
+        )
         resources["replacement_machine"] = replacement.machine_ref
         checks.append(ProofCheck("machine_replacement", "pass", "volume_preserved"))
 
@@ -611,26 +848,51 @@ def run_machine_replacement_proof(
                         f"Reply with the exact proof fact for {profile.alias} only."
                     ),
                     "cloud_conversation_ref": f"{config.run_id}-{profile.alias}",
+                    "proof_expected_history_marker": profile.recognizable_fact,
+                    "proof_forbidden_history_marker": config.profiles[
+                        1 - index
+                    ].recognizable_fact,
                 },
             )
-            for profile in config.profiles
+            for index, profile in enumerate(config.profiles)
         )
         state = replace(
             state,
             execution_ids=tuple(item.id for item in (*active, queued, *resumed)),
         )
-        _wait_for(
-            "replacement_recovery",
-            state,
-            progress,
-            lambda: (
+        def replacement_recovered() -> bool:
+            failed_receipt = (
+                Attempt.objects.filter(
+                    execution_id__in=tuple(item.id for item in resumed),
+                    status=AttemptStatus.FAILED,
+                )
+                .order_by("execution_id", "number")
+                .values_list("terminal_receipt", flat=True)
+                .first()
+            )
+            if isinstance(failed_receipt, dict):
+                code = failed_receipt.get("code")
+                safe_code = (
+                    code
+                    if isinstance(code, str) and _SAFE_CODE.fullmatch(code)
+                    else "failed"
+                )
+                failure = RuntimeError(f"replacement_recovery_{safe_code}")
+                raise failure
+            return (
                 Execution.objects.filter(
                     pk__in=tuple(item.id for item in active),
                     status=ExecutionStatus.FAILED,
                 ).count()
                 == 2
                 and _executions_succeeded(tuple(item.id for item in (queued, *resumed)))
-            ),
+            )
+
+        _wait_for(
+            "replacement_recovery",
+            state,
+            progress,
+            replacement_recovered,
             deadline,
             clock,
             sleep,
@@ -686,19 +948,15 @@ def run_machine_replacement_proof(
         failure_code = _safe_failure_code(exc)
         checks.append(ProofCheck("proof_run", "fail", failure_code))
     finally:
-        for handle in reversed(handles):
-            try:
-                credential_bootstrap.cleanup(handle)
-            except Exception:  # noqa: BLE001 - cleanup detail is intentionally bounded
-                cleanup_complete = False
-        if (
-            dependency_handle is not None
-            and dependency_credential_bootstrap is not None
-        ):
-            try:
-                dependency_credential_bootstrap.cleanup(dependency_handle)
-            except Exception:  # noqa: BLE001 - provider cleanup must still run
-                cleanup_complete = False
+        try:
+            _cleanup_proof_credentials(
+                credential_bootstrap,
+                tuple(reversed(handles)),
+                dependency_credential_bootstrap,
+                dependency_handle,
+            )
+        except Exception:  # noqa: BLE001 - provider cleanup must still run
+            cleanup_complete = False
         if mutated:
             try:
                 _record_current_machine(config.workspace_id, resources)
@@ -757,8 +1015,10 @@ def _spec_for_handle(
             ContainerSpec(
                 "hermes",
                 config.workspace_spec.hermes_image,
-                command=_HERMES_PROOF_COMMAND,
-                healthchecks=(_proof_process_healthcheck("hermes"),),
+                command=_hermes_proof_command(dependency_handle),
+                healthchecks=(
+                    _proof_process_healthcheck("hermes"),
+                ),
                 environment={
                     "HERMES_HOME": "/opt/data",
                     "API_SERVER_HOST": "127.0.0.1",
@@ -775,7 +1035,18 @@ def _spec_for_handle(
             ContainerSpec(
                 "allies-runtime",
                 config.workspace_spec.runtime_image,
-                healthchecks=(_proof_process_healthcheck("allies-runtime"),),
+                entrypoint=_runtime_proof_command(),
+                environment={"HERMES_STREAM_TIMEOUT": "60"},
+                healthchecks=(
+                    _proof_process_healthcheck(
+                        "allies-runtime",
+                        (
+                            "/run/secrets/hermes-api-key",
+                            "/run/secrets/openai-api-key",
+                            "/run/secrets/foundry-runtime-token",
+                        ),
+                    ),
+                ),
                 secret_files=(
                     ContainerFileSecret(
                         "/run/secrets/hermes-api-key",
@@ -799,10 +1070,71 @@ def _spec_for_handle(
     )
 
 
-def _proof_process_healthcheck(name: str) -> dict[str, object]:
+def _set_provider_release_metadata(provider: Any, metadata: Any) -> None:
+    if metadata is None:
+        return
+    if (
+        not isinstance(metadata, tuple)
+        or len(metadata) != 2
+        or not all(isinstance(item, str) for item in metadata)
+    ):
+        raise RuntimeError("provider_release_metadata_invalid")
+    setter = getattr(provider, "set_release_metadata", None)
+    if setter is None:
+        raise RuntimeError("provider_release_metadata_unsupported")
+    setter(*metadata)
+
+
+def _hermes_proof_command(
+    dependency_handle: ProofDependencyCredentialHandle,
+) -> tuple[str, ...]:
+    if not _SAFE_FLY_SECRET_NAME.fullmatch(
+        dependency_handle.hermes_key_secret_name
+    ):
+        raise ValueError("Fly secret name is invalid")
+    command = (
+        f'test -s {_HERMES_KEY_PATH} || exit 1; '
+        f'API_SERVER_KEY="$(cat {_HERMES_KEY_PATH})"; '
+        "export API_SERVER_KEY; "
+        "exec hermes gateway run --no-supervise"
+    )
+    return ("sh", "-c", command)
+
+
+def _runtime_proof_command() -> tuple[str, ...]:
+    return (
+        "sh",
+        "-c",
+        "test -s /run/secrets/hermes-api-key"
+        " && test -s /run/secrets/openai-api-key"
+        " && test -s /run/secrets/foundry-runtime-token"
+        " || exit 1; chown 10000:10000 /run/secrets"
+        + " /run/secrets/hermes-api-key"
+        + " /run/secrets/openai-api-key"
+        + " /run/secrets/foundry-runtime-token"
+        + "; chmod 0700 /run/secrets"
+        + "; chmod 0600 /run/secrets/hermes-api-key"
+        + " /run/secrets/openai-api-key"
+        + " /run/secrets/foundry-runtime-token"
+        + "; attempts=0"
+        + '; while [ "$(stat -c %u /opt/data)" != 10000 ]; do '
+        + "attempts=$((attempts + 1)); "
+        + '[ "$attempts" -lt 60 ] || exit 1; sleep 1; done'
+        + "; exec setpriv --reuid=10000 --regid=10000 --clear-groups"
+        + " python -m allies_runtime",
+    )
+
+
+def _proof_process_healthcheck(
+    name: str, required_secret_paths: tuple[str, ...] = ()
+) -> dict[str, object]:
+    checks = [
+        *(f"test -s {path}" for path in required_secret_paths),
+        "test -r /proc/1/stat",
+    ]
     return {
         "name": name,
-        "exec": {"command": ["/bin/sh", "-c", "test -r /proc/1/stat"]},
+        "exec": {"command": ["/bin/sh", "-c", " && ".join(checks)]},
         "interval": 5,
         "timeout": 2,
         "grace_period": 5,
@@ -841,6 +1173,24 @@ def _wait_for_active_precondition(
 
     def ready() -> bool:
         nonlocal result
+        failed_receipt = (
+            Attempt.objects.filter(
+                execution_id__in=state.execution_ids[:2],
+                status=AttemptStatus.FAILED,
+            )
+            .order_by("execution_id", "number")
+            .values_list("terminal_receipt", flat=True)
+            .first()
+        )
+        if isinstance(failed_receipt, dict):
+            code = failed_receipt.get("code")
+            safe_code = (
+                code
+                if isinstance(code, str) and _SAFE_CODE.fullmatch(code)
+                else "failed"
+            )
+            failure = RuntimeError(f"active_streams_{safe_code}")
+            raise failure
         attempts = tuple(
             Attempt.objects.filter(
                 execution_id__in=state.execution_ids[:2],
@@ -920,10 +1270,35 @@ def _assert_profile_fact_continuity(
     for index, (profile, execution) in enumerate(
         zip(profiles, executions, strict=True)
     ):
-        output = _execution_text(execution.id).casefold()
-        other_fact = profiles[1 - index].recognizable_fact.casefold()
-        if profile.recognizable_fact.casefold() not in output or other_fact in output:
+        if not _history_verified(execution.id):
             raise RuntimeError("profile_fact_continuity_failed")
+        output_tokens = set(
+            re.findall(r"[a-z0-9]+", _execution_text(execution.id).casefold())
+        )
+        expected_tokens = _recognizable_fact_tokens(profile.recognizable_fact)
+        other_tokens = _recognizable_fact_tokens(
+            profiles[1 - index].recognizable_fact
+        )
+        if not expected_tokens <= output_tokens or other_tokens <= output_tokens:
+            raise RuntimeError("profile_fact_continuity_failed")
+
+
+def _recognizable_fact_tokens(value: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", value.casefold())) - {"the", "is"}
+
+
+def _history_verified(execution_id: UUID) -> bool:
+    receipts = tuple(
+        Attempt.objects.filter(
+            execution_id=execution_id,
+            status=AttemptStatus.SUCCEEDED,
+        ).values_list("terminal_receipt", flat=True)
+    )
+    return (
+        len(receipts) == 1
+        and isinstance(receipts[0], dict)
+        and receipts[0].get("history_verified") is True
+    )
 
 
 def _default_old_token_probe(raw_token: str) -> bool:

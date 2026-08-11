@@ -74,6 +74,8 @@ class Command(BaseCommand):
                     secret_store,
                     provider_api_key=provider_api_key,
                 ),
+                bootstrap_secrets=secret_store.bootstrap_release,
+                activate_staged_secrets=secret_store.deploy,
             )
         except (OSError, ProviderError, TypeError, ValueError) as exc:
             result = self._skipped(run_id, "command_preflight_failed")
@@ -93,26 +95,28 @@ class Command(BaseCommand):
         runtime_image = self._image(options["runtime_image"], "runtime image")
         hermes_image = self._image(options["hermes_image"], "Hermes image")
         foundry_origin = self._foundry_origin(options["foundry_origin"])
+        facts = (
+            "the copper lighthouse is north",
+            "the blue orchard is east",
+        )
         profiles = tuple(
             ProofProfile(
                 alias=f"ally-{alias}",
                 profile_id=uuid4(),
                 ally_ref=f"ally-{alias}",
                 seed=ProfileSeed(
-                    personality=f"You are Ally {alias.upper()} in a continuity proof.",
+                    personality=(
+                        f"You are Ally {alias.upper()} in a continuity proof."
+                    ),
                     provider="openai",
                     model=options["model"],
                     base_url=options["base_url"],
                     first_chat_instruction="Answer briefly and retain the stated fact.",
                     credential_refs={"OPENAI_API_KEY": OPENAI_PROOF_CREDENTIAL_REF},
                 ),
-                recognizable_fact=(
-                    "the copper lighthouse is north"
-                    if index == 0
-                    else "the blue orchard is east"
-                ),
+                recognizable_fact=fact,
             )
-            for index, alias in enumerate(("a", "b"))
+            for alias, fact in zip(("a", "b"), facts, strict=True)
         )
         return ContinuityProofConfig(
             run_id=run_id,

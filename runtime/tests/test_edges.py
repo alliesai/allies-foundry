@@ -228,7 +228,27 @@ def test_readiness_requires_authenticated_hermes_probe():
         async def health_detailed(self):
             raise HermesAuthenticationError("rejected")
 
+    class DegradedModelWithReadyGateway:
+        async def health_detailed(self):
+            return SimpleNamespace(
+                status="degraded",
+                readiness={
+                    "checks": {"gateway": {"status": "ok", "state": "running"}}
+                },
+            )
+
+    class DegradedWithUnavailableGateway:
+        async def health_detailed(self):
+            return SimpleNamespace(
+                status="degraded",
+                readiness={
+                    "checks": {"gateway": {"status": "degraded", "state": "starting"}}
+                },
+            )
+
     assert asyncio.run(__main__.probe_readiness(Healthy()))
+    assert asyncio.run(__main__.probe_readiness(DegradedModelWithReadyGateway()))
+    assert not asyncio.run(__main__.probe_readiness(DegradedWithUnavailableGateway()))
     assert not asyncio.run(__main__.probe_readiness(Unauthenticated()))
 
 

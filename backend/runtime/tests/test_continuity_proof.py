@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import re
+from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -235,8 +237,28 @@ def test_proof_spec_mounts_each_dependency_only_in_its_consumer():
     spec = _spec_for_handle(config, generation, dependencies)
     hermes, runtime = spec.containers or ()
 
+    assert not hermes.entrypoint
+    assert hermes.user is None
     assert hermes.command[:2] == ("sh", "-c")
+    assert "chown" not in hermes.command[2]
     assert "exec hermes gateway run --no-supervise" in hermes.command[2]
+    assert "/run/secrets/hermes-api-key" in hermes.command[2]
+    assert runtime.entrypoint[:2] == ("sh", "-c")
+    assert "chown -R" not in runtime.entrypoint[2]
+    assert "stat -c %u /opt/data" in runtime.entrypoint[2]
+    assert "setpriv --reuid=10000 --regid=10000" in runtime.entrypoint[2]
+    assert runtime.entrypoint[2].endswith("python -m allies_runtime")
+    assert runtime.environment["HERMES_STREAM_TIMEOUT"] == "60"
+    assert "/run/secrets/foundry-runtime-token" in runtime.entrypoint[2]
+    assert generation.raw_token not in runtime.entrypoint[2]
+    assert all(
+        path in runtime.healthchecks[0]["exec"]["command"][2]
+        for path in (
+            "/run/secrets/hermes-api-key",
+            "/run/secrets/openai-api-key",
+            "/run/secrets/foundry-runtime-token",
+        )
+    )
     assert {item.secret_name for item in hermes.secret_files} == {
         dependencies.hermes_key_secret_name
     }
@@ -255,7 +277,7 @@ def test_fly_secret_store_passes_secret_value_only_through_stdin(monkeypatch):
 
     def run(args, **kwargs):
         calls.append((args, kwargs))
-        return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=0, stdout="[]")
 
     monkeypatch.setattr(continuity_proof.subprocess, "run", run)
     store = FlyCliSecretStore("fly")
@@ -274,8 +296,49 @@ def test_fly_secret_store_passes_secret_value_only_through_stdin(monkeypatch):
     store.remove("allies-app", "FND008_SECRET")
 
     remove_args, remove_kwargs = calls[1]
-    assert "--stage" in remove_args
+    assert remove_args[1:] == (
+        "secrets",
+        "unset",
+        "FND008_SECRET",
+        "--app",
+        "allies-app",
+    )
     assert remove_kwargs["input"] is None
+    assert remove_kwargs["timeout"] == 180
+    assert calls[2][0][1:] == (
+        "secrets",
+        "list",
+        "--app",
+        "allies-app",
+        "--json",
+    )
+
+
+def test_fly_secret_store_batches_and_verifies_cleanup(monkeypatch):
+    from runtime.services import continuity_proof
+
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="[]")
+
+    monkeypatch.setattr(continuity_proof.subprocess, "run", run)
+
+    FlyCliSecretStore("fly").remove_many(
+        "allies-app", ("FND008_FIRST", "FND008_SECOND")
+    )
+
+    assert calls[0][0][1:] == (
+        "secrets",
+        "unset",
+        "FND008_FIRST",
+        "FND008_SECOND",
+        "--app",
+        "allies-app",
+    )
+    assert calls[0][1]["timeout"] == 180
+    assert calls[1][0][1:3] == ("secrets", "list")
 
 
 def test_fly_secret_store_reports_bounded_timeout(monkeypatch):
@@ -286,8 +349,76 @@ def test_fly_secret_store_reports_bounded_timeout(monkeypatch):
 
     monkeypatch.setattr(continuity_proof.subprocess, "run", timeout)
 
-    with pytest.raises(RuntimeError, match="timed out"):
+    with pytest.raises(RuntimeError, match="fly_secret_cleanup_timeout"):
         FlyCliSecretStore("fly").remove("allies-app", "FND008_SECRET")
+
+
+def test_fly_secret_store_bootstraps_first_release_without_secret_values(
+    monkeypatch,
+):
+    from runtime.services import continuity_proof
+
+    captured = {}
+
+    def run(args, **kwargs):
+        if args[1:3] == ("machine", "list"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '[{"config":{"metadata":{"fly_release_id":'
+                    '"rel_test123","fly_release_version":"1"}}}]'
+                ),
+            )
+        config_path = Path(args[args.index("--config") + 1])
+        captured["args"] = args
+        captured["config"] = config_path.read_text(encoding="utf-8")
+        captured["timeout"] = kwargs["timeout"]
+        captured["path"] = config_path
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(continuity_proof.subprocess, "run", run)
+
+    release = FlyCliSecretStore("fly").bootstrap_release(
+        "allies-app",
+        "registry.example/runtime@sha256:" + "a" * 64,
+        "ams",
+    )
+
+    assert captured["args"][1] == "deploy"
+    assert 'app = "allies-app"' in captured["config"]
+    assert 'entrypoint = ["/bin/sh", "-c", "sleep 1800"]' in captured["config"]
+    assert captured["timeout"] == 180
+    assert not captured["path"].exists()
+    assert release == ("rel_test123", "1")
+
+
+def test_fly_secret_store_deploys_post_release_secrets(monkeypatch):
+    from runtime.services import continuity_proof
+
+    calls = []
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        stdout = (
+            '[{"config":{"metadata":{"fly_release_id":'
+            '"rel_test456","fly_release_version":"2"}}}]'
+            if args[1:3] == ("machine", "list")
+            else ""
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout)
+
+    monkeypatch.setattr(continuity_proof.subprocess, "run", run)
+
+    release = FlyCliSecretStore("fly").deploy("allies-app")
+
+    args, kwargs = calls[0]
+    assert args[1:] == (
+        "secrets",
+        "deploy",
+        "--app",
+        "allies-app",
+    )
+    assert kwargs["timeout"] == 180
+    assert release == ("rel_test456", "2")
 
 
 @pytest.mark.parametrize(
@@ -368,7 +499,14 @@ def test_proof_bootstrap_attempts_revocation_when_secret_removal_fails(
     assert revoked == [handle.credential_id]
 
 
-@pytest.mark.parametrize("outputs", [("", "fact-1"), ("fact-1", "fact-0")])
+@pytest.mark.parametrize(
+    "outputs",
+    [
+        ("fact-1", "fact-0"),
+        ("unrelated answer", "fact-1"),
+    ],
+    ids=["cross-profile", "missing-profile-fact"],
+)
 def test_profile_fact_continuity_rejects_missing_or_cross_profile_output(
     monkeypatch, outputs
 ):
@@ -382,9 +520,36 @@ def test_profile_fact_continuity_rejects_missing_or_cross_profile_output(
         "_execution_text",
         lambda execution_id: by_id[execution_id],
     )
+    monkeypatch.setattr(continuity_proof, "_history_verified", lambda _id: True)
 
     with pytest.raises(RuntimeError, match="profile_fact_continuity_failed"):
         _assert_profile_fact_continuity(profiles, executions)
+
+
+def test_profile_fact_continuity_accepts_punctuation_and_light_paraphrase(monkeypatch):
+    from runtime.services import continuity_proof
+
+    config = proof_config()
+    profiles = (
+        replace(config.profiles[0], recognizable_fact="the copper lighthouse is north"),
+        replace(config.profiles[1], recognizable_fact="the blue orchard is east"),
+    )
+    executions = (SimpleNamespace(id=uuid4()), SimpleNamespace(id=uuid4()))
+    outputs = dict(
+        zip(
+            (item.id for item in executions),
+            ("Copper lighthouse: north.", "Blue orchard — east."),
+            strict=True,
+        )
+    )
+    monkeypatch.setattr(
+        continuity_proof,
+        "_execution_text",
+        lambda execution_id: outputs[execution_id],
+    )
+    monkeypatch.setattr(continuity_proof, "_history_verified", lambda _id: True)
+
+    _assert_profile_fact_continuity(profiles, executions)
 
 
 @pytest.mark.django_db
@@ -650,6 +815,7 @@ def test_machine_replacement_proof_runs_full_deterministic_path():
                     number=number,
                     status=AttemptStatus.SUCCEEDED,
                     machine_generation=2,
+                    terminal_receipt={"history_verified": True},
                 )
                 execution.status = ExecutionStatus.SUCCEEDED
                 execution.save(update_fields=["status", "updated_at"])
@@ -667,10 +833,16 @@ def test_machine_replacement_proof_runs_full_deterministic_path():
                     )
         completed_stages.add(stage)
 
+    bootstraps = []
+    activations = []
     result = run_machine_replacement_proof(
         config,
         provider=provider,
         credential_bootstrap=bootstrap,
+        bootstrap_secrets=lambda app, image, region: bootstraps.append(
+            (app, image, region)
+        ),
+        activate_staged_secrets=activations.append,
         progress=progress,
         sleep=lambda _seconds: None,
     )
@@ -681,6 +853,8 @@ def test_machine_replacement_proof_runs_full_deterministic_path():
     assert result.workspace["new_generation"] == 2
     assert all(item["resumed"] and item["isolated"] for item in result.sessions)
     assert all(len(item["attempt_ids"]) >= 1 for item in result.executions)
+    assert len(bootstraps) == 1
+    assert activations == []
     assert [item["terminal_state"] for item in result.executions[:2]] == [
         ExecutionStatus.FAILED,
         ExecutionStatus.FAILED,
@@ -698,7 +872,10 @@ def test_machine_replacement_proof_runs_full_deterministic_path():
 def test_proof_timeout_after_mutation_is_failed_and_cleaned():
     provider = ProofProvider()
     store = FakeSecretStore()
-    bootstrap = ProofCredentialBootstrap(store, token_factory=lambda: "bounded-token")
+    bootstrap = ProofCredentialBootstrap(
+        store,
+        token_factory=iter(("bounded-token-one", "bounded-token-two")).__next__,
+    )
     config = proof_config(run_id="fnd008-timeout", timeout_seconds=0.02)
     now = [0.0]
 
@@ -717,6 +894,33 @@ def test_proof_timeout_after_mutation_is_failed_and_cleaned():
     assert result.exit_code == 1
     assert result.cleanup == "complete"
     assert result.checks[-1].detail_code == "profiles_generation_one_timeout"
+    assert not Workspace.objects.filter(pk=config.workspace_id).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_uncertain_app_creation_is_reconciled_during_cleanup():
+    class UncertainCreateProvider(ProofProvider):
+        def ensure_app(self, spec):
+            super().ensure_app(spec)
+            raise ProviderRetryableError(
+                "app create response was lost", operation="create_app"
+            )
+
+    provider = UncertainCreateProvider()
+    config = proof_config(run_id="fnd008-uncertain-app")
+
+    result = run_machine_replacement_proof(
+        config,
+        provider=provider,
+        credential_bootstrap=ProofCredentialBootstrap(FakeSecretStore()),
+    )
+
+    assert result.status == "fail"
+    assert result.cleanup == "complete"
+    assert result.resources["app"] == config.workspace_spec.app_spec(
+        config.workspace_id
+    ).name
+    assert provider.app is None
     assert not Workspace.objects.filter(pk=config.workspace_id).exists()
 
 

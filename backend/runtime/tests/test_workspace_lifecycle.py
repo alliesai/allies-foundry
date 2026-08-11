@@ -153,7 +153,9 @@ class FakeProvider:
             raise ProviderNotFoundError("Machine already destroyed")
         self._remove_machine(machine_id)
 
-    def wait_machine(self, app_name, machine_id, *, timeout_seconds):
+    def wait_machine(
+        self, app_name, machine_id, *, timeout_seconds, state="started"
+    ):
         self.calls.append("wait_machine")
         if self.force_unhealthy:
             machine = self.machines[machine_id]
@@ -168,6 +170,8 @@ class FakeProvider:
                 MachineHealth(MachineState.STARTED, {}),
             )
         if self.machines[machine_id].state is MachineState.CREATED:
+            if state == "stopped":
+                return self.machines[machine_id]
             return self._set_machine(machine_id, MachineState.STARTED)
         return self.machines[machine_id]
 
@@ -298,12 +302,36 @@ def test_ensure_does_not_restart_a_machine_that_create_already_started():
 
 
 @pytest.mark.django_db(transaction=True)
+def test_ensure_starts_a_machine_still_in_created_state():
+    provider = FakeProvider()
+    original_ensure = provider.ensure_machine
+
+    def ensure_created_machine(machine_spec):
+        machine = original_ensure(machine_spec)
+        return provider._set_machine(machine.id, MachineState.CREATED)
+
+    provider.ensure_machine = ensure_created_machine
+    lifecycle = WorkspaceLifecycle(provider, sleep=lambda _: None, jitter=False)
+    workspace = Workspace.objects.create(
+        id=WORKSPACE_ID, tenant_ref="tenant-create-pending"
+    )
+
+    binding = lifecycle.ensure_workspace(workspace.id, spec())
+
+    assert binding.machine_generation == 1
+    assert provider.calls.count("start_machine") == 1
+    assert provider.calls.count("wait_machine") >= 1
+
+
+@pytest.mark.django_db(transaction=True)
 def test_ensure_keeps_waiting_after_a_provider_wait_timeout():
     provider = FakeProvider()
     original_wait = provider.wait_machine
     wait_attempts = 0
 
-    def wait_after_timeout(app_name, machine_id, *, timeout_seconds):
+    def wait_after_timeout(
+        app_name, machine_id, *, timeout_seconds, state="started"
+    ):
         nonlocal wait_attempts
         wait_attempts += 1
         if wait_attempts == 1:
@@ -313,7 +341,7 @@ def test_ensure_keeps_waiting_after_a_provider_wait_timeout():
                 status_code=408,
             )
         return original_wait(
-            app_name, machine_id, timeout_seconds=timeout_seconds
+            app_name, machine_id, timeout_seconds=timeout_seconds, state=state
         )
 
     provider.wait_machine = wait_after_timeout
@@ -325,7 +353,7 @@ def test_ensure_keeps_waiting_after_a_provider_wait_timeout():
     binding = lifecycle.ensure_workspace(workspace.id, spec())
 
     assert binding.machine_generation == 1
-    assert wait_attempts == 2
+    assert wait_attempts == 3
 
 
 @pytest.mark.django_db(transaction=True)
@@ -629,7 +657,7 @@ def test_health_timeout_keeps_operation_resumable():
     provider = FakeProvider()
     provider.force_unhealthy = True
     lifecycle = WorkspaceLifecycle(
-        provider, sleep=lambda _: None, jitter=False, phase_deadline_seconds=0.01
+        provider, sleep=lambda _: None, jitter=False, phase_deadline_seconds=0.1
     )
     workspace = Workspace.objects.create(id=WORKSPACE_ID, tenant_ref="tenant-health")
 

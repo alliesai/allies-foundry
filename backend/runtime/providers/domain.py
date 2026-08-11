@@ -188,6 +188,8 @@ class ContainerSpec:
     name: str
     image: str
     command: tuple[str, ...] = ()
+    entrypoint: tuple[str, ...] = ()
+    user: str | None = None
     healthchecks: tuple[Mapping[str, object], ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict)
     secret_files: tuple[ContainerFileSecret, ...] = ()
@@ -199,6 +201,12 @@ class ContainerSpec:
             object.__setattr__(self, "command", tuple(self.command))
         for item in self.command:
             _identifier(item, "container command")
+        if not isinstance(self.entrypoint, tuple):
+            object.__setattr__(self, "entrypoint", tuple(self.entrypoint))
+        for item in self.entrypoint:
+            _identifier(item, "container entrypoint", max_length=4096)
+        if self.user is not None:
+            _identifier(self.user, "container user", max_length=64)
         if not isinstance(self.healthchecks, tuple):
             object.__setattr__(self, "healthchecks", tuple(self.healthchecks))
         normalized_checks: list[Mapping[str, object]] = []

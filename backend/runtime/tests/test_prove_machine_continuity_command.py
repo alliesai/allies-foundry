@@ -74,7 +74,11 @@ def test_live_command_writes_only_the_service_evidence(monkeypatch, tmp_path):
     monkeypatch.setattr(
         command,
         "FlyCliSecretStore",
-        lambda: SimpleNamespace(executable="fly"),
+        lambda: SimpleNamespace(
+            executable="fly",
+            deploy=lambda _app_ref: None,
+            bootstrap_release=lambda _app_ref, _image, _region: None,
+        ),
     )
     monkeypatch.setattr(
         command.Command, "_fly_api_token", staticmethod(lambda _: "fly-token")
@@ -102,6 +106,11 @@ def test_live_command_writes_only_the_service_evidence(monkeypatch, tmp_path):
     assert {profile.seed.provider for profile in captured["config"].profiles} == {
         "openai"
     }
+    assert all(
+        profile.recognizable_fact.casefold()
+        not in profile.seed.personality.casefold()
+        for profile in captured["config"].profiles
+    )
     assert "provider-key-must-not-escape" not in output.read_text(encoding="utf-8")
 
 

@@ -133,11 +133,11 @@ def runtime_entrypoint(
             base_url=settings.foundry_origin,
             runtime_token=runtime_token,
         )
-        hermes_client = hermes or HermesClient(settings, credential_resolver)
+        readiness_client = hermes or HermesClient(settings, credential_resolver)
     except (OSError, SettingsError, TypeError, ValueError):
         return 1
     deadline = time.monotonic() + _HERMES_STARTUP_GRACE_SECONDS
-    while not asyncio.run(probe_readiness(hermes_client)):
+    while not asyncio.run(probe_readiness(readiness_client)):
         if time.monotonic() >= deadline:
             return 1
         time.sleep(0.25)
@@ -145,7 +145,9 @@ def runtime_entrypoint(
         settings=settings,
         foundry=foundry,
         credential_resolver=credential_resolver,
-        hermes=hermes_client,
+        # A production worker must compose its own profile-aware Hermes client.
+        # An explicitly injected client remains available for tests/integrations.
+        hermes=hermes,
         idle_cycles=idle_cycles,
         idle_delay=0.25,
     )
@@ -159,7 +161,22 @@ async def probe_readiness(client: Any) -> bool:
     except Exception:  # noqa: BLE001 - readiness must fail closed
         return False
     status = getattr(health, "status", None)
-    return isinstance(status, str) and status.lower() in {"ok", "ready", "healthy"}
+    if isinstance(status, str) and status.lower() in {"ok", "ready", "healthy"}:
+        return True
+    if not isinstance(status, str) or status.lower() != "degraded":
+        return False
+    readiness = getattr(health, "readiness", None)
+    if not isinstance(readiness, dict):
+        return False
+    checks = readiness.get("checks")
+    if not isinstance(checks, dict):
+        return False
+    gateway = checks.get("gateway")
+    return (
+        isinstance(gateway, dict)
+        and gateway.get("status") == "ok"
+        and gateway.get("state") == "running"
+    )
 
 
 def serve(

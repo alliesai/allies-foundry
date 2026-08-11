@@ -275,3 +275,35 @@ def test_runtime_entrypoint_retries_hermes_during_startup(monkeypatch):
     assert result == 0
     assert sleeps == [0.25]
     assert len(worker_calls) == 1
+
+
+def test_runtime_entrypoint_does_not_reuse_global_readiness_client_for_worker(
+    monkeypatch,
+):
+    readiness_client = FakeHermesClient()
+    worker_calls = []
+
+    monkeypatch.setattr(
+        __main__, "HermesClient", lambda _settings, _resolver: readiness_client
+    )
+    monkeypatch.setattr(
+        __main__, "worker_entrypoint", lambda **kwargs: worker_calls.append(kwargs) or 0
+    )
+
+    result = runtime_entrypoint(
+        env={
+            "HERMES_CREDENTIAL_REF": "vault://hermes/runtime",
+            "FOUNDRY_ORIGIN": "https://foundry.example.com",
+            "FOUNDRY_RUNTIME_CREDENTIAL_REF": (
+                "file:///run/secrets/foundry-runtime-token"
+            ),
+        },
+        credential_resolver=lambda _reference: "hermes-runtime-key",
+        foundry_credential_resolver=lambda _reference: "foundry-secret",
+        foundry_factory=lambda **_kwargs: object(),
+        idle_cycles=1,
+    )
+
+    assert result == 0
+    assert len(worker_calls) == 1
+    assert worker_calls[0]["hermes"] is None

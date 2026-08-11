@@ -94,6 +94,24 @@ def validate_stream_message(message: str) -> str:
     return message
 
 
+def _content_contains_text(value: Any, expected: str, *, depth: int = 0) -> bool:
+    if isinstance(value, str):
+        return expected in value.casefold()
+    if depth >= 4:
+        return False
+    if isinstance(value, list):
+        return len(value) <= MAX_EVENTS and any(
+            _content_contains_text(item, expected, depth=depth + 1) for item in value
+        )
+    if isinstance(value, dict) and len(value) <= 16:
+        return any(
+            _content_contains_text(value.get(key), expected, depth=depth + 1)
+            for key in ("text", "content")
+            if key in value
+        )
+    return False
+
+
 def stable_session_identifiers(
     profile_id: str, cloud_conversation_ref: str
 ) -> StableSessionIdentifiers:
@@ -187,6 +205,7 @@ class _IncrementalHTTPStream:
         self.run_id: str | None = None
         self.state = "awaiting_run"
         self.active_activities: list[tuple[str, str]] = []
+        self.saw_assistant_delta = False
         self.terminal_event: HermesEvent | None = None
         self.done = False
         self.closed = False
@@ -346,7 +365,18 @@ class _IncrementalHTTPStream:
                 raise HermesMalformedResponse(
                     "Hermes assistant completion session was invalid"
                 )
-            return None
+            if name == "message.started" or self.saw_assistant_delta:
+                return None
+            content = payload.get("content")
+            if (
+                not isinstance(content, str)
+                or not content
+                or len(content.encode("utf-8")) > MAX_SAFE_TEXT_BYTES
+            ):
+                raise HermesMalformedResponse(
+                    "Hermes assistant completion omitted bounded text"
+                )
+            return self._event("message.delta", self.session_id, {"text": content})
         if name == "error":
             raise HermesError("Hermes reported a turn failure")
         if name == "assistant.delta":
@@ -357,6 +387,7 @@ class _IncrementalHTTPStream:
                 or len(delta.encode("utf-8")) > MAX_SAFE_TEXT_BYTES
             ):
                 raise HermesMalformedResponse("Hermes assistant delta was invalid")
+            self.saw_assistant_delta = True
             return self._event("message.delta", self.session_id, {"text": delta})
         if name == "tool.started":
             tool_name = payload.get("tool_name")
@@ -855,6 +886,51 @@ class HermesClient:
             return await self.create_profile_session(profile_id, session_id)
         except HermesSessionExists:
             return await self.inspect_profile_session(profile_id, session_id)
+
+    async def profile_session_matches_markers(
+        self,
+        profile_id: str,
+        session_id: str,
+        expected_text: str,
+        forbidden_text: str,
+    ) -> bool:
+        """Confirm profile history contains only its expected proof marker."""
+
+        profile_id = _profile_path(profile_id)
+        session_id = _session_path(session_id)
+        expected = validate_stream_message(expected_text).casefold()
+        forbidden = validate_stream_message(forbidden_text).casefold()
+        token = await self._profile_credential(profile_id)
+        path = f"/p/{profile_id}/api/sessions/{session_id}/messages"
+
+        def inspect_history() -> bool:
+            response = None
+            try:
+                response = self._request(method="GET", path=path, token=token)
+                payload = _decode_json(_read_bounded(response))
+                rows = payload.get("data")
+                if not isinstance(rows, list) or len(rows) > MAX_EVENTS:
+                    raise HermesMalformedResponse(
+                        "Hermes session history was malformed"
+                    )
+                contains_expected = any(
+                    isinstance(row, dict)
+                    and _content_contains_text(row.get("content"), expected)
+                    for row in rows
+                )
+                contains_forbidden = any(
+                    isinstance(row, dict)
+                    and _content_contains_text(row.get("content"), forbidden)
+                    for row in rows
+                )
+                return contains_expected and not contains_forbidden
+            finally:
+                if response is not None:
+                    response.close()
+
+        return await asyncio.wait_for(
+            asyncio.to_thread(inspect_history), self.settings.request_timeout
+        )
 
     async def stream(
         self,

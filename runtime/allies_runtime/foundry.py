@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from .errors import HermesError, HermesMalformedResponse
+from .errors import HermesError, HermesHistoryMismatch, HermesMalformedResponse
 from .hermes import HermesEvent, stable_session_identifiers, validate_stream_message
 
 MAX_CLAIM_SLOTS = 8
@@ -1045,6 +1045,33 @@ class FoundryWorker:
 
             identifiers = stable_session_identifiers(claim.profile_id, conversation_id)
             session_id = claim.session_id or identifiers.candidate_id
+            history_verified = False
+            expected_history_marker = claim.payload.get(
+                "proof_expected_history_marker"
+            )
+            if expected_history_marker is not None:
+                forbidden_history_marker = claim.payload.get(
+                    "proof_forbidden_history_marker"
+                )
+                if not isinstance(expected_history_marker, str) or not isinstance(
+                    forbidden_history_marker, str
+                ):
+                    raise InvalidRequestError("Execution history proof was invalid")
+                inspect_history = getattr(
+                    self.hermes, "profile_session_matches_markers", None
+                )
+                if not callable(inspect_history) or claim.session_id is None:
+                    raise HermesError("Hermes session history was unavailable")
+                history_verified = inspect_history(
+                    claim.hermes_profile_key,
+                    session_id,
+                    expected_history_marker,
+                    forbidden_history_marker,
+                )
+                if inspect.isawaitable(history_verified):
+                    history_verified = await history_verified
+                if history_verified is not True:
+                    raise HermesHistoryMismatch()
 
             sequence = 1
             dispatch_payload = {"status": "dispatched"}
@@ -1175,7 +1202,14 @@ class FoundryWorker:
                         stream_id=claim.stream_id,
                         sequence=sequence,
                         payload=terminal.payload,
-                        receipt={"code": "ok"},
+                        receipt={
+                            "code": "ok",
+                            **(
+                                {"history_verified": True}
+                                if expected_history_marker is not None
+                                else {}
+                            ),
+                        },
                     )
                 )
             except ResponseLossError:
@@ -1315,8 +1349,12 @@ class FoundryWorker:
                 task.add_done_callback(self._active.discard)
             if self._active:
                 done, _ = await asyncio.wait(
-                    self._active, return_when=asyncio.FIRST_COMPLETED
+                    self._active,
+                    timeout=poll_delay,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                if not done:
+                    continue
                 for task in done:
                     try:
                         results.append(task.result())

@@ -597,7 +597,9 @@ class WorkspaceLifecycle:
         if claim.phase == WorkspaceProvisioningPhase.MACHINE_STARTED:
             if not workspace.machine_ref:
                 raise ProviderTerminalError("workspace Machine binding is incomplete")
-            self._start_machine_if_needed(app_spec.name, workspace.machine_ref)
+            self._start_machine_if_needed(
+                app_spec.name, workspace.machine_ref, deadline
+            )
             self._cas_phase(
                 workspace_id,
                 claim,
@@ -734,7 +736,7 @@ class WorkspaceLifecycle:
         if claim.phase == WorkspaceProvisioningPhase.MACHINE_STARTED:
             if not workspace.machine_ref:
                 raise ProviderTerminalError("replacement Machine is missing")
-            self._start_machine_if_needed(app_name, workspace.machine_ref)
+            self._start_machine_if_needed(app_name, workspace.machine_ref, deadline)
             self._cas_phase(
                 workspace_id,
                 claim,
@@ -812,19 +814,75 @@ class WorkspaceLifecycle:
             # recorded Machine and is safe to reconcile as already gone.
             return None
 
-    def _start_machine_if_needed(self, app_name: str, machine_id: str) -> None:
+    def _start_machine_if_needed(
+        self, app_name: str, machine_id: str, deadline: float
+    ) -> None:
         machine = self._inspect_machine_by_id(app_name, machine_id)
         if machine is None:
             raise ProviderNotFoundError("workspace Machine was not found")
-        if machine.state in {
-            MachineState.CREATED,
-            MachineState.STARTED,
-            MachineState.UNKNOWN,
-        }:
+        if machine.state is MachineState.STARTED:
             return
         if machine.state is MachineState.DESTROYED:
             raise ProviderNotFoundError("workspace Machine was destroyed")
-        self.provider.start_machine(app_name, machine_id)
+        if machine.state not in (MachineState.CREATED, MachineState.STOPPED):
+            machine = self._wait_machine_ready_to_start(app_name, machine_id, deadline)
+            if machine.state is MachineState.STARTED:
+                return
+        while True:
+            try:
+                self.provider.start_machine(app_name, machine_id)
+                break
+            except ProviderRetryableError:
+                if time.monotonic() >= deadline:
+                    raise
+                self.sleep(STOP_POLL_SECONDS)
+        self._wait_machine_started(app_name, machine_id, deadline)
+
+    def _wait_machine_ready_to_start(
+        self, app_name: str, machine_id: str, deadline: float
+    ) -> MachineRecord:
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                machine = self.provider.wait_machine(
+                    app_name,
+                    machine_id,
+                    timeout_seconds=min(REQUEST_TIMEOUT_SECONDS, remaining),
+                    state="stopped",
+                )
+            except ProviderTimeoutError:
+                continue
+            if machine.state in (MachineState.STOPPED, MachineState.STARTED):
+                return machine
+            if machine.state is MachineState.DESTROYED:
+                raise ProviderNotFoundError("workspace Machine was destroyed")
+        raise ProviderRetryableError(
+            "workspace Machine was not ready to start before deadline",
+            operation="wait_machine_stopped",
+        )
+
+    def _wait_machine_started(
+        self, app_name: str, machine_id: str, deadline: float
+    ) -> None:
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                machine = self.provider.wait_machine(
+                    app_name,
+                    machine_id,
+                    timeout_seconds=min(REQUEST_TIMEOUT_SECONDS, remaining),
+                )
+            except ProviderTimeoutError:
+                continue
+            if machine.state is MachineState.STARTED:
+                return
+            self.sleep(
+                min(HEALTH_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
+            )
+        raise ProviderRetryableError(
+            "workspace Machine did not start before deadline",
+            operation="wait_machine_start",
+        )
 
     def _wait_healthy(
         self,
