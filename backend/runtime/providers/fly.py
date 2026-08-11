@@ -8,6 +8,7 @@ claims, deadlines, and backoff.
 
 from __future__ import annotations
 
+import base64
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -74,7 +75,10 @@ def deterministic_app_name(workspace_id: UUID | str) -> str:
 
 
 def deterministic_volume_name(workspace_id: UUID | str) -> str:
-    return f"allies-vol-{_workspace_text(workspace_id)}"
+    encoded_workspace = base64.b32encode(
+        bytes.fromhex(_workspace_text(workspace_id))
+    ).decode("ascii")
+    return f"avol{encoded_workspace.rstrip('=').lower()}"
 
 
 def deterministic_machine_name(workspace_id: UUID | str, generation: int) -> str:
@@ -87,7 +91,7 @@ def deterministic_resource_names(workspace_id: UUID | str) -> WorkspaceResourceN
     workspace = _workspace_text(workspace_id)
     return WorkspaceResourceNames(
         app=f"allies-ws-{workspace}",
-        volume=f"allies-vol-{workspace}",
+        volume=deterministic_volume_name(workspace_id),
         workspace_id=workspace,
     )
 
@@ -452,7 +456,7 @@ class FlyProvider:
         return {
             "name": spec.name,
             "region": spec.region,
-            "skip_launch": True,
+            "skip_launch": False,
             "skip_service_registration": True,
             "config": {
                 "containers": containers,
@@ -469,6 +473,11 @@ class FlyProvider:
                 # An explicit empty list makes the no-public-service
                 # invariant testable and cannot accidentally inherit routes.
                 "services": [],
+                "guest": {
+                    "cpu_kind": "shared",
+                    "cpus": 1,
+                    "memory_mb": 1024,
+                },
                 "metadata": metadata,
             },
         }
@@ -816,6 +825,11 @@ def _machine_health(
             if isinstance(item, Mapping) and isinstance(item.get("name"), str):
                 status = item.get("state") or item.get("status") or item.get("health")
                 containers[item["name"]] = _container_state(status)
+    runtime_containers = raw.get("containers")
+    if isinstance(runtime_containers, list):
+        for item in runtime_containers:
+            if isinstance(item, Mapping) and isinstance(item.get("name"), str):
+                containers[item["name"]] = _container_state(item)
     checks = raw.get("checks")
     check_entries: list[tuple[str, Any]] = []
     if isinstance(checks, Mapping):

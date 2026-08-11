@@ -22,6 +22,7 @@ from runtime.providers import (
     ProviderInvalidConfigurationError,
     ProviderOwnershipError,
     ProviderRateLimitError,
+    ProviderRetryableError,
     ProviderTimeoutError,
     ProviderUnauthorizedError,
     ProviderUnsupportedTopologyError,
@@ -123,6 +124,20 @@ def test_names_are_stable_and_generation_scoped():
     assert deterministic_machine_name(WORKSPACE_ID, 1) != deterministic_machine_name(
         WORKSPACE_ID, 2
     )
+    volume_name = deterministic_volume_name(WORKSPACE_ID)
+    assert len(volume_name) == 30
+    assert volume_name.isalnum()
+    assert volume_name == volume_name.lower()
+    assert volume_name.startswith("avol")
+
+
+def test_volume_name_preserves_full_workspace_identity():
+    first = UUID("01234567-89ab-cdef-0123-456789abcdef")
+    last_bit_changed = UUID("01234567-89ab-cdef-0123-456789abcdee")
+
+    assert deterministic_volume_name(first) != deterministic_volume_name(
+        last_bit_changed
+    )
 
 
 def test_app_create_timeout_reconciles_by_deterministic_name():
@@ -150,12 +165,18 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     payload = fake.calls[0].json_body
     config = payload["config"]
     assert result.id == "machine-01"
+    assert payload["skip_launch"] is False
     assert [item["name"] for item in config["containers"]] == [
         "hermes",
         "allies-runtime",
     ]
     assert config["mounts"] == [{"volume": "vol-01", "path": "/opt/data"}]
     assert config["services"] == []
+    assert config["guest"] == {
+        "cpu_kind": "shared",
+        "cpus": 1,
+        "memory_mb": 1024,
+    }
     assert config["containers"][0]["healthchecks"][0]["name"] == "hermes"
     assert config["containers"][1]["healthchecks"][0]["name"] == "allies-runtime"
     assert config["containers"][0]["cmd"] == [
@@ -234,6 +255,25 @@ def test_machine_payload_requires_named_healthchecks():
     with pytest.raises(ProviderInvalidConfigurationError, match="healthcheck"):
         provider(fake).machine_payload(unready_spec)
     assert fake.calls == []
+
+
+def test_machine_health_uses_top_level_runtime_container_states():
+    machine = fixture("machines.json")[0]
+    machine.pop("checks")
+    machine["containers"] = [
+        {"name": "hermes", "state": "healthy"},
+        {"name": "allies-runtime", "state": "healthy"},
+    ]
+    fake = FakeFlyTransport([TransportResponse(200, machine)])
+
+    result = provider(fake).inspect_machine_by_id("workspace-app", "machine-01")
+
+    assert result is not None
+    assert result.health is not None
+    assert result.health.containers == {
+        "hermes": ContainerState.STARTED,
+        "allies-runtime": ContainerState.STARTED,
+    }
 
 
 def test_start_action_ack_is_not_parsed_as_a_machine_record():
@@ -322,6 +362,19 @@ def test_status_mapping_is_typed_and_does_not_retain_response_body(status, error
         provider(fake).inspect_app("missing")
     assert not hasattr(caught.value, "response_body")
     assert "secret response" not in str(caught.value)
+
+
+def test_start_precondition_is_retryable_without_retaining_response_body():
+    fake = FakeFlyTransport(
+        [TransportResponse(412, {"message": "sensitive provider detail"})]
+    )
+
+    with pytest.raises(ProviderRetryableError) as caught:
+        provider(fake).start_machine("workspace-app", "machine-01")
+
+    assert caught.value.operation == "start_machine"
+    assert caught.value.status_code == 412
+    assert "sensitive provider detail" not in str(caught.value)
 
 
 def test_unsupported_topology_gate_runs_before_machine_request():

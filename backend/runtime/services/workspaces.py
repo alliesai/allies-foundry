@@ -53,6 +53,7 @@ from runtime.providers import (
     ProviderOwnershipError,
     ProviderRetryableError,
     ProviderTerminalError,
+    ProviderTimeoutError,
     VolumeMount,
     VolumeRecord,
     VolumeSpec,
@@ -72,6 +73,7 @@ PHASE_DEADLINE_SECONDS = 120
 MAX_ATTEMPTS = 5
 BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0)
 STOP_POLL_SECONDS = 0.05
+HEALTH_POLL_SECONDS = 1.0
 REQUIRED_CONTAINERS = frozenset(("hermes", "allies-runtime"))
 
 
@@ -595,7 +597,7 @@ class WorkspaceLifecycle:
         if claim.phase == WorkspaceProvisioningPhase.MACHINE_STARTED:
             if not workspace.machine_ref:
                 raise ProviderTerminalError("workspace Machine binding is incomplete")
-            self.provider.start_machine(app_spec.name, workspace.machine_ref)
+            self._start_machine_if_needed(app_spec.name, workspace.machine_ref)
             self._cas_phase(
                 workspace_id,
                 claim,
@@ -732,7 +734,7 @@ class WorkspaceLifecycle:
         if claim.phase == WorkspaceProvisioningPhase.MACHINE_STARTED:
             if not workspace.machine_ref:
                 raise ProviderTerminalError("replacement Machine is missing")
-            self.provider.start_machine(app_name, workspace.machine_ref)
+            self._start_machine_if_needed(app_name, workspace.machine_ref)
             self._cas_phase(
                 workspace_id,
                 claim,
@@ -810,6 +812,20 @@ class WorkspaceLifecycle:
             # recorded Machine and is safe to reconcile as already gone.
             return None
 
+    def _start_machine_if_needed(self, app_name: str, machine_id: str) -> None:
+        machine = self._inspect_machine_by_id(app_name, machine_id)
+        if machine is None:
+            raise ProviderNotFoundError("workspace Machine was not found")
+        if machine.state in {
+            MachineState.CREATED,
+            MachineState.STARTED,
+            MachineState.UNKNOWN,
+        }:
+            return
+        if machine.state is MachineState.DESTROYED:
+            raise ProviderNotFoundError("workspace Machine was destroyed")
+        self.provider.start_machine(app_name, machine_id)
+
     def _wait_healthy(
         self,
         app_name: str,
@@ -818,13 +834,22 @@ class WorkspaceLifecycle:
         deadline: float,
     ) -> MachineRecord:
         while time.monotonic() < deadline:
-            machine = self.provider.wait_machine(
-                app_name,
-                machine_id,
-                timeout_seconds=min(
-                    REQUEST_TIMEOUT_SECONDS, max(1, deadline - time.monotonic())
-                ),
-            )
+            try:
+                machine = self.provider.wait_machine(
+                    app_name,
+                    machine_id,
+                    timeout_seconds=min(
+                        REQUEST_TIMEOUT_SECONDS, max(1, deadline - time.monotonic())
+                    ),
+                )
+            except ProviderTimeoutError:
+                self.sleep(
+                    min(
+                        HEALTH_POLL_SECONDS,
+                        max(0.0, deadline - time.monotonic()),
+                    )
+                )
+                continue
             if machine.state is MachineState.STARTED:
                 health = machine.health
                 if health is None or not _healthy_containers(health, spec):
@@ -834,7 +859,9 @@ class WorkspaceLifecycle:
                         health = inspected.health if inspected else None
                 if health is not None and _healthy_containers(health, spec):
                     return machine
-            self.sleep(0.05)
+            self.sleep(
+                min(HEALTH_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
+            )
         raise ProviderRetryableError(
             "workspace Machine did not become healthy before deadline",
             operation="wait_machine",

@@ -29,7 +29,9 @@ from runtime.providers import (
     OwnershipMetadata,
     ProviderNotFoundError,
     ProviderOwnershipError,
+    ProviderRetryableError,
     ProviderTerminalError,
+    ProviderTimeoutError,
     VolumeRecord,
     deterministic_resource_names,
 )
@@ -165,6 +167,8 @@ class FakeProvider:
                 machine.ownership,
                 MachineHealth(MachineState.STARTED, {}),
             )
+        if self.machines[machine_id].state is MachineState.CREATED:
+            return self._set_machine(machine_id, MachineState.STARTED)
         return self.machines[machine_id]
 
     def _set_machine(self, machine_id, state):
@@ -234,6 +238,94 @@ def test_ensure_is_idempotent_and_binds_one_machine():
     )
     assert provider.calls.count("ensure_app") == 1
     assert provider.calls.count("ensure_volume") == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ensure_retries_a_transient_machine_start_precondition():
+    provider = FakeProvider()
+    original_ensure = provider.ensure_machine
+    original_start = provider.start_machine
+    attempts = 0
+
+    def ensure_stopped_machine(machine_spec):
+        machine = original_ensure(machine_spec)
+        return provider._set_machine(machine.id, MachineState.STOPPED)
+
+    def start_after_precondition(app_name, machine_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            provider.calls.append("start_machine")
+            raise ProviderRetryableError(
+                "Machine is not ready to start",
+                operation="start_machine",
+                status_code=412,
+            )
+        return original_start(app_name, machine_id)
+
+    provider.ensure_machine = ensure_stopped_machine
+    provider.start_machine = start_after_precondition
+    lifecycle = WorkspaceLifecycle(provider, sleep=lambda _: None, jitter=False)
+    workspace = Workspace.objects.create(
+        id=WORKSPACE_ID, tenant_ref="tenant-start-precondition"
+    )
+
+    binding = lifecycle.ensure_workspace(workspace.id, spec())
+
+    assert binding.machine_generation == 1
+    assert provider.calls.count("start_machine") == 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ensure_does_not_restart_a_machine_that_create_already_started():
+    provider = FakeProvider()
+    original_ensure = provider.ensure_machine
+
+    def ensure_started_machine(machine_spec):
+        machine = original_ensure(machine_spec)
+        return provider._set_machine(machine.id, MachineState.STARTED)
+
+    provider.ensure_machine = ensure_started_machine
+    lifecycle = WorkspaceLifecycle(provider, sleep=lambda _: None, jitter=False)
+    workspace = Workspace.objects.create(
+        id=WORKSPACE_ID, tenant_ref="tenant-create-started"
+    )
+
+    binding = lifecycle.ensure_workspace(workspace.id, spec())
+
+    assert binding.machine_generation == 1
+    assert provider.calls.count("start_machine") == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ensure_keeps_waiting_after_a_provider_wait_timeout():
+    provider = FakeProvider()
+    original_wait = provider.wait_machine
+    wait_attempts = 0
+
+    def wait_after_timeout(app_name, machine_id, *, timeout_seconds):
+        nonlocal wait_attempts
+        wait_attempts += 1
+        if wait_attempts == 1:
+            raise ProviderTimeoutError(
+                "Machine wait timed out",
+                operation="wait_machine",
+                status_code=408,
+            )
+        return original_wait(
+            app_name, machine_id, timeout_seconds=timeout_seconds
+        )
+
+    provider.wait_machine = wait_after_timeout
+    lifecycle = WorkspaceLifecycle(provider, sleep=lambda _: None, jitter=False)
+    workspace = Workspace.objects.create(
+        id=WORKSPACE_ID, tenant_ref="tenant-wait-timeout"
+    )
+
+    binding = lifecycle.ensure_workspace(workspace.id, spec())
+
+    assert binding.machine_generation == 1
+    assert wait_attempts == 2
 
 
 @pytest.mark.django_db(transaction=True)

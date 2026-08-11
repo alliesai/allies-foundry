@@ -24,7 +24,9 @@ from runtime.models import (
     WorkspaceProvisioningPhase,
 )
 from runtime.providers import (
+    MachineState,
     ProviderInvalidConfigurationError,
+    ProviderRetryableError,
     ProviderUnsupportedTopologyError,
 )
 from runtime.services.continuity_proof import (
@@ -257,12 +259,15 @@ def test_fly_secret_store_passes_secret_value_only_through_stdin(monkeypatch):
 
     monkeypatch.setattr(continuity_proof.subprocess, "run", run)
     store = FlyCliSecretStore("fly")
+    encoded_value = base64.b64encode(b"test-value").decode("ascii")
 
-    store.stage("allies-app", "FND008_SECRET", "base64-private-value")
+    store.stage("allies-app", "FND008_SECRET", encoded_value)
 
     args, kwargs = calls[0]
-    assert "base64-private-value" not in repr(args)
-    assert kwargs["input"] == "base64-private-value"
+    assert encoded_value not in repr(args)
+    assert args[:3] == ("fly", "secrets", "import")
+    assert "--stage" in args
+    assert kwargs["input"] == f"FND008_SECRET={encoded_value}\n"
     assert kwargs["capture_output"] is True
     assert kwargs["timeout"] == 15
 
@@ -283,6 +288,33 @@ def test_fly_secret_store_reports_bounded_timeout(monkeypatch):
 
     with pytest.raises(RuntimeError, match="timed out"):
         FlyCliSecretStore("fly").remove("allies-app", "FND008_SECRET")
+
+
+@pytest.mark.parametrize(
+    ("secret_name", "encoded_value"),
+    [
+        ("SAFE_SECRET\nINJECTED_SECRET", "c2FmZQ=="),
+        ("SAFE_SECRET", "c2FmZQ==\nINJECTED_SECRET=dmFsdWU="),
+        ("lowercase-secret", "c2FmZQ=="),
+        ("SAFE_SECRET", "not-base64"),
+    ],
+)
+def test_fly_secret_store_rejects_stdin_injection(
+    monkeypatch, secret_name, encoded_value
+):
+    from runtime.services import continuity_proof
+
+    called = False
+
+    def run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(continuity_proof.subprocess, "run", run)
+
+    with pytest.raises(ValueError):
+        FlyCliSecretStore("fly").stage("allies-app", secret_name, encoded_value)
+    assert not called
 
 
 def test_proof_bootstrap_attempts_secret_removal_when_revocation_fails(
@@ -436,6 +468,112 @@ def test_cleanup_reconciles_and_removes_persisted_replacement_machine(
         (ready_workspace.fly_app_ref, "machine-1"),
     ]
     assert provider.destroyed == provider.stopped
+
+
+def test_cleanup_accepts_an_already_destroyed_machine():
+    class RecordingProvider:
+        def __init__(self):
+            self.stopped = []
+            self.destroyed = []
+            self.apps = []
+
+        def inspect_machine_by_id(self, _app_ref, machine_ref):
+            return SimpleNamespace(id=machine_ref, state=MachineState.DESTROYED)
+
+        def stop_machine(self, app_ref, machine_ref):
+            self.stopped.append((app_ref, machine_ref))
+
+        def destroy_machine(self, app_ref, machine_ref):
+            self.destroyed.append((app_ref, machine_ref))
+
+        def delete_app(self, app_ref):
+            self.apps.append(app_ref)
+
+    provider = RecordingProvider()
+
+    assert _cleanup_provider_resources(
+        provider, {"app": "proof-app", "current_machine": "machine-1"}
+    )
+    assert provider.stopped == []
+    assert provider.destroyed == []
+    assert provider.apps == ["proof-app"]
+
+
+def test_cleanup_waits_for_machine_stop_and_volume_detachment():
+    class DelayedProvider:
+        def __init__(self):
+            self.machine_states = iter(
+                (
+                    MachineState.STARTED,
+                    MachineState.STARTED,
+                    MachineState.STOPPED,
+                    MachineState.STOPPED,
+                    MachineState.DESTROYED,
+                )
+            )
+            self.current_state = MachineState.STARTED
+            self.volume_checks = 0
+            self.destroyed = []
+            self.deleted_volumes = []
+
+        def inspect_machine_by_id(self, _app_ref, machine_ref):
+            self.current_state = next(self.machine_states, self.current_state)
+            return SimpleNamespace(id=machine_ref, state=self.current_state)
+
+        def stop_machine(self, _app_ref, _machine_ref):
+            return None
+
+        def destroy_machine(self, app_ref, machine_ref):
+            self.destroyed.append((app_ref, machine_ref))
+
+        def list_volumes(self, _app_ref):
+            self.volume_checks += 1
+            attached = "machine-1" if self.volume_checks == 1 else None
+            return (SimpleNamespace(id="volume-1", attached_machine_id=attached),)
+
+        def delete_volume(self, app_ref, volume_ref):
+            self.deleted_volumes.append((app_ref, volume_ref))
+
+        def delete_app(self, _app_ref):
+            return None
+
+    now = [0.0]
+    provider = DelayedProvider()
+
+    assert _cleanup_provider_resources(
+        provider,
+        {"app": "proof-app", "current_machine": "machine-1", "volume": "volume-1"},
+        clock=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+    assert provider.destroyed == [("proof-app", "machine-1")]
+    assert provider.volume_checks == 2
+    assert provider.deleted_volumes == [("proof-app", "volume-1")]
+
+
+def test_cleanup_retries_transient_provider_actions():
+    class RetryProvider:
+        def __init__(self):
+            self.delete_attempts = 0
+
+        def delete_volume(self, _app_ref, _volume_ref):
+            self.delete_attempts += 1
+            if self.delete_attempts == 1:
+                raise ProviderRetryableError("still attached", operation="delete_volume")
+
+        def delete_app(self, _app_ref):
+            return None
+
+    now = [0.0]
+    provider = RetryProvider()
+
+    assert _cleanup_provider_resources(
+        provider,
+        {"app": "proof-app", "volume": "volume-1"},
+        clock=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+    assert provider.delete_attempts == 2
 
 
 @pytest.mark.django_db(transaction=True)
@@ -629,3 +767,23 @@ def test_failed_preflight_is_skipped_without_provider_mutation():
     assert result.resources == {}
     assert store.staged == []
     assert "unsafe provider detail" not in repr(result.to_dict())
+
+
+@pytest.mark.django_db(transaction=True)
+def test_proof_preserves_an_existing_workspace():
+    config = proof_config(run_id="fnd008-existing-workspace")
+    existing = Workspace.objects.create(
+        id=config.workspace_id,
+        tenant_ref=config.tenant_ref,
+    )
+    provider = ProofProvider()
+
+    result = run_machine_replacement_proof(
+        config,
+        provider=provider,
+        credential_bootstrap=ProofCredentialBootstrap(FakeSecretStore()),
+    )
+
+    assert result.status == "skipped"
+    assert result.checks[-1].detail_code == "workspace_not_fresh"
+    assert Workspace.objects.filter(pk=existing.id).exists()

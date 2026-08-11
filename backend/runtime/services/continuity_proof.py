@@ -23,7 +23,13 @@ from runtime.models import (
     RuntimeProfile,
     Workspace,
 )
-from runtime.providers import ContainerFileSecret, ContainerSpec, ProviderNotFoundError
+from runtime.providers import (
+    ContainerFileSecret,
+    ContainerSpec,
+    MachineState,
+    ProviderNotFoundError,
+    ProviderRetryableError,
+)
 from runtime.services.executions import create_execution
 from runtime.services.profiles import ProfileSeed, ensure_runtime_profile
 from runtime.services.runtime_auth import (
@@ -49,7 +55,11 @@ _HERMES_PROOF_COMMAND = (
 )
 _SAFE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
+_SAFE_FLY_SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SAFE_BASE64 = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _FLY_CLI_TIMEOUT_SECONDS = 15
+_CLEANUP_TIMEOUT_SECONDS = 30
+_CLEANUP_POLL_SECONDS = 1
 
 
 class ProofSecretStore(Protocol):
@@ -69,13 +79,29 @@ class FlyCliSecretStore:
         self.executable = executable or _default_fly_executable()
 
     def stage(self, app_ref: str, secret_name: str, encoded_value: str) -> None:
+        self._validate_secret_name(secret_name)
+        if (
+            not isinstance(encoded_value, str)
+            or len(encoded_value) > 8192
+            or len(encoded_value) % 4 != 0
+            or not _SAFE_BASE64.fullmatch(encoded_value)
+        ):
+            raise ValueError("Fly file secret value must be bounded base64")
         self._run(
-            ("secrets", "set", f"{secret_name}=-", "--stage", "--app", app_ref),
-            input_value=encoded_value,
+            ("secrets", "import", "--stage", "--app", app_ref),
+            input_value=f"{secret_name}={encoded_value}\n",
         )
 
     def remove(self, app_ref: str, secret_name: str) -> None:
+        self._validate_secret_name(secret_name)
         self._run(("secrets", "unset", secret_name, "--stage", "--app", app_ref))
+
+    @staticmethod
+    def _validate_secret_name(secret_name: str) -> None:
+        if not isinstance(secret_name, str) or not _SAFE_FLY_SECRET_NAME.fullmatch(
+            secret_name
+        ):
+            raise ValueError("Fly secret name is invalid")
 
     def _run(self, args: tuple[str, ...], *, input_value: str | None = None) -> None:
         try:
@@ -375,6 +401,7 @@ def run_machine_replacement_proof(
 
     progress = progress or (lambda _stage, _state: None)
     mutated = False
+    workspace_created = False
     handles: list[ProofCredentialHandle] = []
     dependency_handle: ProofDependencyCredentialHandle | None = None
     resources: dict[str, str] = {}
@@ -399,12 +426,13 @@ def run_machine_replacement_proof(
         capability()
         checks.append(ProofCheck("provider_preflight", "pass", "capabilities_ready"))
 
-        workspace, _ = Workspace.objects.get_or_create(
+        workspace, workspace_created = Workspace.objects.get_or_create(
             id=config.workspace_id,
             defaults={"tenant_ref": config.tenant_ref},
         )
         if (
-            workspace.tenant_ref != config.tenant_ref
+            not workspace_created
+            or workspace.tenant_ref != config.tenant_ref
             or workspace.machine_generation != 0
         ):
             raise RuntimeError("workspace_not_fresh")
@@ -677,9 +705,15 @@ def run_machine_replacement_proof(
             except Exception:  # noqa: BLE001 - provider cleanup must still run
                 cleanup_complete = False
             cleanup_complete = (
-                _cleanup_provider_resources(provider, resources) and cleanup_complete
+                _cleanup_provider_resources(
+                    provider,
+                    resources,
+                    clock=clock,
+                    sleep=sleep,
+                )
+                and cleanup_complete
             )
-        if cleanup_complete:
+        if cleanup_complete and workspace_created:
             Workspace.objects.filter(pk=config.workspace_id).delete()
 
     if not cleanup_complete:
@@ -900,8 +934,15 @@ def _default_old_token_probe(raw_token: str) -> bool:
     return False
 
 
-def _cleanup_provider_resources(provider: Any, resources: dict[str, str]) -> bool:
+def _cleanup_provider_resources(
+    provider: Any,
+    resources: dict[str, str],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
     complete = True
+    deadline = clock() + _CLEANUP_TIMEOUT_SECONDS
     app = resources.get("app")
     machines = tuple(
         dict.fromkeys(
@@ -911,40 +952,174 @@ def _cleanup_provider_resources(provider: Any, resources: dict[str, str]) -> boo
         )
     )
     for machine in machines if app else ():
+        inspected = None
         inspect = getattr(provider, "inspect_machine_by_id", None)
         if inspect is not None:
             try:
-                if inspect(app, machine) is None:
+                inspected = inspect(app, machine)
+                if inspected is None or inspected.state is MachineState.DESTROYED:
                     continue
             except Exception:  # noqa: BLE001 - still attempt authoritative cleanup
                 complete = False
-        try:
-            provider.stop_machine(app, machine)
-        except ProviderNotFoundError:
-            pass
-        except Exception:  # noqa: BLE001 - cleanup must attempt remaining resources
-            complete = False
-        try:
-            provider.destroy_machine(app, machine)
-        except ProviderNotFoundError:
-            pass
-        except Exception:  # noqa: BLE001 - cleanup must attempt remaining resources
-            complete = False
+        if inspected is None or inspected.state is not MachineState.STOPPED:
+            stopped = _retry_cleanup_action(
+                lambda machine=machine: provider.stop_machine(app, machine),
+                deadline=deadline,
+                clock=clock,
+                sleep=sleep,
+            )
+            complete = stopped and complete
+            if stopped:
+                complete = (
+                    _wait_for_cleanup_machine_state(
+                        provider,
+                        app,
+                        machine,
+                        {MachineState.STOPPED, MachineState.DESTROYED},
+                        deadline=deadline,
+                        clock=clock,
+                        sleep=sleep,
+                    )
+                    and complete
+                )
+        destroyed = _retry_cleanup_action(
+            lambda machine=machine: provider.destroy_machine(app, machine),
+            deadline=deadline,
+            clock=clock,
+            sleep=sleep,
+        )
+        complete = destroyed and complete
+        if destroyed:
+            complete = (
+                _wait_for_cleanup_machine_state(
+                    provider,
+                    app,
+                    machine,
+                    {MachineState.DESTROYED},
+                    deadline=deadline,
+                    clock=clock,
+                    sleep=sleep,
+                )
+                and complete
+            )
     if app and resources.get("volume"):
-        try:
-            provider.delete_volume(app, resources["volume"])
-        except ProviderNotFoundError:
-            pass
-        except Exception:  # noqa: BLE001 - cleanup must attempt remaining resources
-            complete = False
+        volume_id = resources["volume"]
+        complete = (
+            _wait_for_volume_detachment(
+                provider,
+                app,
+                volume_id,
+                deadline=deadline,
+                clock=clock,
+                sleep=sleep,
+            )
+            and complete
+        )
+        complete = (
+            _retry_cleanup_action(
+                lambda: provider.delete_volume(app, volume_id),
+                deadline=deadline,
+                clock=clock,
+                sleep=sleep,
+            )
+            and complete
+        )
     if app:
-        try:
-            provider.delete_app(app)
-        except ProviderNotFoundError:
-            pass
-        except Exception:  # noqa: BLE001 - cleanup must report any provider failure
-            complete = False
+        complete = (
+            _retry_cleanup_action(
+                lambda: provider.delete_app(app),
+                deadline=deadline,
+                clock=clock,
+                sleep=sleep,
+            )
+            and complete
+        )
     return complete
+
+
+def _retry_cleanup_action(
+    action: Callable[[], Any],
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> bool:
+    while True:
+        try:
+            action()
+            return True
+        except ProviderNotFoundError:
+            return True
+        except ProviderRetryableError:
+            if clock() >= deadline:
+                return False
+            sleep(min(_CLEANUP_POLL_SECONDS, max(0.0, deadline - clock())))
+        except Exception:  # noqa: BLE001 - cleanup must attempt remaining resources
+            return False
+
+
+def _wait_for_cleanup_machine_state(
+    provider: Any,
+    app: str,
+    machine: str,
+    accepted: set[MachineState],
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> bool:
+    inspect = getattr(provider, "inspect_machine_by_id", None)
+    if inspect is None:
+        return True
+    while True:
+        try:
+            record = inspect(app, machine)
+        except ProviderNotFoundError:
+            return True
+        except ProviderRetryableError:
+            if clock() >= deadline:
+                return False
+            sleep(min(_CLEANUP_POLL_SECONDS, max(0.0, deadline - clock())))
+            continue
+        except Exception:  # noqa: BLE001 - cleanup result remains bounded
+            return False
+        if record is None or record.state in accepted:
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(min(_CLEANUP_POLL_SECONDS, max(0.0, deadline - clock())))
+
+
+def _wait_for_volume_detachment(
+    provider: Any,
+    app: str,
+    volume_id: str,
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> bool:
+    list_volumes = getattr(provider, "list_volumes", None)
+    if list_volumes is None:
+        return True
+    while True:
+        try:
+            volumes = tuple(list_volumes(app))
+        except ProviderNotFoundError:
+            return True
+        except ProviderRetryableError:
+            if clock() >= deadline:
+                return False
+            sleep(min(_CLEANUP_POLL_SECONDS, max(0.0, deadline - clock())))
+            continue
+        except Exception:  # noqa: BLE001 - cleanup result remains bounded
+            return False
+        matches = [volume for volume in volumes if volume.id == volume_id]
+        if not matches or not matches[0].attached_machine_id:
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(min(_CLEANUP_POLL_SECONDS, max(0.0, deadline - clock())))
 
 
 def _record_current_machine(workspace_id: UUID, resources: dict[str, str]) -> None:
