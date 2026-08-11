@@ -36,6 +36,8 @@ from runtime.providers import (
 FIXTURES = Path(__file__).parent / "fixtures" / "providers"
 WORKSPACE_ID = UUID("01234567-89ab-cdef-0123-456789abcdef")
 OPERATION_ID = UUID("11111111-2222-3333-4444-555555555555")
+HERMES_FILE_SECRET = "FND008_HERMES_KEY"
+OPENAI_FILE_SECRET = "FND008_OPENAI_KEY"
 
 
 def fixture(name: str):
@@ -91,10 +93,10 @@ def machine_spec(generation: int = 1) -> MachineSpec:
                 "registry.example/runtime@sha256:runtime",
                 secret_files=(
                     ContainerFileSecret(
-                        "/run/secrets/hermes-api-key", "FND008_HERMES_KEY"
+                        "/run/secrets/hermes-api-key", HERMES_FILE_SECRET
                     ),
                     ContainerFileSecret(
-                        "/run/secrets/openai-api-key", "FND008_OPENAI_KEY"
+                        "/run/secrets/openai-api-key", OPENAI_FILE_SECRET
                     ),
                 ),
                 healthchecks=(healthcheck("allies-runtime"),),
