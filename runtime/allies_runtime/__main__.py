@@ -64,39 +64,47 @@ def worker_entrypoint(
 
 
 def file_credential_for_reference(reference: CredentialReference) -> str:
-    """Read a bounded runtime bearer from the Fly-mounted secret file."""
+    """Read one bounded credential from a Fly-mounted secret file."""
 
     parsed = urlsplit(str(reference))
     if parsed.scheme != "file" or parsed.netloc or parsed.query or parsed.fragment:
-        raise SettingsError(
-            "FOUNDRY_RUNTIME_CREDENTIAL_REF must be a local file reference"
-        )
+        raise SettingsError("runtime credential must be a local file reference")
     path = Path(url2pathname(unquote(parsed.path)))
     if ".." in path.parts:
-        raise SettingsError(
-            "FOUNDRY_RUNTIME_CREDENTIAL_REF must remain under /run/secrets"
-        )
+        raise SettingsError("runtime credential must remain under /run/secrets")
     secrets_root = _SECRETS_ROOT.resolve()
     try:
         path = path.resolve()
         path.relative_to(secrets_root)
     except (OSError, ValueError) as exc:
         raise SettingsError(
-            "FOUNDRY_RUNTIME_CREDENTIAL_REF must remain under /run/secrets"
+            "runtime credential must remain under /run/secrets"
         ) from exc
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise SettingsError("Foundry runtime credential is unavailable") from exc
+        raise SettingsError("runtime credential is unavailable") from exc
     if not raw or len(raw) > _MAX_RUNTIME_CREDENTIAL_BYTES:
-        raise SettingsError("Foundry runtime credential has an invalid size")
+        raise SettingsError("runtime credential has an invalid size")
     try:
         value = raw.decode("utf-8").strip()
     except UnicodeDecodeError as exc:
-        raise SettingsError("Foundry runtime credential must be UTF-8") from exc
+        raise SettingsError("runtime credential must be UTF-8") from exc
     if not value or "\r" in value or "\n" in value:
-        raise SettingsError("Foundry runtime credential is not a header value")
+        raise SettingsError("runtime credential is not a header value")
     return value
+
+
+def _default_credential_resolver(
+    reference: CredentialReference, values: dict[str, object]
+) -> Callable[[CredentialReference], str]:
+    if str(reference).lower().startswith("test://fnd004/"):
+        return test_credential_for_reference
+    if urlsplit(str(reference)).scheme.lower() == "file":
+        return file_credential_for_reference
+    return UnixSocketCredentialResolver(
+        str(values.get("HERMES_CREDENTIAL_SOCKET", DEFAULT_CREDENTIAL_SOCKET))
+    )
 
 
 def runtime_entrypoint(
@@ -116,17 +124,9 @@ def runtime_entrypoint(
     try:
         settings = load_settings(values)
         if credential_resolver is None:
-            if str(settings.credential_ref).lower().startswith("test://fnd004/"):
-                credential_resolver = test_credential_for_reference
-            else:
-                credential_resolver = UnixSocketCredentialResolver(
-                    str(
-                        values.get(
-                            "HERMES_CREDENTIAL_SOCKET",
-                            DEFAULT_CREDENTIAL_SOCKET,
-                        )
-                    )
-                )
+            credential_resolver = _default_credential_resolver(
+                settings.credential_ref, values
+            )
         resolve_foundry = foundry_credential_resolver or file_credential_for_reference
         runtime_token = resolve_foundry(settings.foundry_credential_ref)
         foundry = foundry_factory(
@@ -179,14 +179,9 @@ def serve(
         try:
             if credential_resolver is None:
                 reference = CredentialReference(os.environ["HERMES_CREDENTIAL_REF"])
-                if str(reference).lower().startswith("test://fnd004/"):
-                    credential_resolver = test_credential_for_reference
-                else:
-                    credential_resolver = UnixSocketCredentialResolver(
-                        os.environ.get(
-                            "HERMES_CREDENTIAL_SOCKET", DEFAULT_CREDENTIAL_SOCKET
-                        )
-                    )
+                credential_resolver = _default_credential_resolver(
+                    reference, dict(os.environ)
+                )
             settings = load_settings(dict(os.environ))
             client = HermesClient(settings, credential_resolver)
         except (SettingsError, ValueError, TypeError):

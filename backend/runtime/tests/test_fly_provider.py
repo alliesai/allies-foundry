@@ -8,6 +8,7 @@ import pytest
 
 from runtime.providers import (
     AppSpec,
+    ContainerFileSecret,
     ContainerSpec,
     ContainerState,
     FakeFlyTransport,
@@ -75,11 +76,27 @@ def machine_spec(generation: int = 1) -> MachineSpec:
             ContainerSpec(
                 "hermes",
                 "registry.example/hermes@sha256:hermes",
+                command=("sh", "-c", "exec hermes gateway run --no-supervise"),
+                environment={
+                    "HERMES_ENV": "/run/secrets/hermes.env",
+                    "GATEWAY_MULTIPLEX_PROFILES": "true",
+                },
+                secret_files=(
+                    ContainerFileSecret("/run/secrets/hermes.env", "FND008_HERMES_ENV"),
+                ),
                 healthchecks=(healthcheck("hermes"),),
             ),
             ContainerSpec(
                 "allies-runtime",
                 "registry.example/runtime@sha256:runtime",
+                secret_files=(
+                    ContainerFileSecret(
+                        "/run/secrets/hermes-api-key", "FND008_HERMES_KEY"
+                    ),
+                    ContainerFileSecret(
+                        "/run/secrets/openai-api-key", "FND008_OPENAI_KEY"
+                    ),
+                ),
                 healthchecks=(healthcheck("allies-runtime"),),
             ),
         ),
@@ -139,6 +156,22 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     assert config["services"] == []
     assert config["containers"][0]["healthchecks"][0]["name"] == "hermes"
     assert config["containers"][1]["healthchecks"][0]["name"] == "allies-runtime"
+    assert config["containers"][0]["cmd"] == [
+        "sh",
+        "-c",
+        "exec hermes gateway run --no-supervise",
+    ]
+    assert "command" not in config["containers"][0]
+    assert config["containers"][0]["env"] == {
+        "HERMES_ENV": "/run/secrets/hermes.env",
+        "GATEWAY_MULTIPLEX_PROFILES": "true",
+    }
+    assert config["containers"][0]["files"] == [
+        {
+            "guest_path": "/run/secrets/hermes.env",
+            "secret_name": "FND008_HERMES_ENV",
+        }
+    ]
     assert config["metadata"]["allies_machine_generation"] == "1"
     assert config["containers"][1]["env"] == {
         "HERMES_CREDENTIAL_REF": "vault://runtime/opaque-ref",
@@ -147,9 +180,17 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     }
     assert config["containers"][1]["files"] == [
         {
+            "guest_path": "/run/secrets/hermes-api-key",
+            "secret_name": "FND008_HERMES_KEY",
+        },
+        {
+            "guest_path": "/run/secrets/openai-api-key",
+            "secret_name": "FND008_OPENAI_KEY",
+        },
+        {
             "guest_path": "/run/secrets/foundry-runtime-token",
             "secret_name": "FND008_RUNTIME_G1",
-        }
+        },
     ]
     assert result.health is not None
     assert result.health.containers == {
@@ -162,6 +203,11 @@ def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     assert "foundry-secret" not in serialized
     assert fake.calls[0].headers["Authorization"] == "<redacted>"
     assert fake.calls[0].timeout == 10.0
+
+
+def test_container_file_secret_rejects_paths_outside_runtime_secret_root():
+    with pytest.raises(ValueError, match="/run/secrets"):
+        ContainerFileSecret("/opt/data/private", "FND008_SECRET")
 
 
 def test_machine_payload_requires_named_healthchecks():

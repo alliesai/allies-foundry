@@ -14,11 +14,14 @@ from django.core.management.base import BaseCommand, CommandError
 
 from runtime.providers import FlyProvider, ProviderError
 from runtime.services.continuity_proof import (
+    HERMES_PROOF_CREDENTIAL_REF,
+    OPENAI_PROOF_CREDENTIAL_REF,
     ContinuityProofConfig,
     ContinuityProofResult,
     FlyCliSecretStore,
     ProofCheck,
     ProofCredentialBootstrap,
+    ProofDependencyCredentialBootstrap,
     ProofProfile,
     run_machine_replacement_proof,
 )
@@ -27,7 +30,6 @@ from runtime.services.profiles import ProfileSeed
 from runtime.services.workspaces import WorkspaceSpec
 
 _IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$", re.IGNORECASE)
-_REFERENCE = re.compile(r"^[a-z][a-z0-9+.-]{1,31}://[^\s]{1,191}$", re.IGNORECASE)
 
 
 class Command(BaseCommand):
@@ -39,21 +41,13 @@ class Command(BaseCommand):
         parser.add_argument("--foundry-origin", required=True)
         parser.add_argument("--output", required=True)
         parser.add_argument("--hermes-image", default=PINNED_HERMES_IMAGE)
-        parser.add_argument("--hermes-credential-ref", required=True)
-        parser.add_argument("--profile-a-credential-ref", required=True)
-        parser.add_argument("--profile-b-credential-ref", required=True)
+        parser.add_argument("--provider-api-key-file", required=True)
         parser.add_argument("--organization", default="allies")
         parser.add_argument("--region", default="ams")
-        parser.add_argument("--provider", default="openai")
         parser.add_argument("--model", required=True)
         parser.add_argument("--base-url")
         parser.add_argument("--run-id")
         parser.add_argument("--timeout", type=float, default=120.0)
-        parser.add_argument(
-            "--confirm-runtime-credential-resolver",
-            action="store_true",
-            help="Confirm the runtime image can resolve the supplied Hermes/profile references.",
-        )
 
     def handle(self, *args, **options):
         output = self._output_path(options["output"])
@@ -65,9 +59,8 @@ class Command(BaseCommand):
                 "FND-008 requires explicit --live opt-in", returncode=result.exit_code
             )
         try:
-            if not options["confirm_runtime_credential_resolver"]:
-                raise ValueError("runtime credential resolver is not confirmed")
             config = self._config(run_id, options)
+            provider_api_key = self._secret_file(options["provider_api_key_file"])
             self._check_foundry_reachable(config.foundry_origin)
             secret_store = FlyCliSecretStore()
             provider = FlyProvider(
@@ -77,6 +70,10 @@ class Command(BaseCommand):
                 config,
                 provider=provider,
                 credential_bootstrap=ProofCredentialBootstrap(secret_store),
+                dependency_credential_bootstrap=ProofDependencyCredentialBootstrap(
+                    secret_store,
+                    provider_api_key=provider_api_key,
+                ),
             )
         except (OSError, ProviderError, TypeError, ValueError) as exc:
             result = self._skipped(run_id, "command_preflight_failed")
@@ -96,19 +93,6 @@ class Command(BaseCommand):
         runtime_image = self._image(options["runtime_image"], "runtime image")
         hermes_image = self._image(options["hermes_image"], "Hermes image")
         foundry_origin = self._foundry_origin(options["foundry_origin"])
-        hermes_ref = self._reference(
-            options["hermes_credential_ref"], "Hermes credential reference"
-        )
-        profile_refs = (
-            self._reference(
-                options["profile_a_credential_ref"],
-                "Ally A credential reference",
-            ),
-            self._reference(
-                options["profile_b_credential_ref"],
-                "Ally B credential reference",
-            ),
-        )
         profiles = tuple(
             ProofProfile(
                 alias=f"ally-{alias}",
@@ -116,11 +100,11 @@ class Command(BaseCommand):
                 ally_ref=f"ally-{alias}",
                 seed=ProfileSeed(
                     personality=f"You are Ally {alias.upper()} in a continuity proof.",
-                    provider=options["provider"],
+                    provider="openai",
                     model=options["model"],
                     base_url=options["base_url"],
                     first_chat_instruction="Answer briefly and retain the stated fact.",
-                    credential_refs={"provider_api": profile_refs[index]},
+                    credential_refs={"OPENAI_API_KEY": OPENAI_PROOF_CREDENTIAL_REF},
                 ),
                 recognizable_fact=(
                     "the copper lighthouse is north"
@@ -140,7 +124,7 @@ class Command(BaseCommand):
                 region=options["region"],
                 hermes_image=hermes_image,
                 runtime_image=runtime_image,
-                runtime_credential_ref=hermes_ref,
+                runtime_credential_ref=HERMES_PROOF_CREDENTIAL_REF,
             ),
             profiles=profiles,
             timeout_seconds=options["timeout"],
@@ -167,10 +151,19 @@ class Command(BaseCommand):
         return value.strip()
 
     @staticmethod
-    def _reference(value: str, name: str) -> str:
-        if not isinstance(value, str) or not _REFERENCE.fullmatch(value.strip()):
-            raise ValueError(f"{name} must be opaque")
-        return value.strip()
+    def _secret_file(value: str) -> str:
+        path = Path(value).expanduser()
+        if not path.is_absolute() or path.is_symlink() or not path.is_file():
+            raise ValueError("provider API key file is unavailable")
+        path = path.resolve()
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("provider API key file is unavailable") from exc
+        secret = raw.rstrip("\r\n")
+        if not secret or len(secret) > 4096 or "\r" in secret or "\n" in secret:
+            raise ValueError("provider API key file is invalid")
+        return secret
 
     @staticmethod
     def _foundry_origin(value: str) -> str:

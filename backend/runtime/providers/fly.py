@@ -397,17 +397,27 @@ class FlyProvider:
                 "image": container.image,
             }
             if container.command:
-                item["command"] = list(container.command)
+                item["cmd"] = list(container.command)
             item["healthchecks"] = [dict(check) for check in container.healthchecks]
+            if container.environment:
+                item["env"] = dict(container.environment)
+            if container.secret_files:
+                item["files"] = [
+                    {
+                        "guest_path": secret.guest_path,
+                        "secret_name": secret.secret_name,
+                    }
+                    for secret in container.secret_files
+                ]
             if (
                 container.name == "allies-runtime"
                 and spec.runtime_credential_ref is not None
             ):
                 # Only the reference is sent.  Secret resolution is owned by a
                 # later deployment boundary; Fly app secrets are global.
-                item["env"] = {
-                    "HERMES_CREDENTIAL_REF": spec.runtime_credential_ref.reference
-                }
+                item.setdefault("env", {})["HERMES_CREDENTIAL_REF"] = (
+                    spec.runtime_credential_ref.reference
+                )
             if (
                 container.name == "allies-runtime"
                 and spec.foundry_runtime_credential_ref is not None
@@ -420,14 +430,24 @@ class FlyProvider:
                         ),
                     }
                 )
-                item["files"] = [
+                foundry_path = urlsplit(
+                    spec.foundry_runtime_credential_ref.reference
+                ).path
+                if any(
+                    secret["guest_path"] == foundry_path
+                    for secret in item.get("files", [])
+                ):
+                    raise ProviderInvalidConfigurationError(
+                        "runtime secret file paths must be unique",
+                        operation="create_machine",
+                        details={"resource_type": "machine"},
+                    )
+                item.setdefault("files", []).append(
                     {
-                        "guest_path": urlsplit(
-                            spec.foundry_runtime_credential_ref.reference
-                        ).path,
+                        "guest_path": foundry_path,
                         "secret_name": spec.foundry_runtime_credential_secret_name,
                     }
-                ]
+                )
             containers.append(item)
         return {
             "name": spec.name,

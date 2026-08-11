@@ -1,9 +1,9 @@
 # Machine replacement continuity proof
 
-Use this runbook to execute FND-008 against Fly. The command creates one owned
-workspace, runs two isolated conversations, replaces the Machine while two
-streams are active, verifies the generation fence and session continuity, then
-removes the proof resources.
+Use this runbook to execute FND-008 against Fly. The command creates one test
+workspace and runs two isolated conversations. It replaces the Machine while
+two streams are active, checks the generation fence and session continuity,
+then removes the proof resources.
 
 The command has no fake mode. Local deterministic coverage runs through the
 service test suite.
@@ -16,11 +16,9 @@ Confirm all of the following:
 - The runtime image is published by immutable digest and contains the FND-008
   worker entrypoint.
 - Foundry is deployed at a public HTTPS origin that Fly Machines can reach.
-- The runtime image can resolve the supplied Hermes and profile credential
-  references. The command requires an explicit confirmation flag because it
-  cannot inspect that resolver without reading credentials.
 - Fly multi-container Machines and runtime-container file secrets are available
   for the target account.
+- You have an OpenAI API key with access to `gpt-5.6-luna`.
 - The evidence output file does not already exist. Its parent directory must be
   writable.
 
@@ -56,32 +54,52 @@ Do not update an existing deployment to the new image without either the worker
 configuration or the explicit `--serve` override. Otherwise the runtime
 container will fail closed during startup.
 
+## Save the OpenAI key locally
+
+Create a file outside the repository that contains only the OpenAI API key. Do
+not add quotes or an environment-variable name. A trailing newline is fine.
+
+For example, save it here:
+
+```text
+C:\Users\ASUS\AppData\Local\Allies\proof-secrets\openai-api-key
+```
+
+Do not paste the key into the command, chat, evidence file, or repository. The
+proof command reads the file locally and sends the key to Fly through standard
+input. Fly mounts it only in the runtime container at
+`/run/secrets/openai-api-key`.
+
 ## Run the proof
 
-Replace every angle-bracket value. Credential arguments are opaque references,
-not secret values.
+Replace the remaining angle-bracket values. Keep the OpenAI key file outside
+the repository.
 
 ```powershell
 Set-Location backend
 
 uv run --locked python manage.py prove_machine_continuity `
   --live `
-  --confirm-runtime-credential-resolver `
   --runtime-image "<registry/runtime@sha256:digest>" `
   --foundry-origin "https://<foundry-host>" `
-  --hermes-credential-ref "<opaque-reference>" `
-  --profile-a-credential-ref "<opaque-reference>" `
-  --profile-b-credential-ref "<opaque-reference>" `
-  --model "<model-name>" `
+  --provider-api-key-file "C:\Users\ASUS\AppData\Local\Allies\proof-secrets\openai-api-key" `
+  --model "gpt-5.6-luna" `
   --organization "<fly-organization>" `
   --region "ams" `
   --output "<absolute-path>/fnd-008-evidence.json"
 ```
 
-The runtime bearer is generated per Machine generation. It is staged to Fly
-through stdin, mounted only in the runtime container as a file, retained in
-memory for the fence check, and revoked during cleanup. It is never written to
-the evidence file or Machine configuration.
+The command generates the Hermes API key and each Machine generation's Foundry
+bearer. It sends all secret values to Fly through standard input. The runtime
+container receives the OpenAI key, Hermes key, and Foundry bearer as separate
+files. The Hermes container receives only the Hermes key file. Its proof
+startup command reads that file into `API_SERVER_KEY` before starting
+`hermes gateway run --no-supervise`. No raw secret is written to the evidence
+file or Machine configuration.
+
+Cleanup removes the temporary Fly secrets along with the proof Machine, Volume,
+and App. Keep the local OpenAI key file if you plan to rerun the proof, or remove
+it yourself after the proof passes.
 
 ## Interpret the result
 

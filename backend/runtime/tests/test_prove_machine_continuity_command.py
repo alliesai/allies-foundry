@@ -13,6 +13,8 @@ from runtime.services.continuity_proof import ContinuityProofResult, ProofCheck
 
 def command_args(output):
     digest = "registry.example/image@sha256:" + "a" * 64
+    provider_key = output.parent / "openai-api-key"
+    provider_key.write_text("provider-key-must-not-escape", encoding="utf-8")
     return (
         "--runtime-image",
         digest,
@@ -22,17 +24,12 @@ def command_args(output):
         "https://foundry.example.com",
         "--output",
         str(output),
-        "--hermes-credential-ref",
-        "vault://hermes/proof",
-        "--profile-a-credential-ref",
-        "vault://providers/ally-a",
-        "--profile-b-credential-ref",
-        "vault://providers/ally-b",
+        "--provider-api-key-file",
+        str(provider_key),
         "--model",
         "gpt-test",
         "--run-id",
         "fnd008-command",
-        "--confirm-runtime-credential-resolver",
     )
 
 
@@ -82,16 +79,37 @@ def test_live_command_writes_only_the_service_evidence(monkeypatch, tmp_path):
     monkeypatch.setattr(
         command.Command, "_fly_api_token", staticmethod(lambda _: "fly-token")
     )
+    captured = {}
+
+    def dependency_bootstrap(store, *, provider_api_key):
+        captured["provider_api_key"] = provider_api_key
+        return object()
+
     monkeypatch.setattr(command, "ProofCredentialBootstrap", lambda _store: object())
+    monkeypatch.setattr(
+        command, "ProofDependencyCredentialBootstrap", dependency_bootstrap
+    )
     monkeypatch.setattr(
         command,
         "run_machine_replacement_proof",
-        lambda config, **_kwargs: expected,
+        lambda config, **_kwargs: captured.update(config=config) or expected,
     )
 
     call_command("prove_machine_continuity", "--live", *command_args(output))
 
     assert json.loads(output.read_text(encoding="utf-8")) == expected.to_dict()
+    assert captured["provider_api_key"] == "provider-key-must-not-escape"
+    assert {profile.seed.provider for profile in captured["config"].profiles} == {
+        "openai"
+    }
+    assert "provider-key-must-not-escape" not in output.read_text(encoding="utf-8")
+
+
+def test_provider_api_key_file_must_be_absolute(tmp_path):
+    from runtime.management.commands.prove_machine_continuity import Command
+
+    with pytest.raises(ValueError, match="unavailable"):
+        Command._secret_file("openai-api-key")
 
 
 @pytest.mark.django_db

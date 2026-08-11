@@ -28,11 +28,15 @@ from runtime.services.continuity_proof import (
     ContinuityProofConfig,
     FlyCliSecretStore,
     ProofCredentialBootstrap,
+    ProofCredentialHandle,
+    ProofDependencyCredentialBootstrap,
+    ProofDependencyCredentialHandle,
     ProofProfile,
     _assert_profile_fact_continuity,
     _cleanup_provider_resources,
     _execution_text,
     _record_current_machine,
+    _spec_for_handle,
     run_machine_replacement_proof,
 )
 from runtime.services.profiles import ProfileSeed
@@ -166,6 +170,72 @@ def test_proof_bootstrap_retains_one_random_bearer_and_stages_only_base64(
     assert store.unset == [(ready_workspace.fly_app_ref, handle.secret_name)]
 
 
+def test_proof_bootstrap_stages_runtime_dependencies_and_cleans_each_secret():
+    store = FakeSecretStore()
+    bootstrap = ProofDependencyCredentialBootstrap(
+        store,
+        provider_api_key="provider-key-must-not-escape",
+        hermes_key_factory=lambda: "generated-hermes-api-key-strong-enough",
+    )
+
+    handle = bootstrap.prepare("allies-proof-app")
+    replay = bootstrap.prepare("allies-proof-app")
+
+    assert isinstance(handle, ProofDependencyCredentialHandle)
+    assert replay is handle
+    decoded = {
+        name: base64.b64decode(value).decode("utf-8")
+        for _app, name, value in store.staged
+    }
+    assert decoded[handle.hermes_key_secret_name] == (
+        "generated-hermes-api-key-strong-enough"
+    )
+    assert decoded[handle.provider_key_secret_name] == "provider-key-must-not-escape"
+    assert "provider-key-must-not-escape" not in repr(bootstrap)
+    assert "generated-hermes-api-key-strong-enough" not in repr(handle)
+
+    bootstrap.cleanup(handle)
+
+    assert set(store.unset) == {
+        ("allies-proof-app", handle.hermes_key_secret_name),
+        ("allies-proof-app", handle.provider_key_secret_name),
+    }
+
+
+def test_proof_spec_mounts_each_dependency_only_in_its_consumer():
+    config = proof_config()
+    generation = ProofCredentialHandle(
+        workspace_id=config.workspace_id,
+        app_ref="allies-proof-app",
+        generation=1,
+        operation_id=uuid4(),
+        credential_id=uuid4(),
+        secret_name="ALLIES_FND008_FOUNDRY_1",
+        credential_ref="file:///run/secrets/foundry-runtime-token",
+        raw_token="foundry-token-must-not-escape",
+    )
+    dependencies = ProofDependencyCredentialHandle(
+        app_ref="allies-proof-app",
+        hermes_key_secret_name="ALLIES_FND008_HERMES_KEY",
+        provider_key_secret_name="ALLIES_FND008_OPENAI_KEY",
+    )
+
+    spec = _spec_for_handle(config, generation, dependencies)
+    hermes, runtime = spec.containers or ()
+
+    assert hermes.command[:2] == ("sh", "-c")
+    assert "exec hermes gateway run --no-supervise" in hermes.command[2]
+    assert {item.secret_name for item in hermes.secret_files} == {
+        dependencies.hermes_key_secret_name
+    }
+    assert {item.secret_name for item in runtime.secret_files} == {
+        dependencies.hermes_key_secret_name,
+        dependencies.provider_key_secret_name,
+    }
+    assert spec.runtime_credential_ref == dependencies.hermes_credential_ref
+    assert "must-not-escape" not in repr(spec)
+
+
 def test_fly_secret_store_passes_secret_value_only_through_stdin(monkeypatch):
     from runtime.services import continuity_proof
 
@@ -185,6 +255,12 @@ def test_fly_secret_store_passes_secret_value_only_through_stdin(monkeypatch):
     assert kwargs["input"] == "base64-private-value"
     assert kwargs["capture_output"] is True
     assert kwargs["timeout"] == 15
+
+    store.remove("allies-app", "FND008_SECRET")
+
+    remove_args, remove_kwargs = calls[1]
+    assert "--stage" in remove_args
+    assert remove_kwargs["input"] is None
 
 
 def test_fly_secret_store_reports_bounded_timeout(monkeypatch):

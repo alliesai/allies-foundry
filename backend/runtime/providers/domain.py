@@ -8,8 +8,9 @@ validating and translating external responses into these shapes.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import PurePosixPath
 from types import MappingProxyType
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -165,11 +166,31 @@ class VolumeMount:
 
 
 @dataclass(frozen=True, slots=True)
+class ContainerFileSecret:
+    guest_path: str
+    secret_name: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.guest_path, "container secret guest path", max_length=255)
+        path = PurePosixPath(self.guest_path)
+        if (
+            not path.is_absolute()
+            or ".." in path.parts
+            or len(path.parts) < 4
+            or path.parts[:3] != ("/", "run", "secrets")
+        ):
+            raise ValueError("container secret files must remain under /run/secrets")
+        _identifier(self.secret_name, "container secret name", max_length=128)
+
+
+@dataclass(frozen=True, slots=True)
 class ContainerSpec:
     name: str
     image: str
     command: tuple[str, ...] = ()
     healthchecks: tuple[Mapping[str, object], ...] = ()
+    environment: Mapping[str, str] = field(default_factory=dict)
+    secret_files: tuple[ContainerFileSecret, ...] = ()
 
     def __post_init__(self) -> None:
         _identifier(self.name, "container name", max_length=64)
@@ -190,6 +211,16 @@ class ContainerSpec:
             _identifier(check_name, "container healthcheck name", max_length=64)
             normalized_checks.append(MappingProxyType(dict(check)))
         object.__setattr__(self, "healthchecks", tuple(normalized_checks))
+        object.__setattr__(
+            self, "environment", _labels(self.environment, "container env")
+        )
+        if not isinstance(self.secret_files, tuple):
+            object.__setattr__(self, "secret_files", tuple(self.secret_files))
+        if not all(isinstance(item, ContainerFileSecret) for item in self.secret_files):
+            raise TypeError("container secret files must be ContainerFileSecret values")
+        guest_paths = [item.guest_path for item in self.secret_files]
+        if len(guest_paths) != len(set(guest_paths)):
+            raise ValueError("container secret file paths must be unique")
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,7 @@ from allies_runtime import (
 )
 from allies_runtime.__main__ import runtime_entrypoint, worker_entrypoint
 from allies_runtime.composition import run_worker
+from allies_runtime.config import CredentialReference
 from allies_runtime.fake import FakeHermesClient
 from allies_runtime.foundry import FoundryClient
 
@@ -202,6 +203,42 @@ def test_runtime_entrypoint_resolves_foundry_secret_at_composition_boundary(
     )
     assert captured["worker"]["idle_cycles"] == 1
     assert "foundry-secret" not in repr(captured["worker"]["settings"])
+
+
+def test_runtime_entrypoint_uses_file_resolver_for_proof_credentials(
+    monkeypatch, tmp_path
+):
+    secrets_root = tmp_path / "secrets"
+    secrets_root.mkdir()
+    hermes_key = secrets_root / "hermes-api-key"
+    provider_key = secrets_root / "openai-api-key"
+    hermes_key.write_text("hermes-key-strong-enough", encoding="utf-8")
+    provider_key.write_text("provider-key", encoding="utf-8")
+    monkeypatch.setattr(__main__, "_SECRETS_ROOT", secrets_root)
+    captured = {}
+    monkeypatch.setattr(
+        __main__,
+        "worker_entrypoint",
+        lambda **kwargs: captured.update(kwargs) or 0,
+    )
+
+    result = runtime_entrypoint(
+        env={
+            "HERMES_CREDENTIAL_REF": hermes_key.as_uri(),
+            "FOUNDRY_ORIGIN": "https://foundry.example.com",
+            "FOUNDRY_RUNTIME_CREDENTIAL_REF": (
+                "file:///run/secrets/foundry-runtime-token"
+            ),
+        },
+        foundry_credential_resolver=lambda _reference: "foundry-secret",
+        foundry_factory=lambda **_kwargs: object(),
+        hermes=FakeHermesClient(),
+        idle_cycles=1,
+    )
+
+    assert result == 0
+    resolver = captured["credential_resolver"]
+    assert resolver(CredentialReference(provider_key.as_uri())) == "provider-key"
 
 
 def test_runtime_entrypoint_retries_hermes_during_startup(monkeypatch):

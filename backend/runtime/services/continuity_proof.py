@@ -23,7 +23,7 @@ from runtime.models import (
     RuntimeProfile,
     Workspace,
 )
-from runtime.providers import ProviderNotFoundError
+from runtime.providers import ContainerFileSecret, ContainerSpec, ProviderNotFoundError
 from runtime.services.executions import create_execution
 from runtime.services.profiles import ProfileSeed, ensure_runtime_profile
 from runtime.services.runtime_auth import (
@@ -39,6 +39,14 @@ from runtime.services.workspaces import (
 )
 
 _CREDENTIAL_REF = "file:///run/secrets/foundry-runtime-token"
+HERMES_PROOF_CREDENTIAL_REF = "file:///run/secrets/hermes-api-key"
+OPENAI_PROOF_CREDENTIAL_REF = "file:///run/secrets/openai-api-key"
+_HERMES_KEY_PATH = "/run/secrets/hermes-api-key"
+_HERMES_PROOF_COMMAND = (
+    "sh",
+    "-c",
+    'API_SERVER_KEY="$(cat /run/secrets/hermes-api-key)"; export API_SERVER_KEY; exec hermes gateway run --no-supervise',
+)
 _SAFE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 _FLY_CLI_TIMEOUT_SECONDS = 15
@@ -67,7 +75,7 @@ class FlyCliSecretStore:
         )
 
     def remove(self, app_ref: str, secret_name: str) -> None:
-        self._run(("secrets", "unset", secret_name, "--app", app_ref))
+        self._run(("secrets", "unset", secret_name, "--stage", "--app", app_ref))
 
     def _run(self, args: tuple[str, ...], *, input_value: str | None = None) -> None:
         try:
@@ -97,6 +105,95 @@ class ProofCredentialHandle:
     secret_name: str
     credential_ref: str
     raw_token: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ProofDependencyCredentialHandle:
+    app_ref: str
+    hermes_key_secret_name: str
+    provider_key_secret_name: str
+    hermes_credential_ref: str = HERMES_PROOF_CREDENTIAL_REF
+    provider_credential_ref: str = OPENAI_PROOF_CREDENTIAL_REF
+
+
+class ProofDependencyCredentialBootstrap:
+    """Stage the proof-only Hermes and provider credentials as Fly files."""
+
+    def __init__(
+        self,
+        secret_store: ProofSecretStore,
+        *,
+        provider_api_key: str,
+        hermes_key_factory: Callable[[], str] | None = None,
+    ) -> None:
+        self.secret_store = secret_store
+        self._provider_api_key = _bounded_credential(
+            provider_api_key, "provider API key"
+        )
+        self._hermes_key_factory = hermes_key_factory or (
+            lambda: secrets.token_urlsafe(48)
+        )
+        self._handle: ProofDependencyCredentialHandle | None = None
+
+    def prepare(self, app_ref: str) -> ProofDependencyCredentialHandle:
+        if self._handle is not None:
+            if self._handle.app_ref != app_ref:
+                raise ValueError("proof dependency credentials were reused")
+            return self._handle
+        hermes_key = _bounded_credential(
+            self._hermes_key_factory(), "Hermes API key", minimum=16
+        )
+        handle = ProofDependencyCredentialHandle(
+            app_ref=app_ref,
+            hermes_key_secret_name="ALLIES_FND008_HERMES_KEY",
+            provider_key_secret_name="ALLIES_FND008_OPENAI_KEY",
+        )
+        values = (
+            (handle.hermes_key_secret_name, hermes_key),
+            (handle.provider_key_secret_name, self._provider_api_key),
+        )
+        staged: list[str] = []
+        try:
+            for name, value in values:
+                encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+                self.secret_store.stage(app_ref, name, encoded)
+                staged.append(name)
+        except Exception:
+            for name in reversed(staged):
+                try:
+                    self.secret_store.remove(app_ref, name)
+                except Exception:  # noqa: BLE001, S110 - preserve original failure
+                    pass
+            raise
+        self._handle = handle
+        return handle
+
+    def cleanup(self, handle: ProofDependencyCredentialHandle) -> None:
+        failures: list[Exception] = []
+        for name in (
+            handle.provider_key_secret_name,
+            handle.hermes_key_secret_name,
+        ):
+            try:
+                self.secret_store.remove(handle.app_ref, name)
+            except Exception as exc:  # noqa: BLE001 - every secret gets an attempt
+                failures.append(exc)
+        self._handle = None
+        if failures:
+            raise RuntimeError(
+                "proof dependency credential cleanup failed"
+            ) from failures[0]
+
+
+def _bounded_credential(value: str, name: str, *, minimum: int = 1) -> str:
+    if (
+        not isinstance(value, str)
+        or not minimum <= len(value) <= 4096
+        or "\r" in value
+        or "\n" in value
+    ):
+        raise ValueError(f"{name} is invalid")
+    return value
 
 
 class ProofCredentialBootstrap:
@@ -268,6 +365,7 @@ def run_machine_replacement_proof(
     *,
     provider: Any,
     credential_bootstrap: ProofCredentialBootstrap,
+    dependency_credential_bootstrap: ProofDependencyCredentialBootstrap | None = None,
     progress: ProofProgressDriver | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
@@ -278,6 +376,7 @@ def run_machine_replacement_proof(
     progress = progress or (lambda _stage, _state: None)
     mutated = False
     handles: list[ProofCredentialHandle] = []
+    dependency_handle: ProofDependencyCredentialHandle | None = None
     resources: dict[str, str] = {}
     checks: list[ProofCheck] = []
     executions: list[dict[str, Any]] = []
@@ -312,6 +411,8 @@ def run_machine_replacement_proof(
         app = provider.ensure_app(config.workspace_spec.app_spec(config.workspace_id))
         mutated = True
         resources["app"] = app.name
+        if dependency_credential_bootstrap is not None:
+            dependency_handle = dependency_credential_bootstrap.prepare(app.name)
 
         first_handle = credential_bootstrap.prepare(
             workspace.id,
@@ -320,7 +421,7 @@ def run_machine_replacement_proof(
             operation_id=UUID(bytes=secrets.token_bytes(16)),
         )
         handles.append(first_handle)
-        first_spec = _spec_for_handle(config, first_handle)
+        first_spec = _spec_for_handle(config, first_handle, dependency_handle)
         first_binding = lifecycle.ensure_workspace(workspace.id, first_spec)
         old_generation = first_binding.machine_generation
         resources.update(
@@ -431,7 +532,7 @@ def run_machine_replacement_proof(
             operation_id=UUID(bytes=secrets.token_bytes(16)),
         )
         handles.append(second_handle)
-        second_spec = _spec_for_handle(config, second_handle)
+        second_spec = _spec_for_handle(config, second_handle, dependency_handle)
         replacement = lifecycle.replace_machine(
             workspace.id,
             second_spec,
@@ -562,6 +663,14 @@ def run_machine_replacement_proof(
                 credential_bootstrap.cleanup(handle)
             except Exception:  # noqa: BLE001 - cleanup detail is intentionally bounded
                 cleanup_complete = False
+        if (
+            dependency_handle is not None
+            and dependency_credential_bootstrap is not None
+        ):
+            try:
+                dependency_credential_bootstrap.cleanup(dependency_handle)
+            except Exception:  # noqa: BLE001 - provider cleanup must still run
+                cleanup_complete = False
         if mutated:
             try:
                 _record_current_machine(config.workspace_id, resources)
@@ -600,13 +709,70 @@ def run_machine_replacement_proof(
 def _spec_for_handle(
     config: ContinuityProofConfig,
     handle: ProofCredentialHandle,
+    dependency_handle: ProofDependencyCredentialHandle | None = None,
 ) -> WorkspaceSpec:
+    containers = config.workspace_spec.containers
+    runtime_credential_ref = config.workspace_spec.runtime_credential_ref
+    if dependency_handle is not None:
+        if (
+            not config.workspace_spec.hermes_image
+            or not config.workspace_spec.runtime_image
+        ):
+            raise ValueError("proof dependency files require both runtime images")
+        containers = (
+            ContainerSpec(
+                "hermes",
+                config.workspace_spec.hermes_image,
+                command=_HERMES_PROOF_COMMAND,
+                healthchecks=(_proof_process_healthcheck("hermes"),),
+                environment={
+                    "HERMES_HOME": "/opt/data",
+                    "API_SERVER_HOST": "127.0.0.1",
+                    "API_SERVER_PORT": "8642",
+                    "GATEWAY_MULTIPLEX_PROFILES": "true",
+                },
+                secret_files=(
+                    ContainerFileSecret(
+                        _HERMES_KEY_PATH,
+                        dependency_handle.hermes_key_secret_name,
+                    ),
+                ),
+            ),
+            ContainerSpec(
+                "allies-runtime",
+                config.workspace_spec.runtime_image,
+                healthchecks=(_proof_process_healthcheck("allies-runtime"),),
+                secret_files=(
+                    ContainerFileSecret(
+                        "/run/secrets/hermes-api-key",
+                        dependency_handle.hermes_key_secret_name,
+                    ),
+                    ContainerFileSecret(
+                        "/run/secrets/openai-api-key",
+                        dependency_handle.provider_key_secret_name,
+                    ),
+                ),
+            ),
+        )
+        runtime_credential_ref = dependency_handle.hermes_credential_ref
     return replace(
         config.workspace_spec,
+        containers=containers,
+        runtime_credential_ref=runtime_credential_ref,
         foundry_origin=config.foundry_origin,
         foundry_runtime_credential_ref=handle.credential_ref,
         foundry_runtime_credential_secret_name=handle.secret_name,
     )
+
+
+def _proof_process_healthcheck(name: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "exec": {"command": ["/bin/sh", "-c", "test -r /proc/1/stat"]},
+        "interval": 5,
+        "timeout": 2,
+        "grace_period": 5,
+    }
 
 
 def _wait_for(
@@ -819,6 +985,8 @@ __all__ = [
     "ProofCheck",
     "ProofCredentialBootstrap",
     "ProofCredentialHandle",
+    "ProofDependencyCredentialBootstrap",
+    "ProofDependencyCredentialHandle",
     "ProofProfile",
     "ProofRunState",
     "ProofSecretStore",
