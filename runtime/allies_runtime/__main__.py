@@ -11,6 +11,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
 
 from .composition import RuntimeComposition, compose_runtime, run_worker
 from .config import CredentialReference, SettingsError, load_settings
@@ -23,8 +24,9 @@ from .hermes import (
 )
 from .smoke import run_smoke_sync
 
-_TEST_BOOTSTRAP_GRACE_SECONDS = 60.0
+_HERMES_STARTUP_GRACE_SECONDS = 60.0
 _MAX_RUNTIME_CREDENTIAL_BYTES = 4096
+_SECRETS_ROOT = Path("/run/secrets")
 
 
 def worker_entrypoint(
@@ -69,11 +71,16 @@ def file_credential_for_reference(reference: CredentialReference) -> str:
         raise SettingsError(
             "FOUNDRY_RUNTIME_CREDENTIAL_REF must be a local file reference"
         )
-    path = Path(unquote(parsed.path))
-    secrets_root = Path("/run/secrets")
+    path = Path(url2pathname(unquote(parsed.path)))
+    if ".." in path.parts:
+        raise SettingsError(
+            "FOUNDRY_RUNTIME_CREDENTIAL_REF must remain under /run/secrets"
+        )
+    secrets_root = _SECRETS_ROOT.resolve()
     try:
+        path = path.resolve()
         path.relative_to(secrets_root)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         raise SettingsError(
             "FOUNDRY_RUNTIME_CREDENTIAL_REF must remain under /run/secrets"
         ) from exc
@@ -129,8 +136,11 @@ def runtime_entrypoint(
         hermes_client = hermes or HermesClient(settings, credential_resolver)
     except (OSError, SettingsError, TypeError, ValueError):
         return 1
-    if not asyncio.run(probe_readiness(hermes_client)):
-        return 1
+    deadline = time.monotonic() + _HERMES_STARTUP_GRACE_SECONDS
+    while not asyncio.run(probe_readiness(hermes_client)):
+        if time.monotonic() >= deadline:
+            return 1
+        time.sleep(0.25)
     return worker_entrypoint(
         settings=settings,
         foundry=foundry,
@@ -188,7 +198,7 @@ def serve(
     # closed immediately when their resolver or key is unavailable.
     reference = os.environ.get("HERMES_CREDENTIAL_REF", "").lower()
     deadline = time.monotonic() + (
-        _TEST_BOOTSTRAP_GRACE_SECONDS if reference.startswith("test://fnd004/") else 0.0
+        _HERMES_STARTUP_GRACE_SECONDS if reference.startswith("test://fnd004/") else 0.0
     )
     try:
         while not asyncio.run(probe_readiness(client)):

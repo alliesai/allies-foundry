@@ -273,15 +273,19 @@ def test_live_entrypoint_fails_closed(monkeypatch, capsys):
     assert "live_capability_gate" in capsys.readouterr().out
 
 
-def test_foundry_file_credential_resolver_reads_only_bounded_secret_files(monkeypatch):
+def test_foundry_file_credential_resolver_reads_only_bounded_secret_files(
+    monkeypatch, tmp_path
+):
     from allies_runtime import __main__
     from allies_runtime.config import CredentialReference, SettingsError
 
-    monkeypatch.setattr(__main__.Path, "read_bytes", lambda _path: b"runtime-bearer\n")
+    secrets_root = tmp_path / "secrets"
+    secrets_root.mkdir()
+    secret = secrets_root / "foundry-token"
+    secret.write_bytes(b"runtime-bearer\n")
+    monkeypatch.setattr(__main__, "_SECRETS_ROOT", secrets_root)
     assert (
-        __main__.file_credential_for_reference(
-            CredentialReference("file:///run/secrets/foundry-token")
-        )
+        __main__.file_credential_for_reference(CredentialReference(secret.as_uri()))
         == "runtime-bearer"
     )
 
@@ -293,6 +297,30 @@ def test_foundry_file_credential_resolver_reads_only_bounded_secret_files(monkey
         __main__.file_credential_for_reference(
             CredentialReference("file:///tmp/foundry-token")
         )
+
+    with pytest.raises(SettingsError, match="remain under"):
+        __main__.file_credential_for_reference(
+            CredentialReference("file:///run/secrets/../../etc/passwd")
+        )
+
+
+def test_foundry_file_credential_resolver_rejects_symlink_escape(monkeypatch, tmp_path):
+    from allies_runtime import __main__
+    from allies_runtime.config import CredentialReference, SettingsError
+
+    secrets_root = tmp_path / "secrets"
+    secrets_root.mkdir()
+    outside = tmp_path / "outside-token"
+    outside.write_text("private", encoding="utf-8")
+    link = secrets_root / "foundry-token"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    monkeypatch.setattr(__main__, "_SECRETS_ROOT", secrets_root)
+
+    with pytest.raises(SettingsError, match="remain under"):
+        __main__.file_credential_for_reference(CredentialReference(link.as_uri()))
 
 
 @pytest.mark.parametrize(
@@ -328,6 +356,7 @@ def test_runtime_entrypoint_fails_before_worker_when_hermes_is_unready(monkeypat
     monkeypatch.setattr(
         __main__, "worker_entrypoint", lambda **kwargs: worker_calls.append(kwargs)
     )
+    monkeypatch.setattr(__main__, "_HERMES_STARTUP_GRACE_SECONDS", 0.0)
     result = __main__.runtime_entrypoint(
         env={
             "HERMES_CREDENTIAL_REF": "vault://hermes/runtime",

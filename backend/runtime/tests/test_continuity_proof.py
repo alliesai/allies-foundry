@@ -29,6 +29,7 @@ from runtime.services.continuity_proof import (
     FlyCliSecretStore,
     ProofCredentialBootstrap,
     ProofProfile,
+    _assert_profile_fact_continuity,
     run_machine_replacement_proof,
 )
 from runtime.services.profiles import ProfileSeed
@@ -180,6 +181,89 @@ def test_fly_secret_store_passes_secret_value_only_through_stdin(monkeypatch):
     assert "base64-private-value" not in repr(args)
     assert kwargs["input"] == "base64-private-value"
     assert kwargs["capture_output"] is True
+    assert kwargs["timeout"] == 15
+
+
+def test_fly_secret_store_reports_bounded_timeout(monkeypatch):
+    from runtime.services import continuity_proof
+
+    def timeout(*_args, **_kwargs):
+        raise continuity_proof.subprocess.TimeoutExpired("fly", 15)
+
+    monkeypatch.setattr(continuity_proof.subprocess, "run", timeout)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        FlyCliSecretStore("fly").remove("allies-app", "FND008_SECRET")
+
+
+def test_proof_bootstrap_attempts_secret_removal_when_revocation_fails(
+    ready_workspace,
+):
+    store = FakeSecretStore()
+    bootstrap = ProofCredentialBootstrap(
+        store,
+        token_factory=lambda: "random-generation-bearer",
+        credential_revoker=lambda _credential_id: (_ for _ in ()).throw(
+            RuntimeError("database unavailable")
+        ),
+    )
+    handle = bootstrap.prepare(
+        ready_workspace.id,
+        ready_workspace.fly_app_ref,
+        generation=2,
+        operation_id=uuid4(),
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        bootstrap.cleanup(handle)
+
+    assert store.unset == [(ready_workspace.fly_app_ref, handle.secret_name)]
+
+
+def test_proof_bootstrap_attempts_revocation_when_secret_removal_fails(
+    ready_workspace,
+):
+    class FailingSecretStore(FakeSecretStore):
+        def remove(self, app_ref, secret_name):
+            super().remove(app_ref, secret_name)
+            raise RuntimeError("Fly unavailable")
+
+    revoked = []
+    bootstrap = ProofCredentialBootstrap(
+        FailingSecretStore(),
+        token_factory=lambda: "random-generation-bearer",
+        credential_revoker=revoked.append,
+    )
+    handle = bootstrap.prepare(
+        ready_workspace.id,
+        ready_workspace.fly_app_ref,
+        generation=2,
+        operation_id=uuid4(),
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        bootstrap.cleanup(handle)
+
+    assert revoked == [handle.credential_id]
+
+
+@pytest.mark.parametrize("outputs", [("", "fact-1"), ("fact-1", "fact-0")])
+def test_profile_fact_continuity_rejects_missing_or_cross_profile_output(
+    monkeypatch, outputs
+):
+    from runtime.services import continuity_proof
+
+    profiles = proof_config().profiles
+    executions = (SimpleNamespace(id=uuid4()), SimpleNamespace(id=uuid4()))
+    by_id = dict(zip((item.id for item in executions), outputs, strict=True))
+    monkeypatch.setattr(
+        continuity_proof,
+        "_execution_text",
+        lambda execution_id: by_id[execution_id],
+    )
+
+    with pytest.raises(RuntimeError, match="profile_fact_continuity_failed"):
+        _assert_profile_fact_continuity(profiles, executions)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -251,7 +335,7 @@ def test_machine_replacement_proof_runs_full_deterministic_path():
         elif stage == "replacement_recovery":
             for execution in Execution.objects.filter(pk__in=state.execution_ids[2:]):
                 number = execution.attempts.count() + 1
-                Attempt.objects.create(
+                attempt = Attempt.objects.create(
                     execution=execution,
                     number=number,
                     status=AttemptStatus.SUCCEEDED,
@@ -259,6 +343,18 @@ def test_machine_replacement_proof_runs_full_deterministic_path():
                 )
                 execution.status = ExecutionStatus.SUCCEEDED
                 execution.save(update_fields=["status", "updated_at"])
+                if execution.id in state.execution_ids[3:]:
+                    profile_index = state.profile_ids.index(execution.profile_id)
+                    ExecutionEvent.objects.create(
+                        attempt=attempt,
+                        event_id=uuid4(),
+                        stream_id=f"resume-{profile_index}",
+                        sequence=1,
+                        event_type="message.delta",
+                        payload={
+                            "text": config.profiles[profile_index].recognizable_fact
+                        },
+                    )
         completed_stages.add(stage)
 
     result = run_machine_replacement_proof(

@@ -18,6 +18,7 @@ from runtime.models import (
     Attempt,
     ConversationBinding,
     Execution,
+    ExecutionEvent,
     ExecutionStatus,
     RuntimeProfile,
     Workspace,
@@ -40,6 +41,7 @@ from runtime.services.workspaces import (
 _CREDENTIAL_REF = "file:///run/secrets/foundry-runtime-token"
 _SAFE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
+_FLY_CLI_TIMEOUT_SECONDS = 15
 
 
 class ProofSecretStore(Protocol):
@@ -75,7 +77,10 @@ class FlyCliSecretStore:
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=_FLY_CLI_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Fly secret command timed out") from exc
         except OSError as exc:
             raise RuntimeError("Fly secret command is unavailable") from exc
         if completed.returncode != 0:
@@ -158,11 +163,19 @@ class ProofCredentialBootstrap:
         return handle
 
     def cleanup(self, handle: ProofCredentialHandle) -> None:
-        self.credential_revoker(handle.credential_id)
+        failures: list[Exception] = []
+        try:
+            self.credential_revoker(handle.credential_id)
+        except Exception as exc:  # noqa: BLE001 - both cleanup legs must run
+            failures.append(exc)
         try:
             self.secret_store.remove(handle.app_ref, handle.secret_name)
+        except Exception as exc:  # noqa: BLE001 - both cleanup legs must run
+            failures.append(exc)
         finally:
             self._handles.pop(handle.operation_id, None)
+        if failures:
+            raise RuntimeError("proof credential cleanup failed") from failures[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +439,14 @@ def run_machine_replacement_proof(
             precondition,
         )
         new_generation = replacement.machine_generation
+        if replacement.volume_ref != first_binding.volume_ref:
+            raise RuntimeError("replacement_volume_changed")
+        inspect_old = getattr(provider, "inspect_machine_by_id", None)
+        if (
+            inspect_old is None
+            or inspect_old(app.name, first_binding.machine_ref) is not None
+        ):
+            raise RuntimeError("old_machine_still_present")
         resources["replacement_machine"] = replacement.machine_ref
         checks.append(ProofCheck("machine_replacement", "pass", "volume_preserved"))
 
@@ -457,7 +478,9 @@ def run_machine_replacement_proof(
                 profile.profile_id,
                 f"{config.run_id}-resume-{profile.alias}",
                 {
-                    "message": f"Recall the proof fact for {profile.alias}.",
+                    "message": (
+                        f"Reply with the exact proof fact for {profile.alias} only."
+                    ),
                     "cloud_conversation_ref": f"{config.run_id}-{profile.alias}",
                 },
             )
@@ -484,6 +507,7 @@ def run_machine_replacement_proof(
             sleep,
             config.poll_interval,
         )
+        _assert_profile_fact_continuity(config.profiles, resumed)
         after_sessions = _session_map(state.profile_ids)
         for profile in config.profiles:
             sessions.append(
@@ -660,6 +684,30 @@ def _session_map(profile_ids: tuple[UUID, UUID]) -> dict[UUID, str]:
             "profile_id", "hermes_session_id"
         )
     )
+
+
+def _execution_text(execution_id: UUID) -> str:
+    chunks: list[str] = []
+    for payload in ExecutionEvent.objects.filter(
+        attempt__execution_id=execution_id,
+        event_type="message.delta",
+    ).values_list("payload", flat=True):
+        if isinstance(payload, dict) and isinstance(payload.get("text"), str):
+            chunks.append(payload["text"])
+    return "".join(chunks)
+
+
+def _assert_profile_fact_continuity(
+    profiles: tuple[ProofProfile, ProofProfile],
+    executions: tuple[Execution, Execution],
+) -> None:
+    for index, (profile, execution) in enumerate(
+        zip(profiles, executions, strict=True)
+    ):
+        output = _execution_text(execution.id).casefold()
+        other_fact = profiles[1 - index].recognizable_fact.casefold()
+        if profile.recognizable_fact.casefold() not in output or other_fact in output:
+            raise RuntimeError("profile_fact_continuity_failed")
 
 
 def _default_old_token_probe(raw_token: str) -> bool:

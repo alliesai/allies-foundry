@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -109,3 +110,19 @@ def test_command_preflight_rejects_mutable_image_before_provider(monkeypatch, tm
     assert caught.value.returncode == 2
     assert provider_calls == []
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == "skipped"
+
+
+def test_fly_api_token_reports_bounded_timeout(monkeypatch):
+    from runtime.management.commands import prove_machine_continuity as command
+
+    monkeypatch.delenv("FLY_API_TOKEN", raising=False)
+    monkeypatch.setattr(
+        command.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("fly", 15)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="timed out"):
+        command.Command._fly_api_token("fly")

@@ -202,3 +202,39 @@ def test_runtime_entrypoint_resolves_foundry_secret_at_composition_boundary(
     )
     assert captured["worker"]["idle_cycles"] == 1
     assert "foundry-secret" not in repr(captured["worker"]["settings"])
+
+
+def test_runtime_entrypoint_retries_hermes_during_startup(monkeypatch):
+    states = iter((False, True))
+    sleeps = []
+    worker_calls = []
+
+    async def readiness(_client):
+        return next(states)
+
+    monkeypatch.setattr(__main__, "probe_readiness", readiness)
+    monkeypatch.setattr(__main__.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        __main__,
+        "worker_entrypoint",
+        lambda **kwargs: worker_calls.append(kwargs) or 0,
+    )
+
+    result = runtime_entrypoint(
+        env={
+            "HERMES_CREDENTIAL_REF": "vault://hermes/runtime",
+            "FOUNDRY_ORIGIN": "https://foundry.example.com",
+            "FOUNDRY_RUNTIME_CREDENTIAL_REF": (
+                "file:///run/secrets/foundry-runtime-token"
+            ),
+        },
+        credential_resolver=lambda _reference: "hermes-runtime-key",
+        foundry_credential_resolver=lambda _reference: "foundry-secret",
+        foundry_factory=lambda **_kwargs: object(),
+        hermes=object(),
+        idle_cycles=1,
+    )
+
+    assert result == 0
+    assert sleeps == [0.25]
+    assert len(worker_calls) == 1

@@ -215,7 +215,10 @@ class Command(BaseCommand):
                 text=True,
                 capture_output=True,
                 check=False,
+                timeout=15,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("Fly authentication timed out") from exc
         except OSError as exc:
             raise ValueError("Fly authentication is unavailable") from exc
         token = completed.stdout.strip()
