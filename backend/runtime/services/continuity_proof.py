@@ -958,6 +958,9 @@ def _record_current_machine(workspace_id: UUID, resources: dict[str, str]) -> No
 
 
 def _safe_failure_code(exc: Exception) -> str:
+    typed_code = getattr(exc, "code", None)
+    if isinstance(typed_code, str) and _SAFE_CODE.fullmatch(typed_code):
+        return typed_code
     value = str(exc)
     return value if _SAFE_CODE.fullmatch(value) else "proof_step_failed"
 

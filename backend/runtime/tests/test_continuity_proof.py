@@ -23,7 +23,10 @@ from runtime.models import (
     Workspace,
     WorkspaceProvisioningPhase,
 )
-from runtime.providers import ProviderUnsupportedTopologyError
+from runtime.providers import (
+    ProviderInvalidConfigurationError,
+    ProviderUnsupportedTopologyError,
+)
 from runtime.services.continuity_proof import (
     ContinuityProofConfig,
     FlyCliSecretStore,
@@ -36,6 +39,7 @@ from runtime.services.continuity_proof import (
     _cleanup_provider_resources,
     _execution_text,
     _record_current_machine,
+    _safe_failure_code,
     _spec_for_handle,
     run_machine_replacement_proof,
 )
@@ -116,6 +120,12 @@ def assert_no_forbidden_evidence(value, *, key=""):
     elif isinstance(value, str):
         assert "Bearer " not in value
         assert "?token=" not in value
+
+
+def test_safe_failure_code_preserves_typed_provider_code_without_message():
+    error = ProviderInvalidConfigurationError("unsafe provider response detail")
+
+    assert _safe_failure_code(error) == "invalid_configuration"
 
 
 @pytest.fixture
