@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import re
 from datetime import timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -25,6 +26,7 @@ from runtime.models import (
 from runtime.providers import ProviderUnsupportedTopologyError
 from runtime.services.continuity_proof import (
     ContinuityProofConfig,
+    FlyCliSecretStore,
     ProofCredentialBootstrap,
     ProofProfile,
     run_machine_replacement_proof,
@@ -158,6 +160,26 @@ def test_proof_bootstrap_retains_one_random_bearer_and_stages_only_base64(
     credential.refresh_from_db()
     assert credential.revoked_at is not None
     assert store.unset == [(ready_workspace.fly_app_ref, handle.secret_name)]
+
+
+def test_fly_secret_store_passes_secret_value_only_through_stdin(monkeypatch):
+    from runtime.services import continuity_proof
+
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(continuity_proof.subprocess, "run", run)
+    store = FlyCliSecretStore("fly")
+
+    store.stage("allies-app", "FND008_SECRET", "base64-private-value")
+
+    args, kwargs = calls[0]
+    assert "base64-private-value" not in repr(args)
+    assert kwargs["input"] == "base64-private-value"
+    assert kwargs["capture_output"] is True
 
 
 @pytest.mark.django_db(transaction=True)

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
 import secrets
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
@@ -52,8 +55,8 @@ class ProofProgressDriver(Protocol):
 class FlyCliSecretStore:
     """Stage proof secrets through stdin so values never enter argv."""
 
-    def __init__(self, executable: str = "fly") -> None:
-        self.executable = executable
+    def __init__(self, executable: str | None = None) -> None:
+        self.executable = executable or _default_fly_executable()
 
     def stage(self, app_ref: str, secret_name: str, encoded_value: str) -> None:
         self._run(
@@ -704,6 +707,22 @@ def _cleanup_provider_resources(provider: Any, resources: dict[str, str]) -> boo
 def _safe_failure_code(exc: Exception) -> str:
     value = str(exc)
     return value if _SAFE_CODE.fullmatch(value) else "proof_step_failed"
+
+
+def _default_fly_executable() -> str:
+    configured = os.environ.get("FLYCTL_PATH")
+    if configured:
+        return configured
+    discovered = shutil.which("fly") or shutil.which("flyctl")
+    if discovered:
+        return discovered
+    for candidate in (
+        Path.home() / ".fly" / "bin" / "fly.exe",
+        Path.home() / ".fly" / "bin" / "flyctl.exe",
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return "fly"
 
 
 __all__ = [

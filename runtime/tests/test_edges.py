@@ -271,3 +271,76 @@ def test_live_entrypoint_fails_closed(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["allies-runtime", "--smoke", "live"])
     assert __main__.main() == 1
     assert "live_capability_gate" in capsys.readouterr().out
+
+
+def test_foundry_file_credential_resolver_reads_only_bounded_secret_files(monkeypatch):
+    from allies_runtime import __main__
+    from allies_runtime.config import CredentialReference, SettingsError
+
+    monkeypatch.setattr(__main__.Path, "read_bytes", lambda _path: b"runtime-bearer\n")
+    assert (
+        __main__.file_credential_for_reference(
+            CredentialReference("file:///run/secrets/foundry-token")
+        )
+        == "runtime-bearer"
+    )
+
+    with pytest.raises(SettingsError, match="local file reference"):
+        __main__.file_credential_for_reference(
+            CredentialReference("vault://runtime/foundry-token")
+        )
+    with pytest.raises(SettingsError, match="remain under"):
+        __main__.file_credential_for_reference(
+            CredentialReference("file:///tmp/foundry-token")
+        )
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (b"", "invalid size"),
+        (b"x" * 4097, "invalid size"),
+        (b"\xff", "UTF-8"),
+        (b"first\nsecond", "header value"),
+    ],
+)
+def test_foundry_file_credential_resolver_rejects_unsafe_content(
+    monkeypatch, raw, message
+):
+    from allies_runtime import __main__
+    from allies_runtime.config import CredentialReference, SettingsError
+
+    monkeypatch.setattr(__main__.Path, "read_bytes", lambda _path: raw)
+    with pytest.raises(SettingsError, match=message):
+        __main__.file_credential_for_reference(
+            CredentialReference("file:///run/secrets/foundry-token")
+        )
+
+
+def test_runtime_entrypoint_fails_before_worker_when_hermes_is_unready(monkeypatch):
+    from allies_runtime import __main__
+
+    class Unready:
+        async def health_detailed(self):
+            raise RuntimeError("private readiness detail")
+
+    worker_calls = []
+    monkeypatch.setattr(
+        __main__, "worker_entrypoint", lambda **kwargs: worker_calls.append(kwargs)
+    )
+    result = __main__.runtime_entrypoint(
+        env={
+            "HERMES_CREDENTIAL_REF": "vault://hermes/runtime",
+            "FOUNDRY_ORIGIN": "https://foundry.example.com",
+            "FOUNDRY_RUNTIME_CREDENTIAL_REF": (
+                "file:///run/secrets/foundry-runtime-token"
+            ),
+        },
+        credential_resolver=lambda _reference: "hermes-secret",
+        foundry_credential_resolver=lambda _reference: "foundry-secret",
+        foundry_factory=lambda **_kwargs: object(),
+        hermes=Unready(),
+    )
+
+    assert result == 1
+    assert worker_calls == []
