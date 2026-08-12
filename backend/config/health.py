@@ -1,5 +1,5 @@
 import asyncio
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 
 from django.db import DatabaseError, connection, transaction
@@ -15,6 +15,7 @@ _health_cache_lock = Lock()
 _health_cache_expires_at = 0.0
 _health_cache_result: tuple[dict[str, str], int] | None = None
 _health_probe_in_flight = False
+_health_probe_event: Event | None = None
 
 
 async def _async_postgres_probe(params: dict[str, object]) -> None:
@@ -30,8 +31,8 @@ async def _async_postgres_probe(params: dict[str, object]) -> None:
         await database.close()
 
 
-def _run_postgres_probe() -> None:
-    params = dict(connection.get_connection_params())
+def _run_postgres_probe(db_connection=connection) -> None:
+    params = dict(db_connection.get_connection_params())
     # Django's PostgreSQL backend supplies its synchronous cursor class. The
     # short-lived async probe uses psycopg's native async cursor instead.
     params.pop("cursor_factory", None)
@@ -51,15 +52,27 @@ def _run_sqlite_probe() -> None:
 
 
 def healthz(request):
-    global _health_cache_expires_at, _health_cache_result, _health_probe_in_flight
+    global _health_cache_expires_at, _health_cache_result, _health_probe_event, _health_probe_in_flight
 
     with _health_cache_lock:
         if _health_cache_result is not None and monotonic() < _health_cache_expires_at:
             payload, status = _health_cache_result
             return JsonResponse(payload, status=status)
         if _health_probe_in_flight:
-            return JsonResponse({"status": "unavailable"}, status=503)
-        _health_probe_in_flight = True
+            probe_event = _health_probe_event
+        else:
+            probe_event = None
+            _health_probe_event = Event()
+            _health_probe_in_flight = True
+
+    if probe_event is not None:
+        probe_event.wait(timeout=HEALTHCHECK_TIMEOUT_SECONDS)
+        with _health_cache_lock:
+            if _health_cache_result is not None and monotonic() < _health_cache_expires_at:
+                payload, status = _health_cache_result
+            else:
+                payload, status = {"status": "unavailable"}, 503
+        return JsonResponse(payload, status=status)
 
     payload, status = {"status": "unavailable"}, 503
     try:
@@ -76,5 +89,8 @@ def healthz(request):
             _health_cache_result = payload, status
             _health_cache_expires_at = monotonic() + HEALTHCHECK_CACHE_SECONDS
             _health_probe_in_flight = False
+            if _health_probe_event is not None:
+                _health_probe_event.set()
+            _health_probe_event = None
 
     return JsonResponse(payload, status=status)

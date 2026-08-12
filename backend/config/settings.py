@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
+import secrets
 from pathlib import Path
 
 import dj_database_url
@@ -43,7 +44,10 @@ if not SECRET_KEY:
         raise ImproperlyConfigured(
             "DJANGO_SECRET_KEY is required when DJANGO_DEBUG is false or DATABASE_URL is set"
         )
-    SECRET_KEY = "django-insecure-local-development-only"
+    # Keep local development self-contained without sharing a signing key
+    # across processes or environments. Restarts intentionally invalidate
+    # development sessions and runtime lease tokens.
+    SECRET_KEY = secrets.token_urlsafe(32)
 
 ALLOWED_HOSTS = env_list(
     "DJANGO_ALLOWED_HOSTS",

@@ -1,7 +1,13 @@
+from threading import Event, Thread
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import dj_database_url
 import pytest
+from django.conf import settings
 from django.db import DatabaseError
+from django.db.backends.postgresql.base import DatabaseWrapper
+
+from config.health import healthz
 
 
 class FakeAsyncCursor:
@@ -35,6 +41,7 @@ def clear_health_cache():
     with (
         patch("config.health._health_cache_expires_at", 0.0),
         patch("config.health._health_cache_result", None),
+        patch("config.health._health_probe_event", None),
         patch("config.health._health_probe_in_flight", False),
     ):
         yield
@@ -102,6 +109,35 @@ def test_healthz_returns_unavailable_when_postgres_probe_times_out(client):
     assert response.json() == {"status": "unavailable"}
 
 
+@pytest.mark.django_db
+def test_healthz_waits_for_an_in_flight_probe_result():
+    probe_started = Event()
+    release_probe = Event()
+    responses = []
+
+    def slow_probe():
+        probe_started.set()
+        release_probe.wait(timeout=1)
+
+    def request_healthz():
+        responses.append(healthz(None))
+
+    with patch("config.health._run_sqlite_probe", side_effect=slow_probe):
+        first_request = Thread(target=request_healthz)
+        first_request.start()
+        assert probe_started.wait(timeout=1)
+
+        second_request = Thread(target=request_healthz)
+        second_request.start()
+        release_probe.set()
+
+        first_request.join(timeout=2)
+        second_request.join(timeout=2)
+
+    assert len(responses) == 2
+    assert all(response.status_code == 200 for response in responses)
+
+
 def test_run_postgres_probe_uses_bounded_async_connection():
     cursor = FakeAsyncCursor()
     database = FakeAsyncDatabase(cursor)
@@ -129,3 +165,32 @@ def test_run_postgres_probe_uses_bounded_async_connection():
         ("SELECT 1",),
     ]
     assert database.closed
+
+
+def test_run_postgres_probe_accepts_real_django_postgres_params():
+    database_settings = dj_database_url.parse(
+        "postgres://ci:ci@127.0.0.1:5432/foundry",
+        conn_max_age=60,
+    )
+    database_settings["TIME_ZONE"] = settings.TIME_ZONE
+    database_settings["OPTIONS"] = {"connect_timeout": 5}
+    database = DatabaseWrapper(database_settings, alias="probe")
+    cursor = FakeAsyncCursor()
+    fake_database = FakeAsyncDatabase(cursor)
+
+    with patch(
+        "config.health.AsyncConnection.connect",
+        new=AsyncMock(return_value=fake_database),
+    ) as connect:
+        from config.health import _run_postgres_probe
+
+        _run_postgres_probe(database)
+
+    params = connect.await_args.kwargs
+    assert params["dbname"] == "foundry"
+    assert params["user"] == "ci"
+    assert params["password"] == "ci"
+    assert params["host"] == "127.0.0.1"
+    assert params["port"] == 5432
+    assert params["connect_timeout"] == 5
+    assert "cursor_factory" not in params

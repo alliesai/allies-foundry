@@ -9,6 +9,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[2]
 PROBE = """
 import config.settings as settings
 print(settings.DEBUG)
+print(settings.SECRET_KEY == "django-insecure-local-development-only")
 print(settings.DATABASES["default"]["ENGINE"])
 print(settings.DATABASES["default"].get("OPTIONS"))
 print(settings.STATIC_ROOT)
@@ -43,6 +44,7 @@ def test_development_mode_keeps_sqlite_fallback():
 
     assert result.returncode == 0, result.stderr
     assert "True" in result.stdout
+    assert "False" in result.stdout
     assert "django.db.backends.sqlite3" in result.stdout
 
 
