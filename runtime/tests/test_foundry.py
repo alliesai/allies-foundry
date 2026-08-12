@@ -31,6 +31,7 @@ CLAIM = {
     "execution_id": "execution-1",
     "profile_id": "profile-1",
     "hermes_profile_key": "ally-a",
+    "model": "gpt-5.6-luna",
     "conversation_id": "cloud-1",
     "session_id": "session-1",
     "stream_id": "stream-1",

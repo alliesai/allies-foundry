@@ -139,6 +139,7 @@ class FoundryClaim:
     execution_id: str
     profile_id: str
     hermes_profile_key: str
+    model: str
     conversation_id: str | None
     session_id: str | None
     stream_id: str
@@ -588,6 +589,7 @@ class FoundryClient:
             "execution_id",
             "profile_id",
             "hermes_profile_key",
+            "model",
             "stream_id",
             "lease_id",
             "lease_token",
@@ -604,6 +606,7 @@ class FoundryClient:
             execution_id=str(payload["execution_id"]),
             profile_id=str(payload["profile_id"]),
             hermes_profile_key=str(payload["hermes_profile_key"]),
+            model=str(payload["model"]),
             conversation_id=payload.get("conversation_id"),
             session_id=payload.get("session_id"),
             stream_id=str(payload["stream_id"]),
@@ -1099,7 +1102,11 @@ class FoundryWorker:
                 ensure_session = getattr(self.hermes, "ensure_profile_session", None)
                 if not callable(ensure_session):
                     raise HermesError("Hermes session operations were unavailable")
-                ensured = ensure_session(claim.hermes_profile_key, session_id)
+                ensured = ensure_session(
+                    claim.hermes_profile_key,
+                    session_id,
+                    model=claim.model,
+                )
                 if inspect.isawaitable(ensured):
                     await ensured
 

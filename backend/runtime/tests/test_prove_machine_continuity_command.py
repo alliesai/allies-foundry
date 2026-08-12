@@ -104,7 +104,10 @@ def test_live_command_writes_only_the_service_evidence(monkeypatch, tmp_path):
     assert json.loads(output.read_text(encoding="utf-8")) == expected.to_dict()
     assert captured["provider_api_key"] == "provider-key-must-not-escape"
     assert {profile.seed.provider for profile in captured["config"].profiles} == {
-        "openai"
+        "custom"
+    }
+    assert {profile.seed.base_url for profile in captured["config"].profiles} == {
+        "https://api.openai.com/v1"
     }
     assert all(
         profile.recognizable_fact.casefold()

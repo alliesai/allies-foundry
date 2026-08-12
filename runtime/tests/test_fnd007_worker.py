@@ -31,6 +31,7 @@ def claim(*, conversation_id: str | None = None, session_id: str | None = None):
         execution_id="execution-1",
         profile_id="profile-1",
         hermes_profile_key="ally-a",
+        model="gpt-5.6-luna",
         conversation_id=conversation_id,
         session_id=session_id,
         stream_id="stream-1",
@@ -87,8 +88,8 @@ class RecordingHermes:
         self.streams = []
         self.history_checks = []
 
-    async def ensure_profile_session(self, profile_key, session_id):
-        self.ensured.append((profile_key, session_id))
+    async def ensure_profile_session(self, profile_key, session_id, *, model):
+        self.ensured.append((profile_key, session_id, model))
 
     async def profile_session_matches_markers(
         self, profile_key, session_id, expected, forbidden

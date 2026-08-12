@@ -247,12 +247,17 @@ async def test_profile_session_create_uses_selected_profile_credential(monkeypat
         profile_credential_resolver=lambda key: resolved.append(key) or "profile-a-key",
     )
 
-    session = await client.create_profile_session("ally-a", "candidate-1")
+    session = await client.create_profile_session(
+        "ally-a", "candidate-1", model="gpt-5.6-luna"
+    )
 
     assert session.session_id == "candidate-1"
     assert resolved == ["ally-a"]
     assert calls[0].get_header("Authorization") == "Bearer profile-a-key"
-    assert json.loads(calls[0].data) == {"id": "candidate-1"}
+    assert json.loads(calls[0].data) == {
+        "id": "candidate-1",
+        "model": "gpt-5.6-luna",
+    }
 
 
 @pytest.mark.asyncio
@@ -303,7 +308,9 @@ async def test_profile_session_conflict_requires_exact_inspection(monkeypatch):
         profile_credential_resolver=lambda key: "profile-a-key",
     )
 
-    session = await client.ensure_profile_session("ally-a", "candidate-1")
+    session = await client.ensure_profile_session(
+        "ally-a", "candidate-1", model="gpt-5.6-luna"
+    )
 
     assert session.session_id == "candidate-1"
     assert [request.method for request in calls] == ["POST", "GET"]
@@ -420,7 +427,7 @@ async def test_incremental_stream_uses_final_content_when_provider_emits_no_delt
                     b'data: {"session_id":"s1","run_id":"r1","content":"final answer"}\n',
                     b"\n",
                     b"event: run.completed\n",
-                    b'data: {"session_id":"s1","run_id":"r1","completed":true}\n',
+                    b'data: {"session_id":"s1","run_id":"r1","completed":true,"messages":[{"role":"assistant","content":"final answer"}]}\n',
                     b"\n",
                     b"event: done\n",
                     b'data: {"session_id":"s1","run_id":"r1"}\n',
@@ -573,14 +580,34 @@ def test_incremental_state_machine_rejects_each_invalid_transition():
             {"session_id": "s1", "run_id": "r1", "completed": True},
         )
     current.active_activities.clear()
+    with pytest.raises(HermesMalformedResponse, match="omitted its transcript"):
+        current._normalize_event(
+            "run.completed",
+            {
+                "session_id": "s1",
+                "run_id": "r1",
+                "completed": True,
+                "messages": [],
+            },
+        )
     with pytest.raises(HermesMalformedResponse, match="terminal session"):
         current._normalize_event(
             "run.completed",
-            {"session_id": "bad/session", "run_id": "r1", "completed": True},
+            {
+                "session_id": "bad/session",
+                "run_id": "r1",
+                "completed": True,
+                "messages": [{"role": "assistant", "content": "ok"}],
+            },
         )
     current._normalize_event(
         "run.completed",
-        {"session_id": "s2", "run_id": "r1", "completed": True},
+        {
+            "session_id": "s2",
+            "run_id": "r1",
+            "completed": True,
+            "messages": [{"role": "assistant", "content": "ok"}],
+        },
     )
     with pytest.raises(HermesMalformedResponse, match="after run completion"):
         current._normalize_event(
@@ -627,7 +654,7 @@ async def test_incremental_stream_yields_before_done_and_closes_response(monkeyp
             b'data: {"session_id":"s1","run_id":"r1","delta":"hello"}\n',
             b"\n",
             b"event: run.completed\n",
-            b'data: {"session_id":"s1","run_id":"r1","completed":true}\n',
+            b'data: {"session_id":"s1","run_id":"r1","completed":true,"messages":[{"role":"assistant","content":"hello"}]}\n',
             b"\n",
             b"event: done\n",
             b'data: {"session_id":"s1","run_id":"r1"}\n',
@@ -661,7 +688,7 @@ async def test_incremental_stream_consumes_done_and_ignores_comments(monkeypatch
                     b'data: {"session_id":"s1","run_id":"r1"}\n',
                     b"\n",
                     b"event: run.completed\n",
-                    b'data: {"session_id":"s1","run_id":"r1","completed":true}\n',
+                    b'data: {"session_id":"s1","run_id":"r1","completed":true,"messages":[{"role":"assistant","content":"hello"}]}\n',
                     b"\n",
                     b"event: done\n",
                     b'data: {"session_id":"s1","run_id":"r1"}\n',

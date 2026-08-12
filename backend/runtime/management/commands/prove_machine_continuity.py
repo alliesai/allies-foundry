@@ -108,9 +108,9 @@ class Command(BaseCommand):
                     personality=(
                         f"You are Ally {alias.upper()} in a continuity proof."
                     ),
-                    provider="openai",
+                    provider="custom",
                     model=options["model"],
-                    base_url=options["base_url"],
+                    base_url=options["base_url"] or "https://api.openai.com/v1",
                     first_chat_instruction="Answer briefly and retain the stated fact.",
                     credential_refs={"OPENAI_API_KEY": OPENAI_PROOF_CREDENTIAL_REF},
                 ),

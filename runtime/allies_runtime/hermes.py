@@ -427,6 +427,15 @@ class _IncrementalHTTPStream:
         if name == "run.completed":
             if self.active_activities or payload.get("completed") is not True:
                 raise HermesMalformedResponse("Hermes run completion was invalid")
+            messages = payload.get("messages")
+            if (
+                not isinstance(messages, list)
+                or not messages
+                or len(messages) > MAX_EVENTS
+            ):
+                raise HermesMalformedResponse(
+                    "Hermes run completion omitted its transcript"
+                )
             if not isinstance(payload_session, str) or not _SESSION_ID.fullmatch(
                 payload_session
             ):
@@ -826,13 +835,16 @@ class HermesClient:
             raise HermesTimeout("Hermes health timed out") from exc
 
     async def create_profile_session(
-        self, profile_id: str, session_id: str
+        self, profile_id: str, session_id: str, *, model: str
     ) -> HermesSession:
         profile_id = _profile_path(profile_id)
         session_id = _session_path(session_id)
+        model = validate_stream_message(model)
         token = await self._profile_credential(profile_id)
         path = f"/p/{profile_id}/api/sessions"
-        body = json.dumps({"id": session_id}, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(
+            {"id": session_id, "model": model}, separators=(",", ":")
+        ).encode("utf-8")
 
         def create() -> HermesSession:
             response = None
@@ -880,10 +892,12 @@ class HermesClient:
         )
 
     async def ensure_profile_session(
-        self, profile_id: str, session_id: str
+        self, profile_id: str, session_id: str, *, model: str
     ) -> HermesSession:
         try:
-            return await self.create_profile_session(profile_id, session_id)
+            return await self.create_profile_session(
+                profile_id, session_id, model=model
+            )
         except HermesSessionExists:
             return await self.inspect_profile_session(profile_id, session_id)
 

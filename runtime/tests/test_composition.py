@@ -70,6 +70,7 @@ def claim_response():
             "execution_id": "execution-1",
             "profile_id": PROFILE_ID,
             "hermes_profile_key": PROFILE_KEY,
+            "model": "gpt-test",
             "conversation_id": "conversation-1",
             "session_id": "session-1",
             "stream_id": "stream-1",
