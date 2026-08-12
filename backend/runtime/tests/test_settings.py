@@ -107,6 +107,6 @@ def test_production_mode_accepts_explicit_database(database_url, engine):
     assert "('HTTP_X_FORWARDED_PROTO', 'https')" in result.stdout
     if engine == "django.db.backends.postgresql":
         assert "'connect_timeout': 5" in result.stdout
-        assert "statement_timeout=5000" in result.stdout
+        assert "statement_timeout" not in result.stdout
     else:
         assert "'transaction_mode': 'IMMEDIATE'" in result.stdout

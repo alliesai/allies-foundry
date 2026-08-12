@@ -499,6 +499,18 @@ Production-safe settings are the default. For local development, export the
 explicit debug flag before running Django commands so the SQLite fallback is
 available:
 
+POSIX shells:
+
+```sh
+export DJANGO_DEBUG=true
+make sync
+make check
+make migrate
+make server
+```
+
+PowerShell:
+
 ```powershell
 $env:DJANGO_DEBUG = "true"
 make sync

@@ -126,7 +126,6 @@ if database_url:
     if database_config["ENGINE"] == "django.db.backends.postgresql":
         database_options = database_config.setdefault("OPTIONS", {})
         database_options.setdefault("connect_timeout", 5)
-        database_options.setdefault("options", "-c statement_timeout=5000")
     DATABASES = {"default": database_config}
 else:
     if not DEBUG:

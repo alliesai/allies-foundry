@@ -75,7 +75,9 @@ jobs:
           DJANGO_SECRET_KEY: ci-only-production-check
           DJANGO_ALLOWED_HOSTS: localhost
           DJANGO_TRUST_PROXY_HEADERS: "true"
-          DATABASE_URL: sqlite:///ci-production.sqlite3
+          # A non-routable URL exercises dj-database-url's PostgreSQL path
+          # without requiring a live service for this settings/static check.
+          DATABASE_URL: postgres://ci:ci@127.0.0.1:5432/foundry
         run: |
           uv run --locked python manage.py check
           uv run --locked python manage.py collectstatic --noinput --dry-run

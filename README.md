@@ -15,7 +15,14 @@ make migrate
 make server
 ```
 
-Run the full cross-platform validation command from the repository root:
+Run the full validation command from the repository root. In a POSIX shell:
+
+```sh
+DJANGO_DEBUG=true \
+uv run --locked --project backend python scripts/validate.py
+```
+
+In PowerShell:
 
 ```powershell
 $env:DJANGO_DEBUG = "true"
