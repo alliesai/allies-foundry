@@ -542,7 +542,7 @@ guarantee.
 
 ## Health endpoint
 
-`GET /healthz` is the public Railway liveness/readiness contract. It requires
+`GET /healthz` is the public liveness/readiness contract. It requires
 no authentication and returns `{"status": "ok"}` with HTTP 200 after a
 successful database probe, or `{"status": "unavailable"}` with HTTP 503 when
 the database probe fails or is still unavailable. PostgreSQL's first request

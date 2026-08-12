@@ -1,0 +1,54 @@
+name: Verify Staging HTTPS
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Public HTTPS base URL for the staging service"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: staging-https-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Public HTTPS healthcheck
+    if: github.event_name == 'workflow_dispatch' || vars.STAGING_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      BASE_URL: ${{ inputs.base_url || vars.STAGING_URL }}
+    steps:
+      - name: Check public HTTPS readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url="${BASE_URL%/}"
+          [[ "$base_url" =~ ^https://[^/[:space:]]+$ ]] || {
+            echo "BASE_URL must be an https:// base URL without a path" >&2
+            exit 1
+          }
+
+          health_url="${base_url}/healthz"
+          for attempt in $(seq 1 30); do
+            status=$(curl --silent --show-error --max-time 10 \
+              --output response.json --write-out '%{http_code}' \
+              "$health_url" || true)
+            if [[ "$status" == "200" ]] && jq -e '.status == "ok"' response.json >/dev/null 2>&1; then
+              echo "Public HTTPS readiness passed on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Attempt ${attempt}/30 returned HTTP ${status:-request-error}; retrying..."
+            sleep 10
+          done
+
+          echo "Public HTTPS readiness failed for ${health_url}." >&2
+          cat response.json 2>/dev/null || true
+          exit 1
