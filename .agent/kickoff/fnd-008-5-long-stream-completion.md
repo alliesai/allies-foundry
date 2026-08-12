@@ -182,3 +182,5 @@ The adversarial and simplicity review outputs are retained at
   P0-P2 findings were identified. The isolated reviewer could not start
   because the configured reviewer model is unsupported for this account; this
   limitation is recorded and the review was completed locally instead.
+- 2026-08-12: Pushed the branch and opened PR #11 targeting `dev`:
+  https://github.com/Timmyy3000/allies-foundry/pull/11. No merge was performed.
