@@ -242,7 +242,7 @@ def test_proof_spec_mounts_each_dependency_only_in_its_consumer():
     assert hermes.command[:2] == ("sh", "-c")
     assert "chown" not in hermes.command[2]
     assert "exec hermes gateway run --no-supervise" in hermes.command[2]
-    assert "/run/secrets/hermes-api-key" in hermes.command[2]
+    assert "/opt/data/.allies-secrets/hermes-api-key" in hermes.command[2]
     assert '"$ALLIES_FND008_HERMES_KEY"|base64 -d' in hermes.command[2]
     assert "unset ALLIES_FND008_HERMES_KEY" in hermes.command[2]
     assert runtime.entrypoint[:2] == ("sh", "-c")

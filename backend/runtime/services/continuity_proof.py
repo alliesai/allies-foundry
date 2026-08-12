@@ -50,7 +50,8 @@ from runtime.services.workspaces import (
 _CREDENTIAL_REF = "file:///run/secrets/foundry-runtime-token"
 HERMES_PROOF_CREDENTIAL_REF = "file:///run/secrets/hermes-api-key"
 OPENAI_PROOF_CREDENTIAL_REF = "file:///run/secrets/openai-api-key"
-_HERMES_KEY_PATH = "/run/secrets/hermes-api-key"
+_HERMES_KEY_PATH = "/opt/data/.allies-secrets/hermes-api-key"
+_HERMES_RUNTIME_KEY_PATH = "/run/secrets/hermes-api-key"
 _SAFE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 _SAFE_FLY_SECRET_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -1054,7 +1055,7 @@ def _spec_for_handle(
                 },
                 secret_files=(
                     ContainerFileSecret(
-                        _HERMES_KEY_PATH,
+                        "/run/secrets/hermes-api-key",
                         dependency_handle.hermes_key_secret_name,
                     ),
                 ),
@@ -1068,7 +1069,7 @@ def _spec_for_handle(
                     _proof_process_healthcheck(
                         "allies-runtime",
                         (
-                            "/run/secrets/hermes-api-key",
+                            _HERMES_RUNTIME_KEY_PATH,
                             "/run/secrets/openai-api-key",
                             "/run/secrets/foundry-runtime-token",
                         ),
@@ -1121,9 +1122,9 @@ def _hermes_proof_command(
         raise ValueError("Fly secret name is invalid")
     secret_name = dependency_handle.hermes_key_secret_name
     command = (
-        f"p={_HERMES_KEY_PATH};umask 77;mkdir -p /run/secrets;"
+        f"p={_HERMES_KEY_PATH};umask 77;mkdir -p ${{p%/*}};"
         f'[ -s $p ]||printf %s "${secret_name}"|base64 -d >$p||exit 1;'
-        f"unset {secret_name};[ -s $p ]||exit 1;"
+        f"unset {secret_name};"
         'export API_SERVER_KEY="$(cat $p)";'
         "exec hermes gateway run --no-supervise"
     )
@@ -1137,7 +1138,7 @@ def _runtime_proof_command(
     secret_files = (
         (
             dependency_handle.hermes_key_secret_name,
-            "/run/secrets/hermes-api-key",
+            _HERMES_RUNTIME_KEY_PATH,
         ),
         (
             dependency_handle.provider_key_secret_name,
@@ -1158,15 +1159,15 @@ def _runtime_proof_command(
         "-c",
         "umask 077; mkdir -p /run/secrets; "
         + materialize
-        + "test -s /run/secrets/hermes-api-key"
+        + f"test -s {_HERMES_RUNTIME_KEY_PATH}"
         " && test -s /run/secrets/openai-api-key"
         " && test -s /run/secrets/foundry-runtime-token"
         " || exit 1; chown 10000:10000 /run/secrets"
-        + " /run/secrets/hermes-api-key"
+        + f" {_HERMES_RUNTIME_KEY_PATH}"
         + " /run/secrets/openai-api-key"
         + " /run/secrets/foundry-runtime-token"
         + "; chmod 0700 /run/secrets"
-        + "; chmod 0600 /run/secrets/hermes-api-key"
+        + f"; chmod 0600 {_HERMES_RUNTIME_KEY_PATH}"
         + " /run/secrets/openai-api-key"
         + " /run/secrets/foundry-runtime-token"
         + "; attempts=0"
