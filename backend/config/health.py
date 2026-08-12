@@ -127,10 +127,7 @@ def healthz(request):
 
     payload, status = {"status": "unavailable"}, 503
     try:
-        if connection.vendor == "postgresql":
-            _run_postgres_probe()
-        else:
-            _run_sqlite_probe()
+        _run_sqlite_probe()
     except (DatabaseError, PsycopgError, OSError, TimeoutError):
         pass
     else:

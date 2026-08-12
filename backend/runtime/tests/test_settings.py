@@ -14,6 +14,8 @@ print(settings.DATABASES["default"]["ENGINE"])
 print(settings.DATABASES["default"].get("OPTIONS"))
 print(settings.STATIC_ROOT)
 print(settings.SECURE_PROXY_SSL_HEADER)
+print(settings.SECURE_SSL_REDIRECT)
+print(settings.SECURE_HSTS_SECONDS)
 """
 
 
@@ -110,5 +112,6 @@ def test_production_mode_accepts_explicit_database(database_url, engine):
     if engine == "django.db.backends.postgresql":
         assert "'connect_timeout': 5" in result.stdout
         assert "statement_timeout" not in result.stdout
+        assert "31536000" in result.stdout
     else:
         assert "'transaction_mode': 'IMMEDIATE'" in result.stdout

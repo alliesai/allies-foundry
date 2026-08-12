@@ -535,7 +535,10 @@ Deployments must set `DJANGO_DEBUG=false`, `DJANGO_SECRET_KEY`, and
 `DATABASE_URL` through the platform's secret/environment configuration. Set
 `DJANGO_ALLOWED_HOSTS` (or provide Railway's `RAILWAY_PUBLIC_DOMAIN`) and opt
 into trusted proxy headers with `DJANGO_TRUST_PROXY_HEADERS=true` only when a
-TLS-terminating proxy strips and rewrites `X-Forwarded-Proto`.
+TLS-terminating proxy strips and rewrites `X-Forwarded-Proto`. In that mode,
+the backend also redirects HTTP requests to HTTPS and enables one-year HSTS;
+leave the flag off for direct/local deployments that do not have that proxy
+guarantee.
 
 The repository root provides the current convenience commands. Set
 `DJANGO_DEBUG=true` in your shell first, as shown above:
