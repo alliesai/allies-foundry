@@ -1,0 +1,9 @@
+version: 1
+plan_review:
+  workers:
+    codex:
+      agent: "luna_worker"
+ship_it:
+  workers:
+    codex:
+      agent: "luna_worker"

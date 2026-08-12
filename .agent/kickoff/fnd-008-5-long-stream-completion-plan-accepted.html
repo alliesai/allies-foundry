@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FND-008.5: let long Hermes streams finish</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400..600&family=Geist+Mono:wght@400..600&display=swap" rel="stylesheet" referrerpolicy="no-referrer">
+  <link href="https://vercel.com/geist/vercel-brand.css" rel="stylesheet">
+  <style>
+    .vbg-custom-main { padding-block: var(--vbg-space-10) var(--vbg-space-16); }
+    .vbg-custom-opening { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: var(--vbg-space-8); align-items: end; }
+    .vbg-custom-proof { border-left: 2px solid var(--vbg-border-strong); padding-left: var(--vbg-space-5); }
+    .vbg-custom-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: var(--vbg-space-6); }
+    .vbg-custom-span-4 { grid-column: span 4; min-width: 0; }
+    .vbg-custom-span-6 { grid-column: span 6; min-width: 0; }
+    .vbg-custom-span-8 { grid-column: span 8; min-width: 0; }
+    .vbg-custom-span-12 { grid-column: span 12; min-width: 0; }
+    .vbg-custom-flow { display: grid; gap: var(--vbg-space-4); }
+    .vbg-custom-flow > * { margin: 0; }
+    .vbg-custom-table { overflow-x: auto; }
+    .vbg-custom-table table { width: 100%; border-collapse: collapse; }
+    .vbg-custom-table th, .vbg-custom-table td { padding: var(--vbg-space-3); border-bottom: 1px solid var(--vbg-border-subtle); vertical-align: top; text-align: left; }
+    .vbg-custom-table th { font-weight: var(--vbg-weight-semibold); }
+    .vbg-custom-callout { padding: var(--vbg-space-5); border: 1px solid var(--vbg-border-default); border-radius: var(--vbg-radius-small); }
+    .vbg-custom-code { font-family: Geist Mono, monospace; font-size: var(--vbg-type-compact); overflow-wrap: anywhere; }
+    .vbg-custom-muted { color: var(--vbg-text-secondary); }
+    .vbg-custom-list { display: grid; gap: var(--vbg-space-2); padding-left: 1.25rem; }
+    .vbg-custom-list li { padding-left: var(--vbg-space-1); }
+    .vbg-custom-diagram { min-height: 290px; overflow-x: auto; }
+    .vbg-skip-link { position: fixed !important; top: var(--vbg-space-2) !important; left: var(--vbg-space-4) !important; z-index: 20; transform: none !important; clip: auto !important; clip-path: none !important; width: auto !important; height: auto !important; max-height: none !important; overflow: visible !important; opacity: 1 !important; }
+    @media (max-width: 800px) {
+      .vbg-custom-opening, .vbg-custom-grid { grid-template-columns: 1fr; }
+      .vbg-custom-span-4, .vbg-custom-span-6, .vbg-custom-span-8, .vbg-custom-span-12 { grid-column: span 1; }
+      .vbg-custom-proof { border-left: 0; border-top: 2px solid var(--vbg-border-strong); padding: var(--vbg-space-4) 0 0; }
+    }
+  </style>
+</head>
+<body class="vbg-report">
+  <div class="vbg-shell">
+    <a class="vbg-skip-link" href="#main">Skip to content</a>
+    <header class="vbg-header">
+      <div class="vbg-masthead">
+        <span class="vbg-identity"><span class="vbg-wordmark" role="img" aria-label="Vercel"></span></span>
+        <div class="vbg-document-meta">
+          <span class="vbg-state">Allies Foundry</span>
+          <span class="vbg-date">12 August 2026</span>
+        </div>
+      </div>
+    </header>
+    <main id="main" class="vbg-custom-main">
+      <section class="vbg-opening vbg-custom-opening" aria-labelledby="title">
+        <div class="vbg-flow">
+          <p class="vbg-label">Reviewed implementation plan</p>
+          <h1 id="title" class="vbg-title">Let long Hermes streams finish</h1>
+          <p class="vbg-lede">FND-008.5 removes an accidental 512-frame ceiling from the incremental runtime parser. A valid terminal event must remain reachable after a long answer has streamed, while byte, text, identity, tool, and timeout safeguards stay in force.</p>
+        </div>
+        <div class="vbg-custom-proof vbg-flow">
+          <p class="vbg-label">Observed failure</p>
+          <p class="vbg-heading-20">The terminal frame was rejected</p>
+          <p class="vbg-custom-muted">Sandy emitted 510 ordered <span class="vbg-mono">message.delta</span> events. The expected terminal event was raw frame 513, so the parser returned <span class="vbg-mono">malformed_response</span>.</p>
+          <p class="vbg-caption">Evidence: <span class="vbg-mono">.agent/fnd008-sandy-greg-r2-first-streams.json</span></p>
+        </div>
+      </section>
+
+      <section class="vbg-section" aria-labelledby="decision">
+        <div class="vbg-custom-grid">
+          <div class="vbg-custom-span-8 vbg-flow">
+            <h2 id="decision" class="vbg-heading-24">The smallest safe change</h2>
+            <p>Keep processing the incremental response one bounded SSE frame at a time. Remove only the universal raw-event rejection from that path. The existing total stream-byte limit, per-frame limit, bounded line reads, value-size checks, idle socket timeout, and configured overall <span class="vbg-mono">stream_timeout</span> continue to bound the stream.</p>
+            <p>Keep <span class="vbg-mono">MAX_EVENTS</span> for the existing small history, transcript, and marker collections. Add an explicit <span class="vbg-mono">MAX_BUFFERED_EVENTS = 65,536</span> guard for the legacy whole-result parser, which is the only path that stores all parsed events.</p>
+          </div>
+          <div class="vbg-custom-span-4 vbg-custom-callout vbg-flow">
+            <p class="vbg-label">Protected contract</p>
+            <p class="vbg-heading-20">Every accepted delta stays visible</p>
+            <p class="vbg-custom-muted">No coalescing or dropping of assistant deltas is part of this fix. Tool starts and completions remain ordered and sanitized.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="vbg-section" aria-labelledby="evidence">
+        <h2 id="evidence" class="vbg-heading-24">What the evidence says</h2>
+        <div class="vbg-custom-table">
+          <table>
+            <caption class="vbg-visually-hidden">Current behavior and target behavior</caption>
+            <thead><tr><th scope="col">Boundary</th><th scope="col">Current behavior</th><th scope="col">Target behavior</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Incremental SSE</th><td>Rejects raw event 513 because <span class="vbg-mono">MAX_EVENTS = 512</span>.</td><td>Continues until the byte, value, identity, state, or transport bound is reached.</td></tr>
+              <tr><th scope="row">Tool events</th><td>Tool progress is validated and discarded; starts and completions become safe activity events.</td><td>Same vocabulary and ordering, regardless of how many progress frames precede the terminal event.</td></tr>
+              <tr><th scope="row">Legacy buffered parser</th><td>Shares the same 512-event constant with unrelated collections.</td><td>Uses a named 65,536-event retained-list guard, independent from history and transcript limits.</td></tr>
+              <tr><th scope="row">Terminal validation</th><td>Valid terminal frame can be rejected before parsing.</td><td>Missing, malformed, out-of-order, or identity-changing terminals still fail closed.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="vbg-section" aria-labelledby="flow">
+        <h2 id="flow" class="vbg-heading-24">The event path stays the same</h2>
+        <p class="vbg-caption">The parser changes its raw-frame safety boundary. The product event vocabulary and ownership boundaries do not change.</p>
+        <div class="vbg-custom-diagram" aria-label="SSE event translation flow">
+          <div class="mermaid">
+            flowchart LR
+              H[Hermes SSE frames] --> P[Incremental parser]
+              P --> V{State, identity, byte, text checks}
+              V -->|assistant.delta| D[message.delta]
+              V -->|tool.started / tool.completed| A[activity events]
+              V -->|run.completed + done| T[execution.completed]
+              D --> F[Foundry ordered events]
+              A --> F
+              T --> F
+              F --> C[Cloud and Interface product language]
+          </div>
+        </div>
+      </section>
+
+      <section class="vbg-section" aria-labelledby="phases">
+        <h2 id="phases" class="vbg-heading-24">Implementation phases</h2>
+        <div class="vbg-custom-grid">
+          <article class="vbg-custom-span-6 vbg-flow">
+            <p class="vbg-label">Phase 1</p>
+            <h3 class="vbg-heading-20">Reproduce and fix</h3>
+            <ul class="vbg-custom-list">
+              <li>Add a deterministic stream with 510 deltas, lifecycle frames, and a valid terminal sequence.</li>
+              <li>Keep the shared collection limit, add the buffered-list guard, and remove only the incremental raw-frame rejection.</li>
+              <li>Keep the raw ordinal for deterministic activity IDs without using it as a rejection condition.</li>
+              <li>Prove malformed, truncated, identity-changing, oversized, invalid UTF-8, and keepalive-only timeout streams still fail.</li>
+            </ul>
+          </article>
+          <article class="vbg-custom-span-6 vbg-flow">
+            <p class="vbg-label">Phase 2</p>
+            <h3 class="vbg-heading-20">Publish and prove live</h3>
+            <ul class="vbg-custom-list">
+              <li>Run backend and runtime validation in their separate uv environments.</li>
+              <li>Publish an immutable runtime image digest.</li>
+              <li>Run Sandy's detailed 12-week fitness-program prompt until a response exceeds 512 raw frames, then retain sanitized text plus terminal evidence.</li>
+              <li>Verify authoritative cleanup of Machines, Volumes, apps, secrets, credentials, and proof records.</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="vbg-section" aria-labelledby="acceptance">
+        <h2 id="acceptance" class="vbg-heading-24">Acceptance criteria</h2>
+        <div class="vbg-custom-table">
+          <table>
+            <caption class="vbg-visually-hidden">FND-008.5 acceptance criteria</caption>
+            <thead><tr><th scope="col">Proof</th><th scope="col">Pass condition</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Long incremental stream</th><td>At least 513 raw JSON SSE events complete with <span class="vbg-mono">execution.completed</span>.</td></tr>
+              <tr><th scope="row">Semantic ordering</th><td>All accepted assistant chunks and safe tool start/end events arrive in order; private tool data never crosses the runtime boundary.</td></tr>
+              <tr><th scope="row">Fail-closed behavior</th><td>Byte, line, text, timeout, JSON, identity, state, unknown-event, and missing-terminal checks remain active.</td></tr>
+              <tr><th scope="row">Live evidence</th><td>Staging shows more than 512 frames from Sandy's detailed fitness prompt, a valid terminal event, preserved streamed text, and no old-cap <span class="vbg-mono">malformed_response</span>. Cleanup is complete.</td></tr>
+              <tr><th scope="row">Delivery</th><td>Tests, Ruff, diff checks, local review, CI, and PR review are clear. Merge still requires owner approval.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="vbg-section" aria-labelledby="validation">
+        <div class="vbg-custom-grid">
+          <div class="vbg-custom-span-8 vbg-flow">
+            <h2 id="validation" class="vbg-heading-24">Validation commands</h2>
+            <ul class="vbg-custom-list vbg-custom-code">
+              <li><code>cd runtime; uv run --locked pytest tests/test_hermes.py tests/test_edges.py tests/test_fnd007_worker.py</code></li>
+              <li><code>cd runtime; uv run --locked ruff check .</code></li>
+              <li><code>uv run --locked --project backend python scripts/validate.py</code></li>
+              <li><code>cd runtime; uv run --locked pytest --cov=allies_runtime --cov-report=xml:coverage.xml</code></li>
+              <li><code>git diff --check</code></li>
+            </ul>
+          </div>
+          <div class="vbg-custom-span-4 vbg-custom-callout vbg-flow">
+            <p class="vbg-label">Rollback</p>
+            <p>Revert the runtime parser commit and use the last immutable runtime image digest. Do not change Hermes data or the durable Foundry schema.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="vbg-section" aria-labelledby="risks">
+        <h2 id="risks" class="vbg-heading-24">Risks that stay visible</h2>
+        <ul class="vbg-custom-list">
+          <li>Removing the incremental raw-frame cap is safe only because total bytes, frame bytes, bounded reads, value sizes, idle reads, and the configured overall stream deadline remain enforced.</li>
+          <li>Many deltas still create many Foundry writes. The 4 MiB stream bound remains the current contract; checkpointing or event compaction needs a separate product decision if measurements show storage pressure.</li>
+          <li>Live staging uses real provider and Fly resources, so cleanup is part of the acceptance proof, not an afterthought.</li>
+        </ul>
+      </section>
+
+      <section class="vbg-section" aria-labelledby="sources">
+        <h2 id="sources" class="vbg-heading-24">Source files and evidence</h2>
+        <p class="vbg-custom-code">runtime/allies_runtime/hermes.py</p>
+        <p class="vbg-custom-code">runtime/tests/test_hermes.py · runtime/tests/test_edges.py · runtime/tests/test_fnd007_worker.py</p>
+        <p class="vbg-custom-code">.agent/fnd008-sandy-greg-r2-first-streams.json</p>
+        <p class="vbg-caption">Full plan, preserved draft, clean edited copy, and edit notes live under <span class="vbg-mono">.agent/kickoff/fnd-008-5-long-stream-completion/</span> in the task worktree.</p>
+      </section>
+    </main>
+    <footer class="vbg-footer">
+      <span class="vbg-logo" role="img" aria-label="Vercel"></span>
+      <span>Allies Foundry engineering plan</span>
+    </footer>
+  </div>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+    mermaid.initialize({ startOnLoad: true, securityLevel: "strict", theme: dark ? "dark" : "neutral" });
+  </script>
+</body>
+</html>
