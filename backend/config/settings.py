@@ -85,7 +85,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
+    "config.security.RailwayHealthcheckSecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -187,10 +187,6 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 SECURE_PROXY_SSL_HEADER = (
     ("HTTP_X_FORWARDED_PROTO", "https") if TRUST_PROXY_HEADERS else None
 )
-# Railway's internal healthchecker reaches the container over plain HTTP. The
-# readiness endpoint must be directly probeable even when public traffic is
-# redirected to HTTPS at the proxy boundary.
-SECURE_REDIRECT_EXEMPT = [r"^healthz$"]
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
 SECURE_SSL_REDIRECT = not DEBUG and TRUST_PROXY_HEADERS
