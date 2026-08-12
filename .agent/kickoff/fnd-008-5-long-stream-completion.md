@@ -9,7 +9,7 @@
 - Planning mode: full
 - Worktree manager: Forest
 - Branch: `feat/fnd-008-5-long-stream-completion`
-- Worktree path: `E:\Users\Oluwatimilehin\Documents\Programming\helpers\allies-foundry\.forest\worktrees\feat\fnd-008-5-long-stream-completion`
+- Worktree path: `.forest/worktrees/feat/fnd-008-5-long-stream-completion`
 - Task workspace: `.agent/kickoff/fnd-008-5-long-stream-completion`
 - Created: 2026-08-12
 - Target date: 2026-08-12, subject to reviewed plan and live validation
