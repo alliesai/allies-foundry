@@ -6,6 +6,7 @@ import pytest
 from django.conf import settings
 from django.db import DatabaseError
 from django.db.backends.postgresql.base import DatabaseWrapper
+from django.test import override_settings
 
 from config.health import healthz
 
@@ -130,6 +131,19 @@ def test_healthz_runs_initial_postgres_probe_before_reply(client):
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
     probe.assert_called_once_with()
+
+
+@pytest.mark.django_db
+@override_settings(
+    ALLOWED_HOSTS=["healthcheck.railway.app"],
+    SECURE_SSL_REDIRECT=True,
+    SECURE_REDIRECT_EXEMPT=[r"^healthz$"],
+)
+def test_healthz_is_directly_probeable_over_railway_internal_http(client):
+    response = client.get("/healthz", HTTP_HOST="healthcheck.railway.app")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
 @pytest.mark.django_db
