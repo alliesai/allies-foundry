@@ -17,10 +17,11 @@ https://staging.example.com
 ```
 
 `Verify Staging HTTPS` runs on every push to `staging`, waits for the deployment
-to become reachable. It follows one plain-HTTP `/healthz` redirect to HTTPS and
-requires the final HTTPS response to be HTTP 200 with `{"status":"ok"}`. It
-retries up to 30 times with a 10-second request timeout and a 10-second delay
-between attempts—roughly ten minutes in the worst case—before failing closed.
+to become reachable. It follows a bounded plain-HTTP `/healthz` redirect chain
+(up to three hops) and requires the final HTTPS response to be HTTP 200 with
+`{"status":"ok"}` at the configured host. It retries up to 30 times with a
+10-second request timeout and a 10-second delay between attempts—roughly ten
+minutes in the worst case—before failing closed.
 The workflow can also be started manually with a URL input when validating a
 different deployment.
 

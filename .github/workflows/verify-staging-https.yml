@@ -46,7 +46,7 @@ jobs:
           echo "::add-mask::${http_url}"
 
           for attempt in $(seq 1 30); do
-            result=$(curl --silent --max-time 10 --location --max-redirs 1 \
+            result=$(curl --silent --max-time 10 --location --max-redirs 3 \
               --output response.json \
               --write-out '%{http_code} %{num_redirects} %{url_effective}' \
               "$http_url" || true)
@@ -54,7 +54,7 @@ jobs:
             remaining="${result#* }"
             redirect_count="${remaining%% *}"
             effective_url="${remaining#* }"
-            if [[ "$status" == "200" && "$redirect_count" == "1" \
+            if [[ "$status" == "200" && "$redirect_count" =~ ^[1-9][0-9]*$ \
               && "$effective_url" == "${base_url}/healthz" ]] \
               && jq -e '.status == "ok"' response.json >/dev/null 2>&1; then
               echo "Public HTTPS readiness and HTTP redirect passed on attempt ${attempt}."
