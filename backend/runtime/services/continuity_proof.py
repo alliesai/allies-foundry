@@ -23,6 +23,7 @@ from runtime.models import (
     Execution,
     ExecutionEvent,
     ExecutionStatus,
+    RuntimeCredential,
     RuntimeProfile,
     Workspace,
 )
@@ -526,6 +527,25 @@ def _cleanup_proof_credentials(
         raise RuntimeError("proof credential cleanup failed") from failures[0]
 
 
+def _proof_credentials_revoked(handles: tuple[ProofCredentialHandle, ...]) -> bool:
+    credential_ids = tuple(
+        handle.credential_id for handle in handles if handle.credential_id is not None
+    )
+    if not credential_ids:
+        return True
+    try:
+        rows = tuple(
+            RuntimeCredential.objects.filter(pk__in=credential_ids).values_list(
+                "id", "revoked_at"
+            )
+        )
+        return {credential_id for credential_id, _revoked_at in rows} == set(
+            credential_ids
+        ) and all(revoked_at is not None for _credential_id, revoked_at in rows)
+    except Exception:  # noqa: BLE001 - cleanup verification fails closed
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class ProofProfile:
     alias: str
@@ -976,6 +996,7 @@ def run_machine_replacement_proof(
         failure_code = _safe_failure_code(exc)
         checks.append(ProofCheck("proof_run", "fail", failure_code))
     finally:
+        credential_cleanup_complete = True
         try:
             _cleanup_proof_credentials(
                 credential_bootstrap,
@@ -984,21 +1005,30 @@ def run_machine_replacement_proof(
                 dependency_handle,
             )
         except Exception:  # noqa: BLE001 - provider cleanup must still run
-            cleanup_complete = False
+            credential_cleanup_complete = False
+        provider_cleanup_complete = True
         if mutated:
             try:
                 _record_current_machine(config.workspace_id, resources)
             except Exception:  # noqa: BLE001 - provider cleanup must still run
-                cleanup_complete = False
-            cleanup_complete = (
+                provider_cleanup_complete = False
+            provider_cleanup_complete = (
                 _cleanup_provider_resources(
                     provider,
                     resources,
                     clock=clock,
                     sleep=sleep,
                 )
-                and cleanup_complete
+                and provider_cleanup_complete
             )
+        if not credential_cleanup_complete and provider_cleanup_complete:
+            # Destroying the app authoritatively removes its scoped Fly secrets.
+            # Recover only when every independently stored bearer is also proven
+            # revoked; a database cleanup failure must remain fail-closed.
+            credential_cleanup_complete = _proof_credentials_revoked(
+                tuple(handles)
+            )
+        cleanup_complete = credential_cleanup_complete and provider_cleanup_complete
         if cleanup_complete and workspace_created:
             Workspace.objects.filter(pk=config.workspace_id).delete()
 

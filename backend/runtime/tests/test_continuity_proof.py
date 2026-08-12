@@ -1063,6 +1063,85 @@ def test_incomplete_cleanup_takes_precedence_over_proof_failure():
 
 
 @pytest.mark.django_db(transaction=True)
+def test_destroyed_app_recovers_failed_secret_cleanup_after_credential_revocation():
+    class BrokenSecretCleanup(FakeSecretStore):
+        def remove(self, app_ref, secret_name):
+            raise RuntimeError("secret deployment timed out")
+
+    provider = ProofProvider()
+    config = proof_config(run_id="fnd008-secret-cleanup", timeout_seconds=0.02)
+    now = [0.0]
+    result = run_machine_replacement_proof(
+        config,
+        provider=provider,
+        credential_bootstrap=ProofCredentialBootstrap(BrokenSecretCleanup()),
+        clock=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+
+    assert result.status == "fail"
+    assert result.cleanup == "complete"
+    assert provider.app is None
+    assert not Workspace.objects.filter(pk=config.workspace_id).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_destroyed_app_does_not_mask_failed_database_credential_revocation():
+    class BrokenSecretCleanup(FakeSecretStore):
+        def remove(self, app_ref, secret_name):
+            raise RuntimeError("secret deployment timed out")
+
+    provider = ProofProvider()
+    config = proof_config(run_id="fnd008-revoke-cleanup", timeout_seconds=0.02)
+    now = [0.0]
+    result = run_machine_replacement_proof(
+        config,
+        provider=provider,
+        credential_bootstrap=ProofCredentialBootstrap(
+            BrokenSecretCleanup(),
+            credential_revoker=lambda _credential_id: (_ for _ in ()).throw(
+                RuntimeError("database revoke failed")
+            ),
+        ),
+        clock=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+
+    assert result.status == "incomplete_cleanup"
+    assert result.cleanup == "incomplete"
+    assert provider.app is None
+    assert Workspace.objects.filter(pk=config.workspace_id).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_destroyed_app_does_not_treat_missing_credential_as_revoked():
+    class BrokenSecretCleanup(FakeSecretStore):
+        def remove(self, app_ref, secret_name):
+            raise RuntimeError("secret deployment timed out")
+
+    def delete_instead_of_revoke(credential_id):
+        RuntimeCredential.objects.filter(pk=credential_id).delete()
+
+    provider = ProofProvider()
+    config = proof_config(run_id="fnd008-missing-credential", timeout_seconds=0.02)
+    now = [0.0]
+    result = run_machine_replacement_proof(
+        config,
+        provider=provider,
+        credential_bootstrap=ProofCredentialBootstrap(
+            BrokenSecretCleanup(), credential_revoker=delete_instead_of_revoke
+        ),
+        clock=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+
+    assert result.status == "incomplete_cleanup"
+    assert result.cleanup == "incomplete"
+    assert provider.app is None
+    assert Workspace.objects.filter(pk=config.workspace_id).exists()
+
+
+@pytest.mark.django_db(transaction=True)
 def test_failed_preflight_is_skipped_without_provider_mutation():
     class BlockedProvider:
         def assert_proof_capabilities(self):
