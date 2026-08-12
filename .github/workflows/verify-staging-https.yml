@@ -31,6 +31,10 @@ jobs:
           set -euo pipefail
 
           base_url="${BASE_URL%/}"
+          [[ -n "$base_url" ]] || {
+            echo "STAGING_URL is required for push-triggered verification; provide base_url for manual dispatch" >&2
+            exit 1
+          }
           [[ "$base_url" =~ ^https://[^/[:space:]]+$ ]] || {
             echo "BASE_URL must be an https:// base URL without a path" >&2
             exit 1
