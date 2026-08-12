@@ -148,6 +148,14 @@ def test_healthz_is_directly_probeable_over_railway_internal_http(client):
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
+    port_bearing_host = client.get(
+        "/healthz",
+        HTTP_HOST="healthcheck.railway.app:8080",
+        HTTP_USER_AGENT="RailwayHealthCheck/1.0",
+    )
+    assert port_bearing_host.status_code == 200
+    assert port_bearing_host.json() == {"status": "ok"}
+
     trailing_slash = client.get("/healthz/", **healthcheck_headers)
     assert trailing_slash.status_code == 301
     assert trailing_slash["Location"] == "https://healthcheck.railway.app/healthz/"

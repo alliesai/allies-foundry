@@ -6,7 +6,12 @@ RAILWAY_HEALTHCHECK_USER_AGENT = "RailwayHealthCheck/1.0"
 
 
 class RailwayHealthcheckSecurityMiddleware(SecurityMiddleware):
-    """Keep Railway's internal HTTP readiness probe off the HTTPS redirect."""
+    """Keep Railway's internal HTTP readiness probe off the HTTPS redirect.
+
+    Railway's probe shares the service listener with application traffic, so
+    the host and user-agent checks are routing guards, not authentication. The
+    endpoint intentionally returns only non-sensitive readiness status.
+    """
 
     def process_request(self, request):
         if self._is_railway_healthcheck(request):
@@ -20,6 +25,6 @@ class RailwayHealthcheckSecurityMiddleware(SecurityMiddleware):
         if request.META.get("HTTP_USER_AGENT") != RAILWAY_HEALTHCHECK_USER_AGENT:
             return False
         try:
-            return request.get_host().lower() == RAILWAY_HEALTHCHECK_HOST
+            return request.get_host().split(":", 1)[0].lower() == RAILWAY_HEALTHCHECK_HOST
         except DisallowedHost:
             return False
