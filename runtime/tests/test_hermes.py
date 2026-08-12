@@ -370,6 +370,9 @@ async def test_incremental_stream_normalizes_safe_events_and_terminal_rotation()
                     b"event: assistant.delta\n",
                     b'data: {"session_id":"s1","run_id":"r1","delta":"hello","private":"drop"}\n',
                     b"\n",
+                    b"event: tool.progress\n",
+                    b'data: {"session_id":"s1","run_id":"r1","tool_name":"_thinking","delta":"private reasoning"}\n',
+                    b"\n",
                     b"event: tool.started\n",
                     b'data: {"session_id":"s1","run_id":"r1","tool_name":"terminal","args":{"secret":"drop"}}\n',
                     b"\n",
@@ -412,6 +415,16 @@ async def test_incremental_stream_normalizes_safe_events_and_terminal_rotation()
     assert events[2].payload["status"] == "completed"
     assert events[3].session_id == "s2"
     assert events[3].payload == {"run_id": "r1", "status": "completed"}
+
+
+def test_incremental_stream_rejects_invalid_tool_progress():
+    stream = _IncrementalHTTPStream(object(), "ally-a", "s1")
+    stream._normalize_event("run.started", {"session_id": "s1", "run_id": "r1"})
+
+    with pytest.raises(HermesMalformedResponse, match="tool progress"):
+        stream._normalize_event(
+            "tool.progress", {"session_id": "s1", "run_id": "r1"}
+        )
 
 
 @pytest.mark.asyncio

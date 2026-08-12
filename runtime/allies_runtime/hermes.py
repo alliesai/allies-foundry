@@ -305,6 +305,7 @@ class _IncrementalHTTPStream:
             "message.started",
             "assistant.delta",
             "tool.started",
+            "tool.progress",
             "tool.completed",
             "assistant.completed",
             "run.completed",
@@ -407,6 +408,11 @@ class _IncrementalHTTPStream:
                 self.session_id,
                 {"activity_id": activity_id, "kind": "tool"},
             )
+        if name == "tool.progress":
+            tool_name = payload.get("tool_name")
+            if not isinstance(tool_name, str) or not tool_name or len(tool_name) > 128:
+                raise HermesMalformedResponse("Hermes tool progress was invalid")
+            return None
         if name == "tool.completed":
             tool_name = payload.get("tool_name")
             match = next(
