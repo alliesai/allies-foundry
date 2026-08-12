@@ -1064,7 +1064,10 @@ def _spec_for_handle(
                 "allies-runtime",
                 config.workspace_spec.runtime_image,
                 entrypoint=_runtime_proof_command(handle, dependency_handle),
-                environment={"HERMES_STREAM_TIMEOUT": "180"},
+                environment={
+                    "HERMES_REQUEST_TIMEOUT": "180",
+                    "HERMES_STREAM_TIMEOUT": "180",
+                },
                 healthchecks=(
                     _proof_process_healthcheck(
                         "allies-runtime",
