@@ -1,4 +1,5 @@
 from concurrent.futures import Future
+from ipaddress import ip_network
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dj_database_url
@@ -136,6 +137,8 @@ def test_healthz_runs_initial_postgres_probe_before_reply(client):
 @pytest.mark.django_db
 @override_settings(
     ALLOWED_HOSTS=["example.test"],
+    TRUST_PROXY_HEADERS=True,
+    TRUSTED_PROXY_NETWORKS=(ip_network("127.0.0.1/32"),),
     SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
     SECURE_SSL_REDIRECT=True,
 )
@@ -153,6 +156,26 @@ def test_healthz_requires_https_when_redirects_are_enabled(client):
 
     assert secure_response.status_code == 200
     assert secure_response.json() == {"status": "ok"}
+
+
+@pytest.mark.django_db
+@override_settings(
+    ALLOWED_HOSTS=["example.test"],
+    TRUST_PROXY_HEADERS=True,
+    TRUSTED_PROXY_NETWORKS=(ip_network("192.0.2.0/24"),),
+    SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
+    SECURE_SSL_REDIRECT=True,
+)
+def test_healthz_ignores_forwarded_https_from_untrusted_peer(client):
+    response = client.get(
+        "/healthz",
+        HTTP_HOST="example.test",
+        HTTP_X_FORWARDED_PROTO="https",
+        REMOTE_ADDR="198.51.100.7",
+    )
+
+    assert response.status_code == 301
+    assert response["Location"] == "https://example.test/healthz"
 
 
 @pytest.mark.django_db

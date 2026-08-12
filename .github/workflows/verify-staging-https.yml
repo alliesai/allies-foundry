@@ -35,8 +35,8 @@ jobs:
             echo "STAGING_URL is required for push-triggered verification; provide base_url for manual dispatch" >&2
             exit 1
           }
-          [[ "$base_url" =~ ^https://[^/[:space:]]+$ ]] || {
-            echo "BASE_URL must be an https:// base URL without a path" >&2
+          [[ "$base_url" =~ ^https://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?$ ]] || {
+            echo "BASE_URL must be an https:// hostname or IPv6 literal with an optional port" >&2
             exit 1
           }
 
