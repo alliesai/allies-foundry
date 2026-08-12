@@ -40,11 +40,14 @@ def env_networks(name: str) -> tuple[IPv4Network | IPv6Network, ...]:
     networks = []
     for value in env_list(name):
         try:
-            networks.append(ip_network(value, strict=False))
+            network = ip_network(value, strict=True)
         except ValueError as error:
             raise ImproperlyConfigured(
                 f"{name} contains an invalid IP network: {value}"
             ) from error
+        if network.prefixlen == 0:
+            raise ImproperlyConfigured(f"{name} must not contain a catch-all network")
+        networks.append(network)
     return tuple(networks)
 
 
@@ -82,7 +85,9 @@ if railway_public_domain:
         CSRF_TRUSTED_ORIGINS.append(railway_origin)
 
 TRUST_PROXY_HEADERS = env_bool("DJANGO_TRUST_PROXY_HEADERS", default=False)
-TRUSTED_PROXY_NETWORKS = env_networks("DJANGO_TRUSTED_PROXY_IPS")
+TRUSTED_PROXY_NETWORKS = (
+    env_networks("DJANGO_TRUSTED_PROXY_IPS") if TRUST_PROXY_HEADERS else ()
+)
 if TRUST_PROXY_HEADERS and not TRUSTED_PROXY_NETWORKS:
     raise ImproperlyConfigured(
         "DJANGO_TRUSTED_PROXY_IPS is required when DJANGO_TRUST_PROXY_HEADERS is true"
