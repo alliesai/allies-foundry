@@ -36,9 +36,11 @@ jobs:
             exit 1
           }
 
+          echo "::add-mask::${base_url}"
           health_url="${base_url}/healthz"
+          echo "::add-mask::${health_url}"
           for attempt in $(seq 1 30); do
-            status=$(curl --silent --show-error --max-time 10 \
+            status=$(curl --silent --max-time 10 \
               --output response.json --write-out '%{http_code}' \
               "$health_url" || true)
             if [[ "$status" == "200" ]] && jq -e '.status == "ok"' response.json >/dev/null 2>&1; then
@@ -49,6 +51,5 @@ jobs:
             sleep 10
           done
 
-          echo "Public HTTPS readiness failed for ${health_url}." >&2
-          cat response.json 2>/dev/null || true
+          echo "Public HTTPS readiness failed after 30 attempts." >&2
           exit 1

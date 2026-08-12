@@ -15,7 +15,7 @@ The promotion credential should be a narrowly scoped GitHub App or fine-grained 
 
 | Variable | Used by | Status |
 | --- | --- | --- |
-| `STAGING_URL` | Public HTTPS staging readiness verification on pushes to `staging` | Optional; set to the public base URL, for example `https://staging.example.com` |
+| `STAGING_URL` | Public HTTPS staging readiness verification on pushes to `staging` | Required for the push-triggered gate; set to the public base URL, for example `https://staging.example.com` |
 
 The verifier also supports a manual `workflow_dispatch` URL input. It requires
 an `https://` URL and checks `/healthz` until the service returns HTTP 200 with
