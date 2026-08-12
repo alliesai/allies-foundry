@@ -37,28 +37,26 @@ jobs:
           }
 
           echo "::add-mask::${base_url}"
-          health_url="${base_url}/healthz"
-          echo "::add-mask::${health_url}"
           http_base="${base_url#https://}"
           http_url="http://${http_base}/healthz"
           echo "::add-mask::${http_url}"
-          redirect=$(curl --silent --max-time 10 --max-redirs 0 \
-            --output /dev/null --write-out '%{http_code} %{redirect_url}' \
-            "$http_url" || true)
-          [[ "$redirect" =~ ^(301|302|307|308)[[:space:]]https:// ]] || {
-            echo "Plain HTTP /healthz did not redirect to HTTPS" >&2
-            exit 1
-          }
 
           for attempt in $(seq 1 30); do
-            status=$(curl --silent --max-time 10 \
-              --output response.json --write-out '%{http_code}' \
-              "$health_url" || true)
-            if [[ "$status" == "200" ]] && jq -e '.status == "ok"' response.json >/dev/null 2>&1; then
-              echo "Public HTTPS readiness passed on attempt ${attempt}."
+            result=$(curl --silent --max-time 10 --location --max-redirs 1 \
+              --output response.json \
+              --write-out '%{http_code} %{num_redirects} %{url_effective}' \
+              "$http_url" || true)
+            status="${result%% *}"
+            remaining="${result#* }"
+            redirect_count="${remaining%% *}"
+            effective_url="${remaining#* }"
+            if [[ "$status" == "200" && "$redirect_count" == "1" \
+              && "$effective_url" == "${base_url}/healthz" ]] \
+              && jq -e '.status == "ok"' response.json >/dev/null 2>&1; then
+              echo "Public HTTPS readiness and HTTP redirect passed on attempt ${attempt}."
               exit 0
             fi
-            echo "Attempt ${attempt}/30 returned HTTP ${status:-request-error}; retrying..."
+            echo "Attempt ${attempt}/30 did not meet public HTTPS readiness; retrying..."
             sleep 10
           done
 
