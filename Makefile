@@ -4,6 +4,10 @@ NAME ?=
 MIGRATION_NAME ?=
 PORT ?= 8000
 
+# Make targets are development entrypoints; keep the production-safe Django
+# default while making clean-checkout local commands portable across shells.
+export DJANGO_DEBUG := true
+
 .PHONY: help sync app check validate test runtime-test format lint runtime-lint migrate migrations server shell
 
 help:

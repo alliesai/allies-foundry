@@ -119,6 +119,10 @@ if database_url:
         conn_max_age=60,
         conn_health_checks=True,
     )
+    if database_config["ENGINE"].endswith("sqlite3"):
+        database_config.setdefault("OPTIONS", {}).setdefault(
+            "transaction_mode", "IMMEDIATE"
+        )
     if database_config["ENGINE"] == "django.db.backends.postgresql":
         database_options = database_config.setdefault("OPTIONS", {})
         database_options.setdefault("connect_timeout", 5)

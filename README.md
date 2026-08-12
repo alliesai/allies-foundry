@@ -18,6 +18,7 @@ make server
 Run the full cross-platform validation command from the repository root:
 
 ```powershell
+$env:DJANGO_DEBUG = "true"
 uv run --locked --project backend python scripts/validate.py
 ```
 
