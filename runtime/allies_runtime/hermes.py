@@ -206,6 +206,7 @@ class _IncrementalHTTPStream:
         self.state = "awaiting_run"
         self.active_activities: list[tuple[str, str]] = []
         self.saw_assistant_delta = False
+        self.assistant_completion_session_id: str | None = None
         self.terminal_event: HermesEvent | None = None
         self.done = False
         self.closed = False
@@ -366,6 +367,8 @@ class _IncrementalHTTPStream:
                     "Hermes assistant completion session was invalid"
                 )
             if name == "message.started" or self.saw_assistant_delta:
+                if name == "assistant.completed":
+                    self.assistant_completion_session_id = payload_session
                 return None
             content = payload.get("content")
             if (
@@ -376,6 +379,7 @@ class _IncrementalHTTPStream:
                 raise HermesMalformedResponse(
                     "Hermes assistant completion omitted bounded text"
                 )
+            self.assistant_completion_session_id = payload_session
             return self._event("message.delta", self.session_id, {"text": content})
         if name == "error":
             raise HermesError("Hermes reported a turn failure")
@@ -430,9 +434,12 @@ class _IncrementalHTTPStream:
             messages = payload.get("messages")
             if (
                 not isinstance(messages, list)
-                or not messages
                 or len(messages) > MAX_EVENTS
             ):
+                raise HermesMalformedResponse(
+                    "Hermes run completion omitted its transcript"
+                )
+            if not messages and self.assistant_completion_session_id != payload_session:
                 raise HermesMalformedResponse(
                     "Hermes run completion omitted its transcript"
                 )

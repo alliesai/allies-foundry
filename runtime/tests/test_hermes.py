@@ -451,6 +451,74 @@ async def test_incremental_stream_uses_final_content_when_provider_emits_no_delt
 
 
 @pytest.mark.asyncio
+async def test_incremental_stream_accepts_empty_inline_transcript_after_completion():
+    """Pinned Hermes can persist history while omitting it from run.completed."""
+
+    class Response:
+        def __init__(self):
+            self.rows = iter(
+                [
+                    b"event: run.started\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                    b"event: assistant.completed\n",
+                    b'data: {"session_id":"s1","run_id":"r1","content":"final answer"}\n',
+                    b"\n",
+                    b"event: run.completed\n",
+                    b'data: {"session_id":"s1","run_id":"r1","completed":true,"messages":[]}\n',
+                    b"\n",
+                    b"event: done\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                ]
+            )
+
+        def readline(self, _limit):
+            return next(self.rows, b"")
+
+        def close(self):
+            return None
+
+    events = [event async for event in _IncrementalHTTPStream(Response(), "ally-a", "s1")]
+
+    assert [event.name for event in events] == [
+        "message.delta",
+        "execution.completed",
+    ]
+    assert events[0].payload == {"text": "final answer"}
+
+
+@pytest.mark.asyncio
+async def test_incremental_stream_rejects_empty_transcript_for_another_session():
+    class Response:
+        def __init__(self):
+            self.rows = iter(
+                [
+                    b"event: run.started\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                    b"event: assistant.completed\n",
+                    b'data: {"session_id":"s2","run_id":"r1","content":"final answer"}\n',
+                    b"\n",
+                    b"event: run.completed\n",
+                    b'data: {"session_id":"s3","run_id":"r1","completed":true,"messages":[]}\n',
+                    b"\n",
+                ]
+            )
+
+        def readline(self, _limit):
+            return next(self.rows, b"")
+
+        def close(self):
+            return None
+
+    stream = _IncrementalHTTPStream(Response(), "ally-a", "s1")
+
+    with pytest.raises(HermesMalformedResponse, match="omitted its transcript"):
+        [event async for event in stream]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "rows",
     [
