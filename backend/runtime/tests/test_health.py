@@ -129,6 +129,18 @@ def test_healthz_serves_stale_result_while_probe_is_in_flight():
     assert response.content == b'{"status": "ok"}'
 
 
+def test_postgres_probe_callback_resets_state_for_unexpected_errors():
+    future = Future()
+    future.set_exception(ValueError("synthetic worker failure"))
+
+    from config import health
+
+    with patch.object(health, "_health_probe_in_flight", True):
+        with pytest.raises(ValueError, match="synthetic worker failure"):
+            health._finish_postgres_probe(future)
+        assert health._health_probe_in_flight is False
+
+
 def test_run_postgres_probe_uses_bounded_async_connection():
     cursor = FakeAsyncCursor()
     database = FakeAsyncDatabase(cursor)

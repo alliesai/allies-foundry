@@ -77,13 +77,13 @@ def _finish_postgres_probe(future: Future[None]) -> None:
         payload, status = {"status": "unavailable"}, 503
     else:
         payload, status = {"status": "ok"}, 200
+    finally:
+        with _health_cache_lock:
+            global _health_cache_expires_at, _health_cache_result, _health_probe_in_flight
 
-    with _health_cache_lock:
-        global _health_cache_expires_at, _health_cache_result, _health_probe_in_flight
-
-        _health_cache_result = payload, status
-        _health_cache_expires_at = monotonic() + HEALTHCHECK_CACHE_SECONDS
-        _health_probe_in_flight = False
+            _health_cache_result = payload, status
+            _health_cache_expires_at = monotonic() + HEALTHCHECK_CACHE_SECONDS
+            _health_probe_in_flight = False
 
 
 def healthz(request):
