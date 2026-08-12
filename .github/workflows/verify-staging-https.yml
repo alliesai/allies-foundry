@@ -19,7 +19,7 @@ concurrency:
 jobs:
   verify:
     name: Public HTTPS healthcheck
-    if: github.event_name == 'workflow_dispatch' || vars.STAGING_URL != ''
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
