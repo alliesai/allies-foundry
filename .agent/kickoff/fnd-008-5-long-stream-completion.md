@@ -153,6 +153,15 @@ The adversarial and simplicity review outputs are retained at
 - 2026-08-12: Owner approved the reviewed plan. Added failing-first regressions
   for a terminal after 512 raw frames, keepalive-only overall timeout, and the
   independent buffered-parser guard. Focused tests now pass; the full runtime
-  suite passes 277 tests with five skips and Ruff check is clean. Ruff format
-  check still reports pre-existing formatting drift in `foundry.py` plus
+  suite passes 278 tests with five skips and the backend suite passes 201 tests
+  with two skips. Runtime coverage is 90.08%; both runtime and backend Ruff
+  checks and `git diff --check` are clean. Ruff format check still reports
+  pre-existing formatting drift in `foundry.py` plus repository line-ending and
   touched-file formatting suggestions; no formatter rewrite has been applied.
+- 2026-08-12: Implemented the approved parser fix. Incremental streams no
+  longer reject valid terminal events solely because more than 512 raw frames
+  preceded them; the existing byte, text, terminal, and overall stream-time
+  bounds remain active. The whole-result parser now uses an independent
+  `MAX_BUFFERED_EVENTS = 65_536` guard, and the configured stream timeout is
+  enforced after the incremental response opens, including keepalive-only
+  streams.
