@@ -68,6 +68,8 @@ def test_buffered_sse_parser_has_an_independent_event_limit(monkeypatch):
     monkeypatch.setattr("allies_runtime.hermes.MAX_BUFFERED_EVENTS", 1)
     with pytest.raises(HermesMalformedResponse, match="buffered event limit"):
         _sse_events([b"data: {}\n", b"\n", b"data: {}\n", b"\n"])
+    with pytest.raises(HermesMalformedResponse, match="buffered event limit"):
+        _sse_events([b"data: {}\n", b"\n", b"data: {}\n"])
 
     assert MAX_BUFFERED_EVENTS == 65_536
 

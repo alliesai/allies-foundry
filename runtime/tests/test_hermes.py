@@ -544,6 +544,32 @@ async def test_incremental_stream_enforces_overall_deadline_for_keepalives():
     assert response.closed is True
 
 
+@pytest.mark.asyncio
+async def test_incremental_stream_rejects_invalid_or_expired_overall_deadlines():
+    with pytest.raises(ValueError, match="stream timeout must be positive"):
+        _IncrementalHTTPStream(object(), "ally-a", "s1", stream_timeout=0)
+    with pytest.raises(ValueError, match="stream timeout must be positive"):
+        _IncrementalHTTPStream(object(), "ally-a", "s1", stream_timeout=True)
+
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    stream = _IncrementalHTTPStream(
+        response, "ally-a", "s1", stream_timeout=1
+    )
+    stream.deadline = time.monotonic() - 1
+
+    with pytest.raises(HermesTimeout, match="stream timed out"):
+        await stream.__anext__()
+
+    assert response.closed is True
+
+
 def test_incremental_stream_rejects_invalid_tool_progress():
     stream = _IncrementalHTTPStream(object(), "ally-a", "s1")
     stream._normalize_event("run.started", {"session_id": "s1", "run_id": "r1"})
