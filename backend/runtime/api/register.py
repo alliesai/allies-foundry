@@ -1,0 +1,364 @@
+from uuid import UUID
+
+from django.http import HttpRequest, HttpResponse, JsonResponse
+from ninja.errors import ValidationError as NinjaValidationError
+from ninja_extra import NinjaExtraAPI
+
+from runtime.exceptions import (
+    RuntimeAuthorizationError,
+    RuntimeDomainError,
+    RuntimeValidationError,
+)
+from runtime.services.attempts import complete_attempt, fail_attempt
+from runtime.services.claims import claim_next_execution
+from runtime.services.events import append_runtime_event
+from runtime.services.leases import acknowledge_stopped, renew_lease
+from runtime.services.profiles import (
+    accept_cleanup_receipt,
+    accept_materialization_receipt,
+    list_profile_reconciliation,
+)
+from runtime.services.runtime_auth import authenticate_runtime_token
+from runtime.services.sessions import update_session_binding
+
+from .schemas import (
+    ClaimRequest,
+    CleanupReceiptRequest,
+    CompleteRequest,
+    EventRequest,
+    FailRequest,
+    MaterializationReceiptRequest,
+    SessionBindingRequest,
+    StoppedRequest,
+)
+
+
+def register(api: NinjaExtraAPI) -> None:
+    api.add_exception_handler(NinjaValidationError, _validation_error)
+
+    @api.post("/runtime/claims", auth=None)
+    def claims(request: HttpRequest, payload: ClaimRequest):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            claim = claim_next_execution(
+                context, payload.claim_id, payload.available_slots
+            )
+            if claim is None:
+                return HttpResponse(status=204)
+            return JsonResponse(_claim_json(claim), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.get("/runtime/profiles/reconciliation", auth=None)
+    def profile_reconciliation(request: HttpRequest):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            profiles = list_profile_reconciliation(context)
+            return JsonResponse(
+                {
+                    "version": 1,
+                    "workspace_id": str(context.workspace_id),
+                    "machine_generation": context.machine_generation,
+                    "profiles": [_profile_json(profile) for profile in profiles],
+                },
+                status=200,
+            )
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/profiles/{profile_id}/materialization-receipt", auth=None)
+    def materialization_receipt(
+        request: HttpRequest,
+        profile_id: UUID,
+        payload: MaterializationReceiptRequest,
+    ):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            if payload.profile_id != profile_id:
+                raise RuntimeValidationError(
+                    "profile receipt identity does not match path"
+                )
+            receipt = accept_materialization_receipt(
+                context,
+                profile_id,
+                payload.operation_id,
+                payload.lifecycle_epoch,
+                payload.materialized_generation,
+                payload.seed_fingerprint,
+                payload.result_code,
+            )
+            return JsonResponse(_profile_receipt_json(receipt), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/profiles/{profile_id}/cleanup-receipt", auth=None)
+    def cleanup_receipt(
+        request: HttpRequest,
+        profile_id: UUID,
+        payload: CleanupReceiptRequest,
+    ):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            if payload.profile_id != profile_id:
+                raise RuntimeValidationError(
+                    "profile receipt identity does not match path"
+                )
+            receipt = accept_cleanup_receipt(
+                context,
+                profile_id,
+                payload.operation_id,
+                payload.lifecycle_epoch,
+                payload.request_digest,
+                result_code=payload.result_code,
+                deleted=payload.deleted,
+                active_lease_count=payload.active_lease_count,
+            )
+            return JsonResponse(_profile_receipt_json(receipt), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/attempts/{attempt_id}/lease/renew", auth=None)
+    def renew(request: HttpRequest, attempt_id):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            receipt = renew_lease(context, attempt_id, _lease_token(request))
+            return JsonResponse(
+                {
+                    "lease_id": str(receipt.lease_id),
+                    "expires_at": _timestamp(receipt.expires_at),
+                },
+                status=200,
+            )
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/attempts/{attempt_id}/events", auth=None)
+    def events(request: HttpRequest, attempt_id, payload: EventRequest):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            event = append_runtime_event(
+                context,
+                attempt_id,
+                _lease_token(request),
+                payload.event_id,
+                payload.stream_id,
+                payload.sequence,
+                payload.type,
+                payload.payload,
+            )
+            return JsonResponse(
+                {"event_id": str(event.event_id), "sequence": event.sequence},
+                status=202,
+            )
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.put("/runtime/attempts/{attempt_id}/session-binding", auth=None)
+    def session_binding(
+        request: HttpRequest,
+        attempt_id,
+        payload: SessionBindingRequest,
+    ):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            binding = update_session_binding(
+                context,
+                attempt_id,
+                _lease_token(request),
+                payload.cloud_conversation_ref,
+                payload.expected_session_id,
+                payload.effective_session_id,
+            )
+            return JsonResponse({"session_id": binding.hermes_session_id}, status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/attempts/{attempt_id}/stopped", auth=None)
+    def stopped(request: HttpRequest, attempt_id, payload: StoppedRequest):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            receipt = acknowledge_stopped(
+                context,
+                attempt_id,
+                _lease_token(request),
+                payload.reason,
+            )
+            return JsonResponse(
+                {
+                    "attempt_id": str(receipt.attempt_id),
+                    "state": receipt.state,
+                    "requeued": receipt.requeued,
+                },
+                status=200,
+            )
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/attempts/{attempt_id}/complete", auth=None)
+    def complete(request: HttpRequest, attempt_id, payload: CompleteRequest):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            receipt = complete_attempt(
+                context,
+                attempt_id,
+                _lease_token(request),
+                payload.receipt,
+                terminal_event={
+                    "event_id": payload.event_id,
+                    "stream_id": payload.stream_id,
+                    "sequence": payload.sequence,
+                    "payload": payload.payload,
+                },
+            )
+            return JsonResponse(_terminal_json(receipt), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/attempts/{attempt_id}/fail", auth=None)
+    def fail(request: HttpRequest, attempt_id, payload: FailRequest):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            receipt = fail_attempt(
+                context,
+                attempt_id,
+                _lease_token(request),
+                {
+                    "code": payload.code,
+                    "retryable": payload.retryable,
+                    "receipt": payload.receipt,
+                },
+                terminal_event={
+                    "event_id": payload.event_id,
+                    "stream_id": payload.stream_id,
+                    "sequence": payload.sequence,
+                    "payload": payload.payload,
+                },
+            )
+            return JsonResponse(_terminal_json(receipt), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+
+def _bearer(request: HttpRequest) -> str:
+    value = request.headers.get("Authorization", "")
+    if not value.startswith("Bearer "):
+        raise RuntimeAuthorizationError("invalid runtime credential")
+    token = value[7:]
+    if not token:
+        raise RuntimeAuthorizationError("invalid runtime credential")
+    return token
+
+
+def _lease_token(request: HttpRequest) -> str:
+    value = request.headers.get("X-Foundry-Lease-Token", "")
+    if not value:
+        raise RuntimeAuthorizationError("missing lease token")
+    return value
+
+
+def _error(exc: RuntimeDomainError) -> JsonResponse:
+    if isinstance(exc, RuntimeAuthorizationError):
+        status = 401
+    elif isinstance(exc, RuntimeValidationError):
+        status = 422
+    else:
+        status = 409
+    return JsonResponse(
+        {"code": getattr(exc, "code", "CONFLICT"), "message": str(exc)},
+        status=status,
+    )
+
+
+def _validation_error(request: HttpRequest, exc: NinjaValidationError) -> JsonResponse:
+    return JsonResponse(
+        {"code": "INVALID_REQUEST", "message": "request body is invalid"},
+        status=422,
+    )
+
+
+def _timestamp(value):
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _claim_json(claim):
+    return {
+        "attempt_id": str(claim.attempt_id),
+        "execution_id": str(claim.execution_id),
+        "profile_id": str(claim.profile_id),
+        "hermes_profile_key": claim.hermes_profile_key,
+        "model": claim.model,
+        "conversation_id": claim.conversation_id,
+        "session_id": claim.session_id,
+        "stream_id": claim.stream_id,
+        "lease_id": str(claim.lease_id),
+        "lease_token": claim.lease_token,
+        "expires_at": _timestamp(claim.expires_at),
+        "payload": claim.payload,
+        "claim_id": str(claim.claim_id),
+    }
+
+
+def _terminal_json(receipt):
+    return {
+        "attempt_id": str(receipt.attempt_id),
+        "status": receipt.status,
+        "receipt_id": str(receipt.receipt_id),
+        "requeued": receipt.requeued,
+        "receipt": receipt.receipt,
+    }
+
+
+def _profile_json(profile):
+    return {
+        "profile_id": str(profile.profile_id),
+        "ally_ref": profile.ally_ref,
+        "hermes_profile_key": profile.hermes_profile_key,
+        "hermes_profile_key_version": profile.hermes_profile_key_version,
+        "lifecycle_state": profile.lifecycle_state,
+        "lifecycle_epoch": profile.lifecycle_epoch,
+        "seed_version": profile.seed_version,
+        "seed_fingerprint": profile.seed_fingerprint,
+        "materialized_generation": profile.materialized_generation,
+        "active_lease_count": profile.active_lease_count,
+        "seed": profile.seed_payload,
+        "materialization_operation_id": (
+            str(profile.materialization_operation_id)
+            if profile.materialization_operation_id
+            else None
+        ),
+        "materialization_request_digest": profile.materialization_request_digest,
+        "materialization_receipt_id": (
+            str(profile.materialization_receipt_id)
+            if profile.materialization_receipt_id
+            else None
+        ),
+        "materialization_result_code": profile.materialization_result_code,
+        "cleanup_operation_id": (
+            str(profile.cleanup_operation_id) if profile.cleanup_operation_id else None
+        ),
+        "cleanup_context_digest": profile.cleanup_context_digest,
+        "cleanup_request_digest": profile.cleanup_request_digest,
+        "cleanup_receipt_id": (
+            str(profile.cleanup_receipt_id) if profile.cleanup_receipt_id else None
+        ),
+        "cleanup_result_code": profile.cleanup_result_code,
+        "cleanup_expires_at": (
+            _timestamp(profile.cleanup_expires_at)
+            if profile.cleanup_expires_at
+            else None
+        ),
+    }
+
+
+def _profile_receipt_json(receipt):
+    return {
+        "profile_id": str(receipt.profile_id),
+        "lifecycle_state": receipt.lifecycle_state,
+        "lifecycle_epoch": receipt.lifecycle_epoch,
+        "materialized_generation": receipt.materialized_generation,
+        "seed_fingerprint": receipt.seed_fingerprint,
+        "receipt_id": str(receipt.receipt_id) if receipt.receipt_id else None,
+        "result_code": receipt.result_code,
+        "deleted": receipt.deleted,
+        "active_lease_count": receipt.active_lease_count,
+    }

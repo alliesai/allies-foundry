@@ -9,14 +9,29 @@ belong at the repository root.
 ## Development
 
 ```powershell
-cd backend
-uv sync
-uv run python manage.py migrate
-uv run python manage.py runserver
+make sync
+make migrate
+make server
 ```
 
-Create Django domain apps from `backend/` as they become necessary:
+Run the full cross-platform validation command from the repository root:
 
 ```powershell
-uv run python manage.py startapp <domain>
+uv run --locked --project backend python scripts/validate.py
 ```
+
+The Make convenience target is equivalent:
+
+```powershell
+make validate
+```
+
+Create Foundry domain apps from the repository root as they become necessary:
+
+```powershell
+make app NAME=<domain>
+```
+
+Run `make help` for the available commands. The underlying Django and uv
+commands remain available from `backend/` when a command needs to be run
+directly.
