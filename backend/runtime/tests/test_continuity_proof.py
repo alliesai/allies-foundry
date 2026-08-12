@@ -243,6 +243,8 @@ def test_proof_spec_mounts_each_dependency_only_in_its_consumer():
     assert "chown" not in hermes.command[2]
     assert "exec hermes gateway run --no-supervise" in hermes.command[2]
     assert "/run/secrets/hermes-api-key" in hermes.command[2]
+    assert '"$ALLIES_FND008_HERMES_KEY"|base64 -d' in hermes.command[2]
+    assert "unset ALLIES_FND008_HERMES_KEY" in hermes.command[2]
     assert runtime.entrypoint[:2] == ("sh", "-c")
     assert "chown -R" not in runtime.entrypoint[2]
     assert "stat -c %u /opt/data" in runtime.entrypoint[2]
@@ -250,6 +252,10 @@ def test_proof_spec_mounts_each_dependency_only_in_its_consumer():
     assert runtime.entrypoint[2].endswith("python -m allies_runtime")
     assert runtime.environment["HERMES_STREAM_TIMEOUT"] == "60"
     assert "/run/secrets/foundry-runtime-token" in runtime.entrypoint[2]
+    assert '"$ALLIES_FND008_HERMES_KEY" | base64 -d' in runtime.entrypoint[2]
+    assert '"$ALLIES_FND008_OPENAI_KEY" | base64 -d' in runtime.entrypoint[2]
+    assert '"$ALLIES_FND008_FOUNDRY_1" | base64 -d' in runtime.entrypoint[2]
+    assert "unset ALLIES_FND008_FOUNDRY_1" in runtime.entrypoint[2]
     assert generation.raw_token not in runtime.entrypoint[2]
     assert all(
         path in runtime.healthchecks[0]["exec"]["command"][2]
@@ -358,22 +364,24 @@ def test_fly_secret_store_bootstraps_first_release_without_secret_values(
 ):
     from runtime.services import continuity_proof
 
-    captured = {}
+    captured = {"calls": []}
 
     def run(args, **kwargs):
+        captured["calls"].append(args)
         if args[1:3] == ("machine", "list"):
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
-                    '[{"config":{"metadata":{"fly_release_id":'
+                    '[{"id":"abc123","config":{"metadata":{"fly_release_id":'
                     '"rel_test123","fly_release_version":"1"}}}]'
                 ),
             )
-        config_path = Path(args[args.index("--config") + 1])
-        captured["args"] = args
-        captured["config"] = config_path.read_text(encoding="utf-8")
-        captured["timeout"] = kwargs["timeout"]
-        captured["path"] = config_path
+        if args[1] == "deploy":
+            config_path = Path(args[args.index("--config") + 1])
+            captured["args"] = args
+            captured["config"] = config_path.read_text(encoding="utf-8")
+            captured["timeout"] = kwargs["timeout"]
+            captured["path"] = config_path
         return SimpleNamespace(returncode=0, stdout="")
 
     monkeypatch.setattr(continuity_proof.subprocess, "run", run)
@@ -389,6 +397,9 @@ def test_fly_secret_store_bootstraps_first_release_without_secret_values(
     assert 'entrypoint = ["/bin/sh", "-c", "sleep 1800"]' in captured["config"]
     assert captured["timeout"] == 180
     assert not captured["path"].exists()
+    assert ("fly", "machine", "stop", "abc123", "--app", "allies-app") in captured[
+        "calls"
+    ]
     assert release == ("rel_test123", "1")
 
 

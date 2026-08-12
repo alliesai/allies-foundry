@@ -160,7 +160,9 @@ class FlyCliSecretStore:
                 ),
                 timeout_seconds=_FLY_DEPLOY_TIMEOUT_SECONDS,
             )
-            return self._release_metadata(app_ref)
+            release = self._release_metadata(app_ref)
+            self._stop_bootstrap_machine(app_ref, release)
+            return release
         finally:
             Path(config_path).unlink(missing_ok=True)
 
@@ -195,6 +197,31 @@ class FlyCliSecretStore:
         if not re.fullmatch(r"rel_[A-Za-z0-9]+", release_id) or not version.isdigit():
             raise _FlySecretCommandError("fly_release_metadata_invalid")
         return release_id, version
+
+    def _stop_bootstrap_machine(
+        self, app_ref: str, release: tuple[str, str]
+    ) -> None:
+        completed = self._run(("machine", "list", "--app", app_ref, "--json"))
+        try:
+            machines = json.loads(completed.stdout)
+            candidates = [
+                str(item["id"])
+                for item in machines
+                if (
+                    item.get("config", {}).get("metadata", {}).get("fly_release_id"),
+                    str(
+                        item.get("config", {})
+                        .get("metadata", {})
+                        .get("fly_release_version", "")
+                    ),
+                )
+                == release
+            ]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise _FlySecretCommandError("fly_release_metadata_invalid") from exc
+        if len(candidates) != 1 or not _SAFE_SLUG.fullmatch(candidates[0]):
+            raise _FlySecretCommandError("fly_release_metadata_invalid")
+        self._run(("machine", "stop", candidates[0], "--app", app_ref))
 
     @staticmethod
     def _validate_secret_name(secret_name: str) -> None:
@@ -1035,7 +1062,7 @@ def _spec_for_handle(
             ContainerSpec(
                 "allies-runtime",
                 config.workspace_spec.runtime_image,
-                entrypoint=_runtime_proof_command(),
+                entrypoint=_runtime_proof_command(handle, dependency_handle),
                 environment={"HERMES_STREAM_TIMEOUT": "60"},
                 healthchecks=(
                     _proof_process_healthcheck(
@@ -1092,20 +1119,46 @@ def _hermes_proof_command(
         dependency_handle.hermes_key_secret_name
     ):
         raise ValueError("Fly secret name is invalid")
+    secret_name = dependency_handle.hermes_key_secret_name
     command = (
-        f'test -s {_HERMES_KEY_PATH} || exit 1; '
-        f'API_SERVER_KEY="$(cat {_HERMES_KEY_PATH})"; '
-        "export API_SERVER_KEY; "
+        f"p={_HERMES_KEY_PATH};umask 77;mkdir -p /run/secrets;"
+        f'[ -s $p ]||printf %s "${secret_name}"|base64 -d >$p||exit 1;'
+        f"unset {secret_name};[ -s $p ]||exit 1;"
+        'export API_SERVER_KEY="$(cat $p)";'
         "exec hermes gateway run --no-supervise"
     )
     return ("sh", "-c", command)
 
 
-def _runtime_proof_command() -> tuple[str, ...]:
+def _runtime_proof_command(
+    handle: ProofCredentialHandle,
+    dependency_handle: ProofDependencyCredentialHandle,
+) -> tuple[str, ...]:
+    secret_files = (
+        (
+            dependency_handle.hermes_key_secret_name,
+            "/run/secrets/hermes-api-key",
+        ),
+        (
+            dependency_handle.provider_key_secret_name,
+            "/run/secrets/openai-api-key",
+        ),
+        (handle.secret_name, "/run/secrets/foundry-runtime-token"),
+    )
+    if not all(_SAFE_FLY_SECRET_NAME.fullmatch(name) for name, _ in secret_files):
+        raise ValueError("Fly secret name is invalid")
+    materialize = "".join(
+        f"if [ ! -s {path} ]; then "
+        f'printf %s "${name}" | base64 -d > {path} || exit 1; fi; '
+        f"unset {name}; "
+        for name, path in secret_files
+    )
     return (
         "sh",
         "-c",
-        "test -s /run/secrets/hermes-api-key"
+        "umask 077; mkdir -p /run/secrets; "
+        + materialize
+        + "test -s /run/secrets/hermes-api-key"
         " && test -s /run/secrets/openai-api-key"
         " && test -s /run/secrets/foundry-runtime-token"
         " || exit 1; chown 10000:10000 /run/secrets"
