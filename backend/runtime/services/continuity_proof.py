@@ -543,7 +543,7 @@ class ContinuityProofConfig:
     foundry_origin: str
     workspace_spec: WorkspaceSpec
     profiles: tuple[ProofProfile, ProofProfile]
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = 600.0
     poll_interval: float = 0.25
 
     def __post_init__(self) -> None:
@@ -1064,7 +1064,7 @@ def _spec_for_handle(
                 "allies-runtime",
                 config.workspace_spec.runtime_image,
                 entrypoint=_runtime_proof_command(handle, dependency_handle),
-                environment={"HERMES_STREAM_TIMEOUT": "60"},
+                environment={"HERMES_STREAM_TIMEOUT": "180"},
                 healthchecks=(
                     _proof_process_healthcheck(
                         "allies-runtime",

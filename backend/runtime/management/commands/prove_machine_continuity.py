@@ -47,7 +47,7 @@ class Command(BaseCommand):
         parser.add_argument("--model", required=True)
         parser.add_argument("--base-url")
         parser.add_argument("--run-id")
-        parser.add_argument("--timeout", type=float, default=120.0)
+        parser.add_argument("--timeout", type=float, default=600.0)
 
     def handle(self, *args, **options):
         output = self._output_path(options["output"])

@@ -42,7 +42,7 @@ def test_settings_accept_validated_foundry_runtime_connection():
         {"HERMES_ORIGIN": "https://127.0.0.1:8642"},
         {"HERMES_CREDENTIAL_REF": "Bearer plaintext"},
         {"PROOF_SLOTS": "1"},
-        {"HERMES_REQUEST_TIMEOUT": "61"},
+        {"HERMES_REQUEST_TIMEOUT": "181"},
         {"VOLUME_MARKER_PATH": "/tmp/not-hermes"},
         {"HERMES_IMAGE": "hermes:latest"},
         {"HERMES_SOURCE_COMMIT": "not-a-commit"},

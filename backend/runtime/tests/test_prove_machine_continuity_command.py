@@ -103,6 +103,7 @@ def test_live_command_writes_only_the_service_evidence(monkeypatch, tmp_path):
 
     assert json.loads(output.read_text(encoding="utf-8")) == expected.to_dict()
     assert captured["provider_api_key"] == "provider-key-must-not-escape"
+    assert captured["config"].timeout_seconds == 600.0
     assert {profile.seed.provider for profile in captured["config"].profiles} == {
         "custom"
     }
