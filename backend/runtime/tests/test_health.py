@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dj_database_url
@@ -40,6 +41,7 @@ def clear_health_cache():
     with (
         patch("config.health._health_cache_expires_at", 0.0),
         patch("config.health._health_cache_result", None),
+        patch("config.health._health_probe_executor", None),
         patch("config.health._health_probe_in_flight", False),
     ):
         yield
@@ -85,25 +87,33 @@ def test_healthz_reuses_a_recent_probe_result(client):
 
 @pytest.mark.django_db
 def test_healthz_bounds_postgres_probe_with_statement_timeout(client):
+    future = Future()
     with (
         patch("config.health.connection.vendor", "postgresql"),
-        patch("config.health._run_postgres_probe") as probe,
+        patch("config.health._health_probe_executor") as executor,
     ):
+        executor.submit.return_value = future
         response = client.get("/healthz")
 
-    assert response.status_code == 200
-    probe.assert_called_once_with()
+    assert response.status_code == 503
+    future.set_result(None)
+    assert client.get("/healthz").status_code == 200
+    executor.submit.assert_called_once()
 
 
 @pytest.mark.django_db
 def test_healthz_returns_unavailable_when_postgres_probe_times_out(client):
+    future = Future()
     with (
         patch("config.health.connection.vendor", "postgresql"),
-        patch("config.health._run_postgres_probe", side_effect=TimeoutError),
+        patch("config.health._health_probe_executor") as executor,
     ):
+        executor.submit.return_value = future
         response = client.get("/healthz")
 
     assert response.status_code == 503
+    future.set_exception(TimeoutError)
+    assert client.get("/healthz").status_code == 503
     assert response.json() == {"status": "unavailable"}
 
 

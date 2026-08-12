@@ -1,8 +1,9 @@
 import asyncio
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from threading import Lock
 from time import monotonic
 
-from django.db import DatabaseError, connection, transaction
+from django.db import DatabaseError, close_old_connections, connection, transaction
 from django.http import JsonResponse
 from psycopg import AsyncConnection
 from psycopg import Error as PsycopgError
@@ -15,6 +16,16 @@ _health_cache_lock = Lock()
 _health_cache_expires_at = 0.0
 _health_cache_result: tuple[dict[str, str], int] | None = None
 _health_probe_in_flight = False
+_health_probe_executor: ThreadPoolExecutor | None = None
+_HEALTH_PROBE_ERRORS = (
+    CancelledError,
+    DatabaseError,
+    PsycopgError,
+    OSError,
+    TimeoutError,
+    TypeError,
+    RuntimeError,
+)
 
 
 async def _async_postgres_probe(params: dict[str, object]) -> None:
@@ -50,8 +61,33 @@ def _run_sqlite_probe() -> None:
         cursor.execute("SELECT 1")
 
 
+def _run_postgres_probe_in_worker() -> None:
+    close_old_connections()
+    try:
+        _run_postgres_probe()
+    finally:
+        close_old_connections()
+
+
+def _finish_postgres_probe(future: Future[None]) -> None:
+    payload, status = {"status": "unavailable"}, 503
+    try:
+        future.result()
+    except _HEALTH_PROBE_ERRORS:
+        payload, status = {"status": "unavailable"}, 503
+    else:
+        payload, status = {"status": "ok"}, 200
+
+    with _health_cache_lock:
+        global _health_cache_expires_at, _health_cache_result, _health_probe_in_flight
+
+        _health_cache_result = payload, status
+        _health_cache_expires_at = monotonic() + HEALTHCHECK_CACHE_SECONDS
+        _health_probe_in_flight = False
+
+
 def healthz(request):
-    global _health_cache_expires_at, _health_cache_result, _health_probe_in_flight
+    global _health_cache_expires_at, _health_cache_result, _health_probe_executor, _health_probe_in_flight
 
     with _health_cache_lock:
         if _health_cache_result is not None and monotonic() < _health_cache_expires_at:
@@ -67,6 +103,27 @@ def healthz(request):
                 payload, status = {"status": "unavailable"}, 503
             return JsonResponse(payload, status=status)
         _health_probe_in_flight = True
+        postgres_probe = connection.vendor == "postgresql"
+
+    if postgres_probe:
+        with _health_cache_lock:
+            if _health_probe_executor is None:
+                _health_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="healthz")
+            executor = _health_probe_executor
+        try:
+            future = executor.submit(_run_postgres_probe_in_worker)
+            future.add_done_callback(_finish_postgres_probe)
+        except RuntimeError:
+            failed_future: Future[None] = Future()
+            failed_future.set_exception(RuntimeError("health probe could not be scheduled"))
+            _finish_postgres_probe(failed_future)
+
+        with _health_cache_lock:
+            if _health_cache_result is not None:
+                payload, status = _health_cache_result
+            else:
+                payload, status = {"status": "unavailable"}, 503
+            return JsonResponse(payload, status=status)
 
     payload, status = {"status": "unavailable"}, 503
     try:
