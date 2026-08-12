@@ -74,6 +74,7 @@ jobs:
           DJANGO_DEBUG: "false"
           DJANGO_SECRET_KEY: ci-only-production-check
           DJANGO_ALLOWED_HOSTS: localhost
+          DJANGO_TRUST_PROXY_HEADERS: "true"
           DATABASE_URL: sqlite:///ci-production.sqlite3
         run: |
           uv run --locked python manage.py check

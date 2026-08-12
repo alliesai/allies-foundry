@@ -35,11 +35,14 @@ def env_list(name: str, *, default: str = "") -> list[str]:
 
 
 DEBUG = env_bool("DJANGO_DEBUG", default=False)
+database_url = os.getenv("DATABASE_URL")
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 if not SECRET_KEY:
-    if not DEBUG:
-        raise ImproperlyConfigured("DJANGO_SECRET_KEY is required when DJANGO_DEBUG is false")
+    if not DEBUG or database_url:
+        raise ImproperlyConfigured(
+            "DJANGO_SECRET_KEY is required when DJANGO_DEBUG is false or DATABASE_URL is set"
+        )
     SECRET_KEY = "django-insecure-local-development-only"
 
 ALLOWED_HOSTS = env_list(
@@ -60,6 +63,8 @@ if railway_public_domain:
     railway_origin = f"https://{railway_public_domain}"
     if railway_origin not in CSRF_TRUSTED_ORIGINS:
         CSRF_TRUSTED_ORIGINS.append(railway_origin)
+
+TRUST_PROXY_HEADERS = env_bool("DJANGO_TRUST_PROXY_HEADERS", default=False)
 
 
 # Application definition
@@ -108,15 +113,17 @@ WSGI_APPLICATION = "config.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-database_url = os.getenv("DATABASE_URL")
 if database_url:
-    DATABASES = {
-        "default": dj_database_url.parse(
-            database_url,
-            conn_max_age=60,
-            conn_health_checks=True,
-        )
-    }
+    database_config = dj_database_url.parse(
+        database_url,
+        conn_max_age=60,
+        conn_health_checks=True,
+    )
+    if database_config["ENGINE"] == "django.db.backends.postgresql":
+        database_options = database_config.setdefault("OPTIONS", {})
+        database_options.setdefault("connect_timeout", 5)
+        database_options.setdefault("options", "-c statement_timeout=5000")
+    DATABASES = {"default": database_config}
 else:
     if not DEBUG:
         raise ImproperlyConfigured("DATABASE_URL is required when DJANGO_DEBUG is false")
@@ -170,6 +177,8 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
-SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_PROXY_SSL_HEADER = (
+    ("HTTP_X_FORWARDED_PROTO", "https") if TRUST_PROXY_HEADERS else None
+)
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG

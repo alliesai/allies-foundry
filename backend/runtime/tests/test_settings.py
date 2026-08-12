@@ -10,7 +10,9 @@ PROBE = """
 import config.settings as settings
 print(settings.DEBUG)
 print(settings.DATABASES["default"]["ENGINE"])
+print(settings.DATABASES["default"].get("OPTIONS"))
 print(settings.STATIC_ROOT)
+print(settings.SECURE_PROXY_SSL_HEADER)
 """
 
 
@@ -21,6 +23,7 @@ def run_settings_probe(**overrides):
         "DJANGO_ALLOWED_HOSTS",
         "DJANGO_DEBUG",
         "DJANGO_SECRET_KEY",
+        "DJANGO_TRUST_PROXY_HEADERS",
         "RAILWAY_PUBLIC_DOMAIN",
     ):
         environment.pop(name, None)
@@ -50,6 +53,16 @@ def test_production_mode_requires_secret_key():
     assert "DJANGO_SECRET_KEY is required" in result.stderr
 
 
+def test_debug_mode_requires_secret_when_database_is_configured():
+    result = run_settings_probe(
+        DJANGO_DEBUG="true",
+        DATABASE_URL="sqlite:///test-development.sqlite3",
+    )
+
+    assert result.returncode != 0
+    assert "DJANGO_SECRET_KEY is required" in result.stderr
+
+
 def test_production_mode_requires_database_url():
     result = run_settings_probe(
         DJANGO_DEBUG="false",
@@ -72,15 +85,26 @@ def test_production_mode_requires_allowed_host():
     assert "DJANGO_ALLOWED_HOSTS or RAILWAY_PUBLIC_DOMAIN is required" in result.stderr
 
 
-@pytest.mark.parametrize("database_url", ["sqlite:///test-production.sqlite3"])
-def test_production_mode_accepts_explicit_database(database_url):
+@pytest.mark.parametrize(
+    ("database_url", "engine"),
+    [
+        ("sqlite:///test-production.sqlite3", "django.db.backends.sqlite3"),
+        ("postgres://user:pass@localhost:5432/foundry", "django.db.backends.postgresql"),
+    ],
+)
+def test_production_mode_accepts_explicit_database(database_url, engine):
     result = run_settings_probe(
         DJANGO_DEBUG="false",
         DJANGO_SECRET_KEY="synthetic-test-secret",
         DJANGO_ALLOWED_HOSTS="localhost",
         DATABASE_URL=database_url,
+        DJANGO_TRUST_PROXY_HEADERS="true",
     )
 
     assert result.returncode == 0, result.stderr
     assert "False" in result.stdout
-    assert "django.db.backends.sqlite3" in result.stdout
+    assert engine in result.stdout
+    assert "('HTTP_X_FORWARDED_PROTO', 'https')" in result.stdout
+    if engine == "django.db.backends.postgresql":
+        assert "'connect_timeout': 5" in result.stdout
+        assert "statement_timeout=5000" in result.stdout
