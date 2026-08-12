@@ -540,6 +540,18 @@ the backend also redirects HTTP requests to HTTPS and enables one-year HSTS;
 leave the flag off for direct/local deployments that do not have that proxy
 guarantee.
 
+## Health endpoint
+
+`GET /healthz` is the public Railway liveness/readiness contract. It requires
+no authentication and returns `{"status": "ok"}` with HTTP 200 after a
+successful database probe, or `{"status": "unavailable"}` with HTTP 503 when
+the database probe fails or is still unavailable. PostgreSQL's first request
+per worker performs one bounded five-second probe before replying; later
+refreshes run in a single background worker. Results are cached for one second,
+and callers receive the last result while a refresh is in flight. The endpoint
+does not accept request data and should be used only for platform health
+checks, not application traffic.
+
 The repository root provides the current convenience commands. Set
 `DJANGO_DEBUG=true` in your shell first, as shown above:
 

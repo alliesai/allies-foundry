@@ -78,12 +78,31 @@ def _finish_postgres_probe(future: Future[None]) -> None:
     else:
         payload, status = {"status": "ok"}, 200
     finally:
-        with _health_cache_lock:
-            global _health_cache_expires_at, _health_cache_result, _health_probe_in_flight
+        _cache_postgres_probe_result(payload, status)
 
-            _health_cache_result = payload, status
-            _health_cache_expires_at = monotonic() + HEALTHCHECK_CACHE_SECONDS
-            _health_probe_in_flight = False
+
+def _cache_postgres_probe_result(payload: dict[str, str], status: int) -> None:
+    global _health_cache_expires_at, _health_cache_result, _health_probe_in_flight
+
+    with _health_cache_lock:
+        _health_cache_result = payload, status
+        _health_cache_expires_at = monotonic() + HEALTHCHECK_CACHE_SECONDS
+        _health_probe_in_flight = False
+
+
+def _run_initial_postgres_probe() -> tuple[dict[str, str], int]:
+    payload, status = {"status": "unavailable"}, 503
+    try:
+        _run_postgres_probe_in_worker()
+    except _HEALTH_PROBE_ERRORS:
+        # The first request must report the actual database state, while
+        # probe failures still fail closed as 503.
+        pass
+    else:
+        payload, status = {"status": "ok"}, 200
+    finally:
+        _cache_postgres_probe_result(payload, status)
+    return payload, status
 
 
 def healthz(request):
@@ -107,9 +126,16 @@ def healthz(request):
 
     if postgres_probe:
         with _health_cache_lock:
-            if _health_probe_executor is None:
-                _health_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="healthz")
-            executor = _health_probe_executor
+            initial_probe = _health_cache_result is None
+            if not initial_probe:
+                if _health_probe_executor is None:
+                    _health_probe_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="healthz")
+                executor = _health_probe_executor
+
+        if initial_probe:
+            payload, status = _run_initial_postgres_probe()
+            return JsonResponse(payload, status=status)
+
         try:
             future = executor.submit(_run_postgres_probe_in_worker)
             future.add_done_callback(_finish_postgres_probe)

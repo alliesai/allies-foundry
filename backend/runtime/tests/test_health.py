@@ -90,6 +90,7 @@ def test_healthz_bounds_postgres_probe_with_statement_timeout(client):
     future = Future()
     with (
         patch("config.health.connection.vendor", "postgresql"),
+        patch("config.health._health_cache_result", ({"status": "unavailable"}, 503)),
         patch("config.health._health_probe_executor") as executor,
     ):
         executor.submit.return_value = future
@@ -106,6 +107,7 @@ def test_healthz_returns_unavailable_when_postgres_probe_times_out(client):
     future = Future()
     with (
         patch("config.health.connection.vendor", "postgresql"),
+        patch("config.health._health_cache_result", ({"status": "unavailable"}, 503)),
         patch("config.health._health_probe_executor") as executor,
     ):
         executor.submit.return_value = future
@@ -114,6 +116,34 @@ def test_healthz_returns_unavailable_when_postgres_probe_times_out(client):
     assert response.status_code == 503
     future.set_exception(TimeoutError)
     assert client.get("/healthz").status_code == 503
+    assert response.json() == {"status": "unavailable"}
+
+
+@pytest.mark.django_db
+def test_healthz_runs_initial_postgres_probe_before_reply(client):
+    with (
+        patch("config.health.connection.vendor", "postgresql"),
+        patch("config.health._run_postgres_probe_in_worker") as probe,
+    ):
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    probe.assert_called_once_with()
+
+
+@pytest.mark.django_db
+def test_healthz_fails_closed_when_initial_postgres_probe_fails(client):
+    with (
+        patch("config.health.connection.vendor", "postgresql"),
+        patch(
+            "config.health._run_postgres_probe_in_worker",
+            side_effect=DatabaseError,
+        ),
+    ):
+        response = client.get("/healthz")
+
+    assert response.status_code == 503
     assert response.json() == {"status": "unavailable"}
 
 
