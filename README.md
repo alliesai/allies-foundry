@@ -9,6 +9,7 @@ belong at the repository root.
 ## Development
 
 ```powershell
+$env:DJANGO_DEBUG = "true"
 make sync
 make migrate
 make server

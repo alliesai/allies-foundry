@@ -44,12 +44,16 @@ if not SECRET_KEY:
 
 ALLOWED_HOSTS = env_list(
     "DJANGO_ALLOWED_HOSTS",
-    default="localhost,127.0.0.1,[::1]" if DEBUG else ".railway.app",
+    default="localhost,127.0.0.1,[::1]" if DEBUG else "",
 )
 
 railway_public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
 if railway_public_domain and railway_public_domain not in ALLOWED_HOSTS:
     ALLOWED_HOSTS.append(railway_public_domain)
+if not DEBUG and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured(
+        "DJANGO_ALLOWED_HOSTS or RAILWAY_PUBLIC_DOMAIN is required when DJANGO_DEBUG is false"
+    )
 
 CSRF_TRUSTED_ORIGINS = env_list("DJANGO_CSRF_TRUSTED_ORIGINS")
 if railway_public_domain:

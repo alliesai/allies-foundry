@@ -54,10 +54,22 @@ def test_production_mode_requires_database_url():
     result = run_settings_probe(
         DJANGO_DEBUG="false",
         DJANGO_SECRET_KEY="synthetic-test-secret",
+        DJANGO_ALLOWED_HOSTS="localhost",
     )
 
     assert result.returncode != 0
     assert "DATABASE_URL is required" in result.stderr
+
+
+def test_production_mode_requires_allowed_host():
+    result = run_settings_probe(
+        DJANGO_DEBUG="false",
+        DJANGO_SECRET_KEY="synthetic-test-secret",
+        DATABASE_URL="sqlite:///test-production.sqlite3",
+    )
+
+    assert result.returncode != 0
+    assert "DJANGO_ALLOWED_HOSTS or RAILWAY_PUBLIC_DOMAIN is required" in result.stderr
 
 
 @pytest.mark.parametrize("database_url", ["sqlite:///test-production.sqlite3"])
