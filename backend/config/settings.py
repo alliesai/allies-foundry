@@ -34,7 +34,7 @@ def env_list(name: str, *, default: str = "") -> list[str]:
     return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
 
 
-DEBUG = env_bool("DJANGO_DEBUG", default=True)
+DEBUG = env_bool("DJANGO_DEBUG", default=False)
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 if not SECRET_KEY:
@@ -114,6 +114,8 @@ if database_url:
         )
     }
 else:
+    if not DEBUG:
+        raise ImproperlyConfigured("DATABASE_URL is required when DJANGO_DEBUG is false")
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",

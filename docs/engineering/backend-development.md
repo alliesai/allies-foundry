@@ -495,6 +495,21 @@ Tests should prove tenant isolation and failure behavior, not only the successfu
 
 ## Local development commands
 
+Production-safe settings are the default. For local development, export the
+explicit debug flag before running Django commands so the SQLite fallback is
+available:
+
+```powershell
+$env:DJANGO_DEBUG = "true"
+make sync
+make check
+make migrate
+make server
+```
+
+Deployments must set `DJANGO_DEBUG=false`, `DJANGO_SECRET_KEY`, and
+`DATABASE_URL` through the platform's secret/environment configuration.
+
 The repository root provides the current convenience commands:
 
 ```powershell
