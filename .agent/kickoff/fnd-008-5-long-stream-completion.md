@@ -165,3 +165,14 @@ The adversarial and simplicity review outputs are retained at
   `MAX_BUFFERED_EVENTS = 65_536` guard, and the configured stream timeout is
   enforced after the incremental response opens, including keepalive-only
   streams.
+- 2026-08-12: Published immutable runtime image
+  `ghcr.io/timmyy3000/allies-runtime@sha256:c5e84e5f4ca6164c7c69aebb1145f05a9a7d83834b3f1dbe246b8cabfa38a20e`.
+  The real Sandy generation-one response completed through the new parser with
+  762 persisted events and terminal `ok`; Greg completed with 74 events. The
+  interactive replacement adapter stalled before creating active rows and was
+  cleaned up without claiming a continuity result.
+- 2026-08-12: The separate standard same-volume proof passed all live gates
+  with the same image: generation-one startup, isolated turns, two overlapping
+  streams plus queued work, volume-preserving Machine replacement, old-claim
+  fencing, generation-two isolated session continuity, and complete cleanup.
+  Sanitized evidence is retained in `.agent/fnd-008-5-standard-proof-debug1.json`.
