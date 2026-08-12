@@ -9,8 +9,8 @@ def healthz(request):
         with transaction.atomic(), connection.cursor() as cursor:
             if connection.vendor == "postgresql":
                 cursor.execute(
-                    "SET LOCAL statement_timeout = %s",
-                    [HEALTHCHECK_TIMEOUT_MS],
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    [str(HEALTHCHECK_TIMEOUT_MS)],
                 )
             cursor.execute("SELECT 1")
     except DatabaseError:

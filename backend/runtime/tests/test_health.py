@@ -37,9 +37,14 @@ def test_healthz_bounds_postgres_probe_with_statement_timeout(client):
     health_calls = [
         call_item
         for call_item in cursor.execute.call_args_list
-        if call_item.args and call_item.args[0] in {"SET LOCAL statement_timeout = %s", "SELECT 1"}
+        if call_item.args
+        and call_item.args[0]
+        in {"SELECT set_config('statement_timeout', %s, true)", "SELECT 1"}
     ]
     assert health_calls == [
-        call("SET LOCAL statement_timeout = %s", [5000]),
+        call(
+            "SELECT set_config('statement_timeout', %s, true)",
+            ["5000"],
+        ),
         call("SELECT 1"),
     ]
