@@ -39,6 +39,17 @@ jobs:
           echo "::add-mask::${base_url}"
           health_url="${base_url}/healthz"
           echo "::add-mask::${health_url}"
+          http_base="${base_url#https://}"
+          http_url="http://${http_base}/healthz"
+          echo "::add-mask::${http_url}"
+          redirect=$(curl --silent --max-time 10 --max-redirs 0 \
+            --output /dev/null --write-out '%{http_code} %{redirect_url}' \
+            "$http_url" || true)
+          [[ "$redirect" =~ ^(301|302|307|308)[[:space:]]https:// ]] || {
+            echo "Plain HTTP /healthz did not redirect to HTTPS" >&2
+            exit 1
+          }
+
           for attempt in $(seq 1 30); do
             status=$(curl --silent --max-time 10 \
               --output response.json --write-out '%{http_code}' \
