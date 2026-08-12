@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
+import subprocess
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -236,15 +238,24 @@ def test_proof_spec_mounts_each_dependency_only_in_its_consumer():
 
     spec = _spec_for_handle(config, generation, dependencies)
     hermes, runtime = spec.containers or ()
+    hermes_script = "".join(hermes.command[4:])
 
     assert not hermes.entrypoint
     assert hermes.user is None
     assert hermes.command[:2] == ("sh", "-c")
-    assert "chown" not in hermes.command[2]
-    assert "exec hermes gateway run --no-supervise" in hermes.command[2]
-    assert "/opt/data/.allies-secrets/hermes-api-key" in hermes.command[2]
-    assert '"$ALLIES_FND008_HERMES_KEY"|base64 -d' in hermes.command[2]
-    assert "unset ALLIES_FND008_HERMES_KEY" in hermes.command[2]
+    assert hermes.command[2] == 'eval "$(printf %s "$@")"'
+    assert hermes.command[3] == "allies-proof"
+    assert all(len(item) <= 255 for item in hermes.command)
+    assert "chown -R" not in hermes_script
+    assert "exec hermes gateway run --no-supervise" in hermes_script
+    assert "/opt/data/.allies-secrets/key" in hermes_script
+    assert '"$ALLIES_FND008_HERMES_KEY"|base64 -d' in hermes_script
+    assert "unset ALLIES_FND008_HERMES_KEY" in hermes_script
+    assert '"desired_state":"stopped"' in hermes_script
+    assert '[ ! -L "$s" ]' in hermes_script
+    assert "mktemp /opt/data/.gateway-state.XXXXXX" in hermes_script
+    assert 'chown 10000:10000 "$t"' in hermes_script
+    assert 'mv -fT -- "$t" "$s"' in hermes_script
     assert runtime.entrypoint[:2] == ("sh", "-c")
     assert "chown -R" not in runtime.entrypoint[2]
     assert "stat -c %u /opt/data" in runtime.entrypoint[2]
@@ -275,6 +286,93 @@ def test_proof_spec_mounts_each_dependency_only_in_its_consumer():
     }
     assert spec.runtime_credential_ref == dependencies.hermes_credential_ref
     assert "must-not-escape" not in repr(spec)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="proof guest shell is Linux")
+def test_hermes_proof_command_refuses_persisted_gateway_state_symlink(tmp_path):
+    config = proof_config()
+    generation = ProofCredentialHandle(
+        workspace_id=config.workspace_id,
+        app_ref="allies-proof-app",
+        generation=1,
+        operation_id=uuid4(),
+        credential_id=uuid4(),
+        secret_name="ALLIES_FND008_FOUNDRY_1",
+        credential_ref="file:///run/secrets/foundry-runtime-token",
+        raw_token="foundry-token-must-not-escape",
+    )
+    dependencies = ProofDependencyCredentialHandle(
+        app_ref="allies-proof-app",
+        hermes_key_secret_name="ALLIES_FND008_HERMES_KEY",
+        provider_key_secret_name="ALLIES_FND008_OPENAI_KEY",
+    )
+    spec = _spec_for_handle(config, generation, dependencies)
+    hermes, _runtime = spec.containers or ()
+    data = tmp_path / "data"
+    data.mkdir()
+    victim = tmp_path / "victim"
+    victim.write_text("untouched", encoding="utf-8")
+    (data / "gateway_state.json").symlink_to(victim)
+    script = "".join(hermes.command[4:]).replace("/opt/data", str(data))
+    script = script.replace("exec hermes gateway run --no-supervise", "exit 99")
+    chunks = tuple(script[offset : offset + 200] for offset in range(0, len(script), 200))
+    env = {
+        **os.environ,
+        "ALLIES_FND008_HERMES_KEY": base64.b64encode(b"synthetic-key").decode(),
+    }
+
+    completed = subprocess.run(
+        ("sh", "-c", hermes.command[2], "allies-proof", *chunks),
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert victim.read_text(encoding="utf-8") == "untouched"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="proof guest shell is Linux")
+def test_hermes_proof_command_preserves_state_on_prerename_failure(tmp_path):
+    config = proof_config()
+    generation = ProofCredentialHandle(
+        workspace_id=config.workspace_id,
+        app_ref="allies-proof-app",
+        generation=1,
+        operation_id=uuid4(),
+        credential_id=uuid4(),
+        secret_name="ALLIES_FND008_FOUNDRY_1",
+        credential_ref="file:///run/secrets/foundry-runtime-token",
+        raw_token="foundry-token-must-not-escape",
+    )
+    dependencies = ProofDependencyCredentialHandle(
+        app_ref="allies-proof-app",
+        hermes_key_secret_name="ALLIES_FND008_HERMES_KEY",
+        provider_key_secret_name="ALLIES_FND008_OPENAI_KEY",
+    )
+    spec = _spec_for_handle(config, generation, dependencies)
+    hermes, _runtime = spec.containers or ()
+    data = tmp_path / "data"
+    data.mkdir()
+    state = data / "gateway_state.json"
+    state.write_text('{"desired_state":"running"}\n', encoding="utf-8")
+    script = "".join(hermes.command[4:]).replace("/opt/data", str(data))
+    script = script.replace('chown 10000:10000 "$t"', "false")
+    script = script.replace("exec hermes gateway run --no-supervise", "exit 99")
+    chunks = tuple(script[offset : offset + 200] for offset in range(0, len(script), 200))
+    env = {
+        **os.environ,
+        "ALLIES_FND008_HERMES_KEY": base64.b64encode(b"synthetic-key").decode(),
+    }
+
+    completed = subprocess.run(
+        ("sh", "-c", hermes.command[2], "allies-proof", *chunks),
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert state.read_text(encoding="utf-8") == '{"desired_state":"running"}\n'
+    assert list(data.glob(".gateway-state.*")) == []
 
 
 def test_fly_secret_store_passes_secret_value_only_through_stdin(monkeypatch):

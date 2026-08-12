@@ -50,7 +50,7 @@ from runtime.services.workspaces import (
 _CREDENTIAL_REF = "file:///run/secrets/foundry-runtime-token"
 HERMES_PROOF_CREDENTIAL_REF = "file:///run/secrets/hermes-api-key"
 OPENAI_PROOF_CREDENTIAL_REF = "file:///run/secrets/openai-api-key"
-_HERMES_KEY_PATH = "/opt/data/.allies-secrets/hermes-api-key"
+_HERMES_KEY_PATH = "/opt/data/.allies-secrets/key"
 _HERMES_RUNTIME_KEY_PATH = "/run/secrets/hermes-api-key"
 _SAFE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
@@ -1128,10 +1128,21 @@ def _hermes_proof_command(
         f"p={_HERMES_KEY_PATH};umask 77;mkdir -p ${{p%/*}};"
         f'[ -s $p ]||printf %s "${secret_name}"|base64 -d >$p||exit 1;'
         f"unset {secret_name};"
+        's=/opt/data/gateway_state.json;'
+        '[ ! -L "$s" ]&&{ [ ! -e "$s" ]||[ -f "$s" ]; }||exit 1;'
+        't=$(mktemp /opt/data/.gateway-state.XXXXXX)||exit 1;'
+        "echo '{\"desired_state\":\"stopped\"}'>\"$t\"&&"
+        'chown 10000:10000 "$t"&&mv -fT -- "$t" "$s"'
+        '||{ rm -f -- "$t";exit 1; };'
         'export API_SERVER_KEY="$(cat $p)";'
         "exec hermes gateway run --no-supervise"
     )
-    return ("sh", "-c", command)
+    chunk_size = 200
+    chunks = tuple(
+        command[offset : offset + chunk_size]
+        for offset in range(0, len(command), chunk_size)
+    )
+    return ("sh", "-c", 'eval "$(printf %s "$@")"', "allies-proof", *chunks)
 
 
 def _runtime_proof_command(
