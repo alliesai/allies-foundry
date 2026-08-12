@@ -176,3 +176,9 @@ The adversarial and simplicity review outputs are retained at
   streams plus queued work, volume-preserving Machine replacement, old-claim
   fencing, generation-two isolated session continuity, and complete cleanup.
   Sanitized evidence is retained in `.agent/fnd-008-5-standard-proof-debug1.json`.
+- 2026-08-12: Pre-PR local review covered the incremental parser state machine,
+  deadline/cancellation path, byte and retained-list bounds, session/tool
+  validation, security isolation, and the new regression tests. No actionable
+  P0-P2 findings were identified. The isolated reviewer could not start
+  because the configured reviewer model is unsupported for this account; this
+  limitation is recorded and the review was completed locally instead.
