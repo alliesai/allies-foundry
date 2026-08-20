@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from django.core.exceptions import PermissionDenied, SuspiciousOperation
@@ -109,6 +110,26 @@ def test_middleware_emits_request_event_and_propagates_request_id(monkeypatch):
     assert captured[0]["status_code"] == 202
     assert captured[0]["request_id"] == "req_client"
     assert captured[0]["route"].endswith("/:id")
+
+
+def test_middleware_uses_resolved_route_template(monkeypatch):
+    captured = []
+
+    def response(_request):
+        return HttpResponse(status=200)
+
+    request = RequestFactory().get("/workspaces/0123456789abcdef")
+    request.resolver_match = SimpleNamespace(
+        route="api/v1/workspaces/<uuid:workspace_id>/"
+    )
+    monkeypatch.setattr(
+        "observability.middleware.emit_event",
+        lambda event, **kwargs: captured.append(event),
+    )
+
+    WideEventMiddleware(response)(request)
+
+    assert captured[0]["route"] == "/api/v1/workspaces/:workspace_id/"
 
 
 def test_middleware_emits_error_event_and_re_raises(monkeypatch):

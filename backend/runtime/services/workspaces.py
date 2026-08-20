@@ -1144,16 +1144,21 @@ class WorkspaceLifecycle:
     def _handle_failure(
         self, workspace_id: UUID, claim: _Claim, error: ProviderError
     ) -> None:
+        will_retry = (
+            error.retryable
+            and self._phase_attempts.get(claim.phase, 0) < MAX_ATTEMPTS
+        )
         if error.retryable:
-            emit_event(
-                build_event(
-                    "runtime.operation.retried",
-                    operation="workspace_lifecycle",
-                    workspace_id=str(workspace_id),
-                    reason_code=getattr(error, "code", None),
-                    outcome="retry",
+            if will_retry:
+                emit_event(
+                    build_event(
+                        "runtime.operation.retried",
+                        operation="workspace_lifecycle",
+                        workspace_id=str(workspace_id),
+                        reason_code=getattr(error, "code", None),
+                        outcome="retry",
+                    )
                 )
-            )
             self._clear_claim(workspace_id, claim)
             return
 

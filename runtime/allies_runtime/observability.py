@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import random
 import re
 import sys
@@ -237,6 +238,78 @@ class EventCounters:
 _COUNTERS = EventCounters()
 _SINK: EventSink | None = None
 _CONFIG: WideEventSettings | None = None
+_STDOUT_DISPATCHER: _StdoutDispatcher | None = None
+_STDOUT_QUEUE_SIZE: int | None = None
+_STDOUT_LOCK = threading.Lock()
+
+
+class _StdoutDispatcher:
+    """Bounded, fail-open writer that keeps stdout I/O off the caller path."""
+
+    def __init__(self, max_queue_size: int) -> None:
+        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=max_queue_size)
+        self._closed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._drain,
+            name="foundry-runtime-observability-stdout",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def offer(self, envelope: bytes) -> bool:
+        if self._closed.is_set():
+            return False
+        try:
+            self._queue.put_nowait(bytes(envelope))
+        except queue.Full:
+            return False
+        return True
+
+    def _drain(self) -> None:
+        while True:
+            envelope = self._queue.get()
+            try:
+                if envelope is None:
+                    return
+                self._write(envelope)
+            finally:
+                self._queue.task_done()
+            if self._closed.is_set():
+                return
+
+    @staticmethod
+    def _write(envelope: bytes) -> bool:
+        try:
+            stream = getattr(sys.stdout, "buffer", sys.stdout)
+            try:
+                stream.write(envelope + b"\n")
+            except TypeError:
+                stream.write((envelope + b"\n").decode("utf-8"))
+        except Exception:  # noqa: BLE001 - stdout is fail-open
+            return False
+        return True
+
+    def close(self) -> None:
+        self._closed.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            return
+
+
+_STDOUT_DISPATCHER = _StdoutDispatcher(128)
+_STDOUT_QUEUE_SIZE = 128
+
+
+def _offer_stdout(envelope: bytes, *, max_queue_size: int) -> bool:
+    global _STDOUT_DISPATCHER, _STDOUT_QUEUE_SIZE
+    with _STDOUT_LOCK:
+        if _STDOUT_DISPATCHER is None or _STDOUT_QUEUE_SIZE != max_queue_size:
+            if _STDOUT_DISPATCHER is not None:
+                _STDOUT_DISPATCHER.close()
+            _STDOUT_DISPATCHER = _StdoutDispatcher(max_queue_size)
+            _STDOUT_QUEUE_SIZE = max_queue_size
+        return _STDOUT_DISPATCHER.offer(envelope)
 
 
 def configure_runtime_observability(
@@ -275,12 +348,10 @@ def emit_runtime_event(event: Mapping[str, object]) -> None:
         mutable = dict(event)
         mutable["sampled"] = True
         envelope = serialize_event(mutable, max_bytes=config.max_bytes)
-        stream = getattr(sys.stdout, "buffer", sys.stdout)
-        try:
-            stream.write(envelope + b"\n")
-        except TypeError:
-            stream.write((envelope + b"\n").decode("utf-8"))
-        _COUNTERS.increment("events_emitted")
+        if _offer_stdout(envelope, max_queue_size=config.max_queue_size):
+            _COUNTERS.increment("events_emitted")
+        else:
+            _COUNTERS.increment("events_dropped")
         if config.sink_enabled and _SINK is not None:
             try:
                 result = _SINK.offer(bytes(envelope))

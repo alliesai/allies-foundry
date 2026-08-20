@@ -36,8 +36,17 @@ def _request_id_for(request) -> str:
 def _route_for(request) -> str:
     match = getattr(request, "resolver_match", None)
     route = getattr(match, "route", None)
-    if isinstance(route, str) and route.startswith("/"):
-        return route.split("?", 1)[0][:512]
+    if isinstance(route, str) and route.strip():
+        route = route.split("?", 1)[0].strip()
+        route = re.sub(
+            r"<(?:(?P<converter>[A-Za-z_][A-Za-z0-9_]*):)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)>",
+            lambda match: ":" + match.group("name"),
+            route,
+        )
+        route = re.sub(r"/[0-9a-fA-F-]{16,}", "/:id", route)
+        route = re.sub(r"/\d+", "/:id", route)
+        route = "/" + route.lstrip("/")
+        return route[:512]
     # Unmatched paths are intentionally reduced to a stable shape rather than
     # retaining user-controlled path segments or query strings.
     path = str(getattr(request, "path", ""))

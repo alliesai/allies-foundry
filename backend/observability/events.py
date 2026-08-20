@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from .settings import FoundryObservabilitySettings
+from .sinks import BoundedSinkDispatcher, OfferResult
 
 MAX_STRING_LENGTH = 256
 MAX_COLLECTION_ITEMS = 16
@@ -353,6 +354,38 @@ class EventCounters:
 
 
 _counters = EventCounters()
+_stdout_dispatcher: BoundedSinkDispatcher | None = None
+_stdout_queue_size: int | None = None
+_stdout_lock = threading.Lock()
+
+
+class _StdoutSink:
+    def offer(self, envelope: bytes) -> OfferResult:
+        stream = getattr(sys.stdout, "buffer", sys.stdout)
+        try:
+            stream.write(envelope + b"\n")
+        except TypeError:
+            stream.write((envelope + b"\n").decode("utf-8"))
+        return OfferResult(accepted=True, dropped=False)
+
+
+_stdout_dispatcher = BoundedSinkDispatcher(
+    _StdoutSink(), max_queue_size=128, enabled=True
+)
+_stdout_queue_size = 128
+
+
+def _offer_stdout(envelope: bytes, *, max_queue_size: int) -> OfferResult:
+    global _stdout_dispatcher, _stdout_queue_size
+    with _stdout_lock:
+        if _stdout_dispatcher is None or _stdout_queue_size != max_queue_size:
+            if _stdout_dispatcher is not None:
+                _stdout_dispatcher.close()
+            _stdout_dispatcher = BoundedSinkDispatcher(
+                _StdoutSink(), max_queue_size=max_queue_size, enabled=True
+            )
+            _stdout_queue_size = max_queue_size
+        return _stdout_dispatcher.offer(envelope)
 
 
 def event_counters() -> dict[str, int]:
@@ -393,12 +426,13 @@ def emit_event(
         mutable = dict(event)
         mutable["sampled"] = True
         envelope = serialize_event(mutable, max_bytes=selected_config.max_bytes)
-        stream = getattr(sys.stdout, "buffer", sys.stdout)
-        try:
-            stream.write(envelope + b"\n")
-        except TypeError:
-            stream.write((envelope + b"\n").decode("utf-8"))
-        _counters.increment("events_emitted")
+        stdout_result = _offer_stdout(
+            envelope, max_queue_size=selected_config.max_queue_size
+        )
+        if stdout_result.accepted:
+            _counters.increment("events_emitted")
+        else:
+            _counters.increment("events_dropped")
         if selected_config.sink_enabled and sink is not None:
             try:
                 result = sink.offer(bytes(envelope))

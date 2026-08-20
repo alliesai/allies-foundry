@@ -1,6 +1,8 @@
 import threading
 import time
 
+from observability import events
+from observability.settings import FoundryObservabilitySettings
 from observability.sinks import BoundedSinkDispatcher, OfferResult
 
 
@@ -72,3 +74,30 @@ def test_close_terminates_worker_and_rejects_later_offers():
     assert dispatcher.offer(b"after-close") == OfferResult(
         accepted=False, dropped=False
     )
+
+
+def test_stdout_write_isolated_from_event_caller(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingStream:
+        buffer = None
+
+        def __init__(self):
+            self.buffer = self
+
+        def write(self, value):
+            started.set()
+            release.wait(2)
+            return len(value)
+
+    monkeypatch.setattr(events.sys, "stdout", BlockingStream())
+    started_at = time.monotonic()
+    events.emit_event(
+        events.build_event("worker.idle", outcome="success"),
+        config=FoundryObservabilitySettings(success_sample_rate=1),
+    )
+
+    assert time.monotonic() - started_at < 0.5
+    assert started.wait(2)
+    release.set()

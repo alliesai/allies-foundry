@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 
 import pytest
 
@@ -8,9 +10,13 @@ from allies_runtime.config import WideEventSettings
 
 @pytest.fixture(autouse=True)
 def reset_runtime_observability_configuration():
+    dispatcher = observability._STDOUT_DISPATCHER
+    queue_size = observability._STDOUT_QUEUE_SIZE
     observability.configure_runtime_observability()
     yield
     observability.configure_runtime_observability()
+    observability._STDOUT_DISPATCHER = dispatcher
+    observability._STDOUT_QUEUE_SIZE = queue_size
 
 
 def test_build_event_redacts_payload_and_hashes_tenant_id(monkeypatch):
@@ -92,7 +98,13 @@ def test_emit_runtime_event_writes_json_and_counts(monkeypatch, capsys):
 
     observability.emit_runtime_event(observability.build_event("worker.idle"))
 
-    assert json.loads(capsys.readouterr().out)["event"] == "worker.idle"
+    output = ""
+    deadline = time.monotonic() + 2
+    while not output and time.monotonic() < deadline:
+        output = capsys.readouterr().out
+        if not output:
+            time.sleep(0.005)
+    assert json.loads(output)["event"] == "worker.idle"
     assert observability.event_counters()["events_emitted"] == before + 1
 
 
@@ -109,6 +121,8 @@ def test_runtime_settings_configuration_controls_emission(monkeypatch):
 
 
 def test_stdout_emission_does_not_flush_synchronously(monkeypatch):
+    written = threading.Event()
+
     class NoFlushStream:
         buffer = None
 
@@ -118,6 +132,7 @@ def test_stdout_emission_does_not_flush_synchronously(monkeypatch):
 
         def write(self, value):
             self.writes.append(value)
+            written.set()
             return len(value)
 
         def flush(self):
@@ -130,7 +145,84 @@ def test_stdout_emission_does_not_flush_synchronously(monkeypatch):
 
     observability.emit_runtime_event(observability.build_event("worker.idle"))
 
+    assert written.wait(2)
     assert len(stream.writes) == 1
+
+
+def test_stdout_write_blocking_does_not_block_event_caller(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingStream:
+        buffer = None
+
+        def __init__(self):
+            self.buffer = self
+
+        def write(self, value):
+            started.set()
+            release.wait(2)
+            return len(value)
+
+    monkeypatch.setattr(observability.sys, "stdout", BlockingStream())
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_SUCCESS_SAMPLE_RATE", "1")
+
+    started_at = time.monotonic()
+    observability.emit_runtime_event(observability.build_event("worker.idle"))
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.5
+    assert started.wait(2)
+    release.set()
+
+
+def test_stdout_queue_drop_is_fail_open(monkeypatch):
+    class FullDispatcher:
+        def offer(self, envelope):
+            return False
+
+    monkeypatch.setattr(observability, "_STDOUT_DISPATCHER", FullDispatcher())
+    monkeypatch.setattr(observability, "_STDOUT_QUEUE_SIZE", 128)
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_SUCCESS_SAMPLE_RATE", "1")
+    before = observability.event_counters()["events_dropped"]
+
+    observability.emit_runtime_event(observability.build_event("worker.idle"))
+
+    assert observability.event_counters()["events_dropped"] == before + 1
+
+
+def test_stdout_dispatcher_close_and_write_failures_are_fail_open(monkeypatch):
+    class TextOnlyStream:
+        buffer = None
+
+        def __init__(self):
+            self.buffer = self
+
+        def write(self, value):
+            if isinstance(value, bytes):
+                raise TypeError("text stream")
+            return len(value)
+
+    monkeypatch.setattr(observability.sys, "stdout", TextOnlyStream())
+    assert observability._StdoutDispatcher._write(b"event")
+
+    class BrokenStream:
+        buffer = None
+
+        def write(self, value):
+            raise OSError("stdout unavailable")
+
+    monkeypatch.setattr(observability.sys, "stdout", BrokenStream())
+    assert not observability._StdoutDispatcher._write(b"event")
+
+    dispatcher = observability._StdoutDispatcher(1)
+    thread = dispatcher._thread
+    dispatcher.close()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert not dispatcher.offer(b"after-close")
 
 
 def test_emit_runtime_event_drops_sampled_success(monkeypatch):
