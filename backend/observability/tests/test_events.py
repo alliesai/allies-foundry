@@ -8,6 +8,7 @@ from django.http import Http404, HttpResponse
 from django.test import RequestFactory
 from django.urls import Resolver404
 
+from observability import events as events_module
 from observability.events import (
     ALLOWED_EVENT_NAMES,
     MAX_COLLECTION_ITEMS,
@@ -178,3 +179,28 @@ def test_middleware_maps_framework_errors_to_client_status(
         WideEventMiddleware(response)(RequestFactory().get("/api/v1/fail"))
 
     assert captured[0]["status_code"] == status_code
+
+
+def test_error_rate_limit_drops_client_flood_but_retains_server_evidence(
+    monkeypatch,
+):
+    monkeypatch.setattr(events_module, "_error_rate_limiter", events_module._ErrorRateLimiter())
+    config = events_module.FoundryObservabilitySettings(success_sample_rate=1)
+    before_dropped = events_module.event_counters()["events_dropped"]
+    before_emitted = events_module.event_counters()["events_emitted"]
+
+    for _ in range(events_module._MAX_CLIENT_ERROR_EVENTS + 4):
+        events_module.emit_event(
+            events_module.build_event(
+                "http.request", status_code=401, outcome="error"
+            ),
+            config=config,
+        )
+    events_module.emit_event(
+        events_module.build_event("http.request", status_code=500, outcome="error"),
+        config=config,
+    )
+
+    counters = events_module.event_counters()
+    assert counters["events_dropped"] >= before_dropped + 4
+    assert counters["events_emitted"] >= before_emitted + 1

@@ -15,6 +15,8 @@ import random
 import re
 import sys
 import threading
+import time
+from collections import deque
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -354,6 +356,52 @@ class EventCounters:
 
 
 _counters = EventCounters()
+_ERROR_RATE_WINDOW_SECONDS = 1.0
+_MAX_CLIENT_ERROR_EVENTS = 16
+_MAX_SERVER_ERROR_EVENTS = 64
+
+
+class _ErrorRateLimiter:
+    """Keep request/provider error floods from monopolizing stdout capacity."""
+
+    def __init__(self) -> None:
+        self._events: dict[str, deque[float]] = {
+            "client": deque(),
+            "server": deque(),
+        }
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _bucket(event: Mapping[str, object]) -> tuple[str, int] | None:
+        status = event.get("status_code")
+        if type(status) is int and 400 <= status < 500:
+            return "client", _MAX_CLIENT_ERROR_EVENTS
+        if type(status) is int and 500 <= status <= 599:
+            return "server", _MAX_SERVER_ERROR_EVENTS
+        if event.get("outcome") in {"error", "failed"} or str(
+            event.get("event", "")
+        ).endswith(".failed"):
+            return "server", _MAX_SERVER_ERROR_EVENTS
+        return None
+
+    def allow(self, event: Mapping[str, object]) -> bool:
+        bucket = self._bucket(event)
+        if bucket is None:
+            return True
+        name, limit = bucket
+        now = time.monotonic()
+        cutoff = now - _ERROR_RATE_WINDOW_SECONDS
+        with self._lock:
+            recent = self._events[name]
+            while recent and recent[0] <= cutoff:
+                recent.popleft()
+            if len(recent) >= limit:
+                return False
+            recent.append(now)
+            return True
+
+
+_error_rate_limiter = _ErrorRateLimiter()
 _stdout_dispatcher: BoundedSinkDispatcher | None = None
 _stdout_queue_size: int | None = None
 _stdout_lock = threading.Lock()
@@ -425,6 +473,9 @@ def emit_event(
             return
         mutable = dict(event)
         mutable["sampled"] = True
+        if not _error_rate_limiter.allow(mutable):
+            _counters.increment("events_dropped")
+            return
         envelope = serialize_event(mutable, max_bytes=selected_config.max_bytes)
         stdout_result = _offer_stdout(
             envelope, max_queue_size=selected_config.max_queue_size

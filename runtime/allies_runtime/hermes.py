@@ -192,6 +192,51 @@ class CancellableHermesStream:
     cancel = aclose
 
 
+class _ObservedHermesStream:
+    """Add one provider lifecycle pair to an incremental Hermes stream."""
+
+    def __init__(
+        self,
+        stream: CancellableHermesStream,
+        on_finished: Callable[[BaseException | None], Any],
+    ) -> None:
+        self._stream = stream
+        self._on_finished = on_finished
+        self._finished = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> HermesEvent:
+        try:
+            return await self._stream.__anext__()
+        except StopAsyncIteration:
+            await self._finish(None)
+            raise
+        except BaseException as error:
+            await self._finish(error)
+            raise
+
+    async def _finish(self, error: BaseException | None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        result = self._on_finished(error)
+        if inspect.isawaitable(result):
+            await result
+
+    async def aclose(self) -> None:
+        try:
+            await self._stream.aclose()
+        finally:
+            # A worker closing after a terminal event is a successful stream
+            # completion; errors raised while reading have already finalized
+            # the pair in __anext__.
+            await self._finish(None)
+
+    cancel = aclose
+
+
 class _IncrementalHTTPStream:
     """Validate and normalize one bounded Hermes session stream."""
 
@@ -1138,12 +1183,44 @@ class HermesClient:
         message: str,
         *,
         session_key: str | None = None,
-    ) -> CancellableHermesStream:
+    ) -> _ObservedHermesStream:
         """Open an SSE response and yield events without buffering the body."""
 
+        started_at = time.monotonic()
         profile_id = _profile_path(profile_id)
         session_id = _session_path(session_id)
         message = validate_stream_message(message)
+        emit_runtime_event(
+            build_event(
+                "provider.operation.started",
+                operation="hermes_stream",
+                provider="hermes",
+                profile_id=profile_id,
+                session_id=session_id,
+                outcome="started",
+            )
+        )
+
+        def finish(error: BaseException | None) -> None:
+            fields = {
+                "operation": "hermes_stream",
+                "provider": "hermes",
+                "profile_id": profile_id,
+                "session_id": session_id,
+                "duration_ms": (time.monotonic() - started_at) * 1000,
+                "outcome": "error" if error is not None else "success",
+            }
+            if error is not None:
+                fields["error_type"] = type(error).__name__
+                fields["error_code"] = getattr(error, "code", None)
+                emit_runtime_event(
+                    build_event("provider.operation.failed", **fields)
+                )
+            else:
+                emit_runtime_event(
+                    build_event("provider.operation.succeeded", **fields)
+                )
+
         try:
             token = await asyncio.wait_for(
                 self._profile_credential(profile_id), self.settings.stream_timeout
@@ -1163,25 +1240,33 @@ class HermesClient:
                 ),
                 self.settings.stream_timeout,
             )
+            if not callable(getattr(response, "readline", None)):
+                response.close()
+                raise HermesMalformedResponse(
+                    "Hermes stream did not expose incremental reads"
+                )
+            return _ObservedHermesStream(
+                CancellableHermesStream(
+                    _IncrementalHTTPStream(
+                        response,
+                        profile_id,
+                        session_id,
+                        stream_timeout=self.settings.stream_timeout,
+                    )
+                ),
+                finish,
+            )
         except TimeoutError as exc:
-            raise HermesTimeout("Hermes stream timed out") from exc
-        except HermesError:
+            error = HermesTimeout("Hermes stream timed out")
+            finish(error)
+            raise error from exc
+        except HermesError as error:
+            finish(error)
             raise
         except (URLError, OSError, ConnectionError) as exc:
-            raise HermesDisconnected("Hermes stream disconnected") from exc
-        if not callable(getattr(response, "readline", None)):
-            response.close()
-            raise HermesMalformedResponse(
-                "Hermes stream did not expose incremental reads"
-            )
-        return CancellableHermesStream(
-            _IncrementalHTTPStream(
-                response,
-                profile_id,
-                session_id,
-                stream_timeout=self.settings.stream_timeout,
-            )
-        )
+            error = HermesDisconnected("Hermes stream disconnected")
+            finish(error)
+            raise error from exc
 
 
 __all__ = [

@@ -163,6 +163,7 @@ def test_app_create_timeout_reconciles_by_deterministic_name():
 
 def test_provider_observes_direct_operations_once_and_aliases(monkeypatch):
     events = []
+    monkeypatch.setenv("ALLIES_OBSERVABILITY_DIGEST_KEY", "test-digest")
     monkeypatch.setattr(
         "runtime.providers.fly.emit_event",
         lambda event: events.append(event),
@@ -181,6 +182,7 @@ def test_provider_observes_direct_operations_once_and_aliases(monkeypatch):
     operations = [event["operation"] for event in events]
     assert operations == ["inspect_app", "inspect_app", "create_app", "create_app"]
     assert "ensure_app" not in operations
+    assert all(event["workspace_id"].startswith("id_") for event in events)
 
     machine_fake = FakeFlyTransport(
         [TransportResponse(200, fixture("machines.json"))]
@@ -191,10 +193,12 @@ def test_provider_observes_direct_operations_once_and_aliases(monkeypatch):
     ) is not None
     assert events[-2]["operation"] == "inspect_machine"
     assert events[-1]["operation"] == "inspect_machine"
+    assert all(event["workspace_id"].startswith("id_") for event in events)
 
 
 def test_wait_machine_only_emits_nested_inspection_pair(monkeypatch):
     events = []
+    monkeypatch.setenv("ALLIES_OBSERVABILITY_DIGEST_KEY", "test-digest")
     monkeypatch.setattr(
         "runtime.providers.fly.emit_event",
         lambda event: events.append(event),
@@ -206,12 +210,15 @@ def test_wait_machine_only_emits_nested_inspection_pair(monkeypatch):
         ]
     )
 
-    provider(fake).wait_machine("workspace-app", "machine-01", timeout_seconds=10)
+    provider(fake).wait_machine(
+        deterministic_app_name(WORKSPACE_ID), "machine-01", timeout_seconds=10
+    )
 
     assert [event["operation"] for event in events] == [
         "inspect_machine_by_id",
         "inspect_machine_by_id",
     ]
+    assert all(event["workspace_id"].startswith("id_") for event in events)
 
 
 def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():

@@ -51,6 +51,43 @@ _GENERATION_MARKER = "allies_machine_generation"
 _OWNER_MARKER = "allies_owner"
 _OWNER_VALUE = "foundry"
 _EXPECTED_CONTAINERS = frozenset(("hermes", "allies-runtime"))
+_DETERMINISTIC_APP_RE = re.compile(r"^allies-ws-([0-9a-f]{32})$")
+
+
+def _workspace_id_from_value(value: object, *, depth: int = 0) -> UUID | str | None:
+    """Find a workspace identity only from trusted provider boundary shapes."""
+
+    if depth > 2:
+        return None
+    if isinstance(value, UUID):
+        return value
+    if isinstance(value, str):
+        match = _DETERMINISTIC_APP_RE.fullmatch(value)
+        return UUID(hex=match.group(1)) if match else None
+    if isinstance(value, OwnershipMetadata):
+        return value.workspace_id
+    for attribute in ("ownership", "app_name", "name"):
+        nested = getattr(value, attribute, None)
+        if nested is not None and nested is not value:
+            workspace_id = _workspace_id_from_value(nested, depth=depth + 1)
+            if workspace_id is not None:
+                return workspace_id
+    return None
+
+
+def _workspace_id_for_call(
+    args: tuple[object, ...], kwargs: Mapping[str, object]
+) -> UUID | str | None:
+    explicit = kwargs.get("workspace_id")
+    if explicit is not None:
+        return explicit if isinstance(explicit, (UUID, str)) else None
+    for value in (*args, *kwargs.values()):
+        workspace_id = _workspace_id_from_value(value)
+        if workspace_id is not None:
+            return workspace_id
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class WorkspaceResourceNames:
     """Stable Fly names derived solely from immutable workspace identity."""
@@ -76,14 +113,7 @@ def _observed_provider_operation(method):
     def observed(self, *args, **kwargs):
         started_at = time.monotonic()
         operation = method.__name__
-        workspace_id = kwargs.get("workspace_id")
-        if workspace_id is None:
-            for candidate in args:
-                ownership = getattr(candidate, "ownership", None)
-                if ownership is not None:
-                    workspace_id = getattr(ownership, "workspace_id", None)
-                    if workspace_id is not None:
-                        break
+        workspace_id = _workspace_id_for_call(args, kwargs)
         fields = {
             "operation": operation,
             "provider": "fly",

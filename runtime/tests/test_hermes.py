@@ -357,6 +357,47 @@ async def test_incremental_profile_stream_sends_stable_session_key(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_incremental_profile_stream_emits_one_provider_lifecycle_pair(
+    monkeypatch,
+):
+    class Response(FakeResponse):
+        def __init__(self):
+            super().__init__()
+            self.rows = iter(
+                [
+                    b"event: run.started\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                    b"event: run.completed\n",
+                    b'data: {"session_id":"s1","run_id":"r1","completed":true,"messages":[{"role":"assistant","content":"hello"}]}\n',
+                    b"\n",
+                    b"event: done\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                ]
+            )
+
+        def readline(self, _limit):
+            return next(self.rows, b"")
+
+    events = []
+    monkeypatch.setattr(
+        "allies_runtime.hermes.emit_runtime_event",
+        lambda event: events.append(event),
+    )
+    client, _ = _client(monkeypatch, Response())
+
+    stream = await client.stream_profile_incremental("ally-a", "s1", "hello")
+    events_from_stream = [event async for event in stream]
+
+    assert [event.name for event in events_from_stream] == ["execution.completed"]
+    assert [event["event"] for event in events] == [
+        "provider.operation.started",
+        "provider.operation.succeeded",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_incremental_profile_stream_passes_overall_deadline_to_adapter(monkeypatch):
     class Response:
         def __init__(self):
