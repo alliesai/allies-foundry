@@ -294,6 +294,27 @@ def test_error_rate_limit_drops_client_flood_but_retains_server_evidence(monkeyp
     assert counters["events_emitted"] >= before_emitted + 1
 
 
+def test_error_rate_limiter_bounds_successful_http_flood(monkeypatch):
+    monkeypatch.setattr(
+        observability,
+        "_ERROR_RATE_LIMITER",
+        observability._ErrorRateLimiter(),
+    )
+    monkeypatch.setattr(observability, "_offer_stdout", lambda *_args, **_kwargs: True)
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_SUCCESS_SAMPLE_RATE", "1")
+    before_dropped = observability.event_counters()["events_dropped"]
+
+    for _ in range(observability._MAX_SUCCESS_EVENTS + 4):
+        observability.emit_runtime_event(
+            observability.build_event(
+                "http.request", status_code=200, outcome="success"
+            )
+        )
+
+    assert observability.event_counters()["events_dropped"] >= before_dropped + 4
+
+
 def test_sink_failure_is_fail_open(monkeypatch):
     class BrokenSink:
         def offer(self, envelope):

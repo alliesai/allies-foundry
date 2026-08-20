@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from django.core.exceptions import PermissionDenied, SuspiciousOperation
 from django.http import Http404, HttpResponse
-from django.test import RequestFactory
+from django.test import Client, RequestFactory
 from django.urls import Resolver404
 
 from observability import events as events_module
@@ -160,6 +160,43 @@ def test_middleware_emits_error_event_and_re_raises(monkeypatch):
     assert captured[0]["error_type"] == "ValueError"
 
 
+def test_django_exception_response_echoes_request_id_after_conversion(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        "observability.middleware.emit_event",
+        lambda event, **kwargs: captured.append(event),
+    )
+
+    response = Client().get(
+        "/not-found",
+        HTTP_HOST="localhost",
+        HTTP_X_REQUEST_ID="req_chain",
+    )
+
+    assert response.status_code == 404
+    assert response["X-Request-ID"] == "req_chain"
+    assert captured[0]["status_code"] == 404
+
+
+@pytest.mark.parametrize("supplied", ["bad id", "x" * 129])
+def test_middleware_replaces_invalid_or_oversized_request_id(monkeypatch, supplied):
+    captured = []
+    monkeypatch.setattr(
+        "observability.middleware.emit_event",
+        lambda event, **kwargs: captured.append(event),
+    )
+
+    response = WideEventMiddleware(
+        lambda _request: HttpResponse(status=200)
+    )(RequestFactory().get("/healthz", HTTP_X_REQUEST_ID=supplied))
+
+    generated = response["X-Request-ID"]
+    assert generated != supplied
+    assert generated.startswith("req_")
+    assert len(generated) <= 128
+    assert captured[0]["request_id"] == generated
+
+
 @pytest.mark.parametrize(
     ("error_type", "status_code"),
     [
@@ -211,6 +248,29 @@ def test_error_rate_limit_drops_client_flood_but_retains_server_evidence(
     counters = events_module.event_counters()
     assert counters["events_dropped"] >= before_dropped + 4
     assert counters["events_emitted"] >= before_emitted + 1
+
+
+def test_error_rate_limiter_bounds_successful_http_flood(monkeypatch):
+    monkeypatch.setattr(events_module, "_error_rate_limiter", events_module._ErrorRateLimiter())
+    monkeypatch.setattr(
+        events_module,
+        "_offer_stdout",
+        lambda *_args, **_kwargs: events_module.OfferResult(
+            accepted=True, dropped=False
+        ),
+    )
+    config = events_module.FoundryObservabilitySettings(success_sample_rate=1)
+    before_dropped = events_module.event_counters()["events_dropped"]
+
+    for _ in range(events_module._MAX_SUCCESS_EVENTS + 4):
+        events_module.emit_event(
+            events_module.build_event(
+                "http.request", status_code=200, outcome="success"
+            ),
+            config=config,
+        )
+
+    assert events_module.event_counters()["events_dropped"] >= before_dropped + 4
 
 
 def test_stdout_write_failures_are_counted(monkeypatch):

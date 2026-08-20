@@ -370,15 +370,17 @@ _counters = EventCounters()
 _ERROR_RATE_WINDOW_SECONDS = 1.0
 _MAX_CLIENT_ERROR_EVENTS = 16
 _MAX_SERVER_ERROR_EVENTS = 64
+_MAX_SUCCESS_EVENTS = 1024
 
 
 class _ErrorRateLimiter:
-    """Keep request/provider error floods from monopolizing stdout capacity."""
+    """Keep request/provider floods from monopolizing stdout capacity."""
 
     def __init__(self) -> None:
         self._events: dict[str, deque[float]] = {
             "client": deque(),
             "server": deque(),
+            "success": deque(),
         }
         self._lock = threading.Lock()
 
@@ -393,6 +395,8 @@ class _ErrorRateLimiter:
             event.get("event", "")
         ).endswith(".failed"):
             return "server", _MAX_SERVER_ERROR_EVENTS
+        if type(status) is int and 200 <= status < 300:
+            return "success", _MAX_SUCCESS_EVENTS
         return None
 
     def allow(self, event: Mapping[str, object]) -> bool:

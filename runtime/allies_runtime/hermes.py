@@ -227,14 +227,24 @@ class _ObservedHermesStream:
         if inspect.isawaitable(result):
             await result
 
+    def mark_completed(self) -> None:
+        """Mark a yielded terminal event before an eager consumer closes."""
+
+        self._completed = True
+
     async def aclose(self) -> None:
         try:
             await self._stream.aclose()
         finally:
-            if not self._completed:
-                # Closing before the iterator reaches StopAsyncIteration is an
-                # interrupted provider operation, not a successful stream.
-                await self._finish(HermesDisconnected("Hermes stream closed"))
+            # A consumer may close immediately after receiving the terminal
+            # event, before requesting the iterator's final StopAsyncIteration.
+            # Only that explicit completion marker is allowed to produce
+            # success; every other early close is an interrupted operation.
+            await self._finish(
+                None
+                if self._completed
+                else HermesDisconnected("Hermes stream closed")
+            )
 
     cancel = aclose
 
