@@ -1,0 +1,95 @@
+"""Django request boundary for bounded ``http.request`` events."""
+
+from __future__ import annotations
+
+import contextvars
+import re
+import time
+from uuid import uuid4
+
+from django.conf import settings
+
+from .events import build_event, emit_event
+
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "foundry_request_id", default=None
+)
+
+
+def current_request_id() -> str | None:
+    return _request_id.get()
+
+
+def _request_id_for(request) -> str:
+    supplied = request.META.get("HTTP_X_REQUEST_ID", "")
+    if isinstance(supplied, str):
+        supplied = supplied.strip()
+    if isinstance(supplied, str) and _REQUEST_ID_RE.fullmatch(supplied):
+        return supplied[:128]
+    return f"req_{uuid4().hex}"
+
+
+def _route_for(request) -> str:
+    match = getattr(request, "resolver_match", None)
+    route = getattr(match, "route", None)
+    if isinstance(route, str) and route.startswith("/"):
+        return route.split("?", 1)[0][:512]
+    # Unmatched paths are intentionally reduced to a stable shape rather than
+    # retaining user-controlled path segments or query strings.
+    path = str(getattr(request, "path", ""))
+    parts = [part for part in path.split("/") if part]
+    safe = [":id" if (part.isdigit() or len(part) > 32) else "*" for part in parts]
+    return "/" + "/".join(safe) if safe else "/"
+
+
+class WideEventMiddleware:
+    """Emit one final request event while preserving response/error semantics."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        request_id = _request_id_for(request)
+        request.request_id = request_id
+        token = _request_id.set(request_id)
+        started = time.monotonic()
+        response = None
+        error: BaseException | None = None
+        try:
+            response = self.get_response(request)
+            return response
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            duration_ms = (time.monotonic() - started) * 1000
+            status_code = getattr(response, "status_code", 500 if error else 200)
+            outcome = "error" if error is not None or status_code >= 400 else "success"
+            fields: dict[str, object] = {
+                "request_id": request_id,
+                "method": getattr(request, "method", "GET"),
+                "route": _route_for(request),
+                "status_code": status_code,
+                "duration_ms": duration_ms,
+                "outcome": outcome,
+            }
+            if error is not None:
+                fields["error_type"] = type(error).__name__
+                error_code = getattr(error, "code", None)
+                if isinstance(error_code, str):
+                    fields["error_code"] = error_code
+            emit_event(
+                build_event("http.request", **fields),
+                sink=getattr(settings, "FOUNDRY_EVENT_SINK", None),
+                config=getattr(settings, "FOUNDRY_OBSERVABILITY", None),
+            )
+            if response is not None:
+                response["X-Request-ID"] = request_id
+            _request_id.reset(token)
+
+
+RequestObservabilityMiddleware = WideEventMiddleware
+
+
+__all__ = ["RequestObservabilityMiddleware", "WideEventMiddleware", "current_request_id"]

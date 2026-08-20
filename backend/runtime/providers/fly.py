@@ -11,11 +11,14 @@ from __future__ import annotations
 import base64
 import os
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
+
+from observability.events import build_event, emit_event
 
 from .domain import (
     AppRecord,
@@ -47,6 +50,29 @@ _GENERATION_MARKER = "allies_machine_generation"
 _OWNER_MARKER = "allies_owner"
 _OWNER_VALUE = "foundry"
 _EXPECTED_CONTAINERS = frozenset(("hermes", "allies-runtime"))
+_OBSERVED_PROVIDER_METHODS = frozenset(
+    {
+        "inspect_app",
+        "create_app",
+        "ensure_app",
+        "list_volumes",
+        "create_volume",
+        "ensure_volume",
+        "inspect_machine",
+        "inspect_machine_by_id",
+        "create_machine",
+        "ensure_machine",
+        "wait_machine",
+        "start_machine",
+        "stop_machine",
+        "destroy_machine",
+        "delete_volume",
+        "delete_app",
+        "acquire_machine_lease",
+        "release_machine_lease",
+        "check_volume_attachment",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +125,62 @@ def deterministic_resource_names(workspace_id: UUID | str) -> WorkspaceResourceN
 
 class FlyProvider:
     """Translate Fly REST resources into provider-neutral records."""
+
+    def __getattribute__(self, name: str):
+        value = super().__getattribute__(name)
+        if name not in _OBSERVED_PROVIDER_METHODS or not callable(value):
+            return value
+
+        def observed(*args, **kwargs):
+            started_at = time.monotonic()
+            operation = name
+            workspace_id = kwargs.get("workspace_id")
+            if workspace_id is None and args:
+                first = args[0]
+                ownership = getattr(first, "ownership", None)
+                workspace_id = getattr(ownership, "workspace_id", None)
+            fields = {
+                "operation": operation,
+                "provider": "fly",
+                "workspace_id": str(workspace_id) if workspace_id is not None else None,
+                "outcome": "started",
+            }
+            emit_event(build_event("provider.operation.started", **fields))
+            try:
+                result = value(*args, **kwargs)
+            except BaseException as error:
+                emit_event(
+                    build_event(
+                        "provider.operation.failed",
+                        operation=operation,
+                        provider="fly",
+                        workspace_id=(
+                            str(workspace_id) if workspace_id is not None else None
+                        ),
+                        duration_ms=(time.monotonic() - started_at) * 1000,
+                        outcome="error",
+                        error_type=type(error).__name__,
+                        error_code=getattr(error, "code", None),
+                    )
+                )
+                raise
+            resource_id = getattr(result, "id", None)
+            emit_event(
+                build_event(
+                    "provider.operation.succeeded",
+                    operation=operation,
+                    provider="fly",
+                    workspace_id=(
+                        str(workspace_id) if workspace_id is not None else None
+                    ),
+                    provider_resource_id=resource_id,
+                    duration_ms=(time.monotonic() - started_at) * 1000,
+                    outcome="success",
+                )
+            )
+            return result
+
+        return observed
 
     def __init__(
         self,

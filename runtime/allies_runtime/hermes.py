@@ -32,6 +32,7 @@ from .errors import (
     HermesTimeout,
     HermesUnavailable,
 )
+from .observability import build_event, emit_runtime_event
 
 _PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -1088,9 +1089,47 @@ class HermesClient:
         *,
         session_key: str | None = None,
     ) -> HermesStreamResult:
-        return await self.stream(
-            profile_id, session_id, message, session_key=session_key
+        started_at = time.monotonic()
+        emit_runtime_event(
+            build_event(
+                "provider.operation.started",
+                operation="hermes_stream",
+                provider="hermes",
+                profile_id=profile_id,
+                session_id=session_id,
+                outcome="started",
+            )
         )
+        try:
+            result = await self.stream(
+                profile_id, session_id, message, session_key=session_key
+            )
+        except BaseException as error:
+            emit_runtime_event(
+                build_event(
+                    "provider.operation.failed",
+                    operation="hermes_stream",
+                    provider="hermes",
+                    profile_id=profile_id,
+                    session_id=session_id,
+                    duration_ms=(time.monotonic() - started_at) * 1000,
+                    outcome="error",
+                    error_type=type(error).__name__,
+                )
+            )
+            raise
+        emit_runtime_event(
+            build_event(
+                "provider.operation.succeeded",
+                operation="hermes_stream",
+                provider="hermes",
+                profile_id=profile_id,
+                session_id=session_id,
+                duration_ms=(time.monotonic() - started_at) * 1000,
+                outcome="success",
+            )
+        )
+        return result
 
     async def stream_profile_incremental(
         self,
