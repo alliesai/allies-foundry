@@ -272,7 +272,7 @@ def build_event(kind: str, **fields: object) -> dict[str, object]:
     if kind not in ALLOWED_EVENT_NAMES:
         raise ValueError("event name is not allowlisted")
     environment = os.getenv("ALLIES_ENVIRONMENT", os.getenv("DJANGO_ENVIRONMENT", "development"))
-    revision = os.getenv("ALLIES_REVISION", os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"))
+    revision = os.getenv("ALLIES_REVISION", "unknown")
     base: dict[str, object] = {
         "schema_version": 1,
         "event": kind,
