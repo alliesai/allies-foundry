@@ -1,6 +1,19 @@
 import json
+from pathlib import Path
 
-from observability.events import build_event, identifier_fingerprint, serialize_event
+import pytest
+from django.http import HttpResponse
+from django.test import RequestFactory
+
+from observability.events import (
+    ALLOWED_EVENT_NAMES,
+    MAX_COLLECTION_ITEMS,
+    build_event,
+    identifier_fingerprint,
+    serialize_event,
+)
+from observability.middleware import WideEventMiddleware, current_request_id
+from observability.settings import MAX_WIDE_EVENT_BYTES
 
 
 def test_event_is_allowlisted_and_redacts_sensitive_text(monkeypatch):
@@ -42,3 +55,75 @@ def test_event_strings_match_shared_contract_limit(monkeypatch):
     event = build_event("runtime.operation.failed", message="x" * 512)
 
     assert len(event["message"]) <= 256
+
+
+def test_event_implementation_conforms_to_shared_contract():
+    contract = json.loads(
+        (
+            Path(__file__).resolve().parents[3]
+            / "docs/contracts/observability/wide-event-v1.json"
+        ).read_text()
+    )
+    assert ALLOWED_EVENT_NAMES <= set(contract["events"])
+    assert MAX_COLLECTION_ITEMS == contract["limits"]["max_collection_items"]
+    assert MAX_WIDE_EVENT_BYTES == contract["limits"]["max_event_bytes"]
+
+    event = build_event(
+        "task.started",
+        task_name="runtime.tasks.profile_turn",
+        task_id="task_123",
+        queue="default",
+        outcome="started",
+    )
+    encoded = json.loads(serialize_event(event))
+    assert set(contract["required"]) <= set(encoded)
+    assert set(encoded) <= set(contract["required"]) | set(contract["optional"])
+
+
+def test_middleware_emits_request_event_and_propagates_request_id(monkeypatch):
+    factory = RequestFactory()
+    captured = []
+
+    def response(request):
+        assert current_request_id() == "req_client"
+        return HttpResponse(status=202)
+
+    middleware = WideEventMiddleware(response)
+    request = factory.get(
+        "/api/v1/workspaces/123?secret=hidden", HTTP_X_REQUEST_ID="req_client"
+    )
+    monkeypatch.setattr(
+        "observability.middleware.emit_event",
+        lambda event, **kwargs: captured.append(event),
+    )
+
+    result = middleware(request)
+
+    assert result.status_code == 202
+    assert result["X-Request-ID"] == "req_client"
+    assert current_request_id() is None
+    assert captured[0]["event"] == "http.request"
+    assert captured[0]["outcome"] == "success"
+    assert captured[0]["status_code"] == 202
+    assert captured[0]["request_id"] == "req_client"
+    assert captured[0]["route"].endswith("/:id")
+
+
+def test_middleware_emits_error_event_and_re_raises(monkeypatch):
+    captured = []
+
+    def response(_request):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(
+        "observability.middleware.emit_event",
+        lambda event, **kwargs: captured.append(event),
+    )
+
+    with pytest.raises(ValueError, match="boom"):
+        WideEventMiddleware(response)(RequestFactory().get("/api/v1/fail"))
+
+    assert captured[0]["event"] == "http.request"
+    assert captured[0]["outcome"] == "error"
+    assert captured[0]["status_code"] == 500
+    assert captured[0]["error_type"] == "ValueError"

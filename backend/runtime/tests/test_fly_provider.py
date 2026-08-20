@@ -161,6 +161,38 @@ def test_app_create_timeout_reconciles_by_deterministic_name():
     }
 
 
+def test_provider_observes_direct_operations_once_and_aliases(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "runtime.providers.fly.emit_event",
+        lambda event: events.append(event),
+    )
+    fake = FakeFlyTransport(
+        [
+            TransportResponse(404, {}),
+            TransportResponse(200, fixture("app.json")),
+        ]
+    )
+    result = provider(fake).ensure_app(
+        AppSpec(deterministic_app_name(WORKSPACE_ID), "allies-pilot", "ams")
+    )
+
+    assert result.id == "app-01"
+    operations = [event["operation"] for event in events]
+    assert operations == ["inspect_app", "inspect_app", "create_app", "create_app"]
+    assert "ensure_app" not in operations
+
+    machine_fake = FakeFlyTransport(
+        [TransportResponse(200, fixture("machines.json"))]
+    )
+    machine_provider = provider(machine_fake)
+    assert machine_provider.reconcile_machine(
+        deterministic_app_name(WORKSPACE_ID), deterministic_machine_name(WORKSPACE_ID, 1)
+    ) is not None
+    assert events[-2]["operation"] == "inspect_machine"
+    assert events[-1]["operation"] == "inspect_machine"
+
+
 def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     fake = FakeFlyTransport([TransportResponse(200, fixture("machines.json")[0])])
     result = provider(fake).create_machine(machine_spec())

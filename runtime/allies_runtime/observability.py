@@ -17,10 +17,16 @@ from typing import Any, Protocol
 from .config import WideEventSettings
 
 MAX_STRING_LENGTH = 256
+MAX_COLLECTION_ITEMS = 16
 MAX_EVENT_DEPTH = 3
+DEFAULT_MAX_EVENT_BYTES = 16 * 1024
 ALLOWED_EVENT_NAMES = frozenset(
     {
         "http.request",
+        "task.started",
+        "task.succeeded",
+        "task.failed",
+        "task.retried",
         "runtime.operation.started",
         "runtime.operation.succeeded",
         "runtime.operation.failed",
@@ -59,6 +65,7 @@ _FIELDS = frozenset(
         "outcome",
         "error_type",
         "error_code",
+        "error_fingerprint",
         "reason_code",
         "message",
         "operation",
@@ -72,8 +79,12 @@ _FIELDS = frozenset(
         "profile_id",
         "session_id",
         "run_id",
+        "task_name",
+        "task_id",
+        "queue",
         "retry_count",
         "sampled",
+        "truncated",
     }
 )
 
@@ -122,7 +133,16 @@ def _value(name: str, value: object) -> object | None:
         return _identifier(value)
     if name == "error_type":
         return value[:96] if isinstance(value, str) and _CLASS_RE.fullmatch(value) else None
-    if name in {"error_code", "reason_code", "operation", "provider"}:
+    if name in {
+        "error_code",
+        "error_fingerprint",
+        "reason_code",
+        "operation",
+        "provider",
+        "task_name",
+        "task_id",
+        "queue",
+    }:
         return value[:64] if isinstance(value, str) and _CODE_RE.fullmatch(value) else None
     if name == "route":
         if not isinstance(value, str):
@@ -135,6 +155,8 @@ def _value(name: str, value: object) -> object | None:
     if name == "retry_count":
         return value if type(value) is int and 0 <= value <= 1_000_000 else None
     if name == "sampled":
+        return value if isinstance(value, bool) else None
+    if name == "truncated":
         return value if isinstance(value, bool) else None
     if isinstance(value, str):
         return _text(value)
@@ -163,6 +185,7 @@ def build_event(kind: str, **fields: object) -> dict[str, object]:
         "process": "runtime",
         "environment": os.getenv("ALLIES_ENVIRONMENT", "development"),
         "revision": os.getenv("ALLIES_REVISION", "unknown"),
+        "outcome": "unknown",
         "sampled": True,
     }
     for name, value in fields.items():
@@ -183,7 +206,8 @@ def serialize_event(event: Mapping[str, object], *, max_bytes: int | None = None
     }
     safe.setdefault("schema_version", 1)
     safe.setdefault("occurred_at", datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"))
-    limit = max_bytes or _settings().max_bytes
+    safe.setdefault("outcome", "unknown")
+    limit = max_bytes or _settings().max_bytes or DEFAULT_MAX_EVENT_BYTES
     raw = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if len(raw) <= limit:
         return raw
@@ -212,10 +236,14 @@ class EventCounters:
 
 _COUNTERS = EventCounters()
 _SINK: EventSink | None = None
+_CONFIG: WideEventSettings | None = None
 
 
-def configure_runtime_observability(*, sink: EventSink | None = None) -> None:
-    global _SINK
+def configure_runtime_observability(
+    *, config: WideEventSettings | None = None, sink: EventSink | None = None
+) -> None:
+    global _CONFIG, _SINK
+    _CONFIG = config
     _SINK = sink
 
 
@@ -237,7 +265,7 @@ def emit_runtime_event(event: Mapping[str, object]) -> None:
     """Emit a runtime event without allowing logging failures to escape."""
 
     try:
-        config = _settings()
+        config = _CONFIG or _settings()
         if not config.enabled:
             _COUNTERS.increment("events_dropped")
             return
@@ -252,7 +280,6 @@ def emit_runtime_event(event: Mapping[str, object]) -> None:
             stream.write(envelope + b"\n")
         except TypeError:
             stream.write((envelope + b"\n").decode("utf-8"))
-        stream.flush()
         _COUNTERS.increment("events_emitted")
         if config.sink_enabled and _SINK is not None:
             try:

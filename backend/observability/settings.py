@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from django.core.exceptions import ImproperlyConfigured
 
-MAX_WIDE_EVENT_BYTES = 64 * 1024
+MAX_WIDE_EVENT_BYTES = 16 * 1024
 MAX_WIDE_EVENT_QUEUE_SIZE = 4096
 
 

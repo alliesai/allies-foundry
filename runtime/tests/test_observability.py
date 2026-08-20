@@ -3,6 +3,14 @@ import json
 import pytest
 
 from allies_runtime import observability
+from allies_runtime.config import WideEventSettings
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime_observability_configuration():
+    observability.configure_runtime_observability()
+    yield
+    observability.configure_runtime_observability()
 
 
 def test_build_event_redacts_payload_and_hashes_tenant_id(monkeypatch):
@@ -86,6 +94,43 @@ def test_emit_runtime_event_writes_json_and_counts(monkeypatch, capsys):
 
     assert json.loads(capsys.readouterr().out)["event"] == "worker.idle"
     assert observability.event_counters()["events_emitted"] == before + 1
+
+
+def test_runtime_settings_configuration_controls_emission(monkeypatch):
+    monkeypatch.delenv("ALLIES_WIDE_EVENTS_ENABLED", raising=False)
+    observability.configure_runtime_observability(
+        config=WideEventSettings(enabled=False)
+    )
+    before = observability.event_counters()["events_dropped"]
+
+    observability.emit_runtime_event(observability.build_event("worker.idle"))
+
+    assert observability.event_counters()["events_dropped"] == before + 1
+
+
+def test_stdout_emission_does_not_flush_synchronously(monkeypatch):
+    class NoFlushStream:
+        buffer = None
+
+        def __init__(self):
+            self.buffer = self
+            self.writes = []
+
+        def write(self, value):
+            self.writes.append(value)
+            return len(value)
+
+        def flush(self):
+            raise AssertionError("wide-event emission must not synchronously flush")
+
+    stream = NoFlushStream()
+    monkeypatch.setattr(observability.sys, "stdout", stream)
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_SUCCESS_SAMPLE_RATE", "1")
+
+    observability.emit_runtime_event(observability.build_event("worker.idle"))
+
+    assert len(stream.writes) == 1
 
 
 def test_emit_runtime_event_drops_sampled_success(monkeypatch):

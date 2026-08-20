@@ -14,6 +14,7 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -50,31 +51,6 @@ _GENERATION_MARKER = "allies_machine_generation"
 _OWNER_MARKER = "allies_owner"
 _OWNER_VALUE = "foundry"
 _EXPECTED_CONTAINERS = frozenset(("hermes", "allies-runtime"))
-_OBSERVED_PROVIDER_METHODS = frozenset(
-    {
-        "inspect_app",
-        "create_app",
-        "ensure_app",
-        "list_volumes",
-        "create_volume",
-        "ensure_volume",
-        "inspect_machine",
-        "inspect_machine_by_id",
-        "create_machine",
-        "ensure_machine",
-        "wait_machine",
-        "start_machine",
-        "stop_machine",
-        "destroy_machine",
-        "delete_volume",
-        "delete_app",
-        "acquire_machine_lease",
-        "release_machine_lease",
-        "check_volume_attachment",
-    }
-)
-
-
 @dataclass(frozen=True, slots=True)
 class WorkspaceResourceNames:
     """Stable Fly names derived solely from immutable workspace identity."""
@@ -87,6 +63,68 @@ class WorkspaceResourceNames:
         if type(generation) is not int or generation <= 0:
             raise ValueError("machine generation must be a positive integer")
         return deterministic_machine_name(self.workspace_id, generation)
+
+
+def _observed_provider_operation(method):
+    """Emit one lifecycle pair for a direct provider operation.
+
+    Composite reconciliation helpers intentionally remain undecorated. Their
+    direct HTTP operations are observed once, avoiding nested duplicate events.
+    """
+
+    @wraps(method)
+    def observed(self, *args, **kwargs):
+        started_at = time.monotonic()
+        operation = method.__name__
+        workspace_id = kwargs.get("workspace_id")
+        if workspace_id is None:
+            for candidate in args:
+                ownership = getattr(candidate, "ownership", None)
+                if ownership is not None:
+                    workspace_id = getattr(ownership, "workspace_id", None)
+                    if workspace_id is not None:
+                        break
+        fields = {
+            "operation": operation,
+            "provider": "fly",
+            "workspace_id": str(workspace_id) if workspace_id is not None else None,
+            "outcome": "started",
+        }
+        emit_event(build_event("provider.operation.started", **fields))
+        try:
+            result = method(self, *args, **kwargs)
+        except BaseException as error:
+            emit_event(
+                build_event(
+                    "provider.operation.failed",
+                    operation=operation,
+                    provider="fly",
+                    workspace_id=(
+                        str(workspace_id) if workspace_id is not None else None
+                    ),
+                    duration_ms=(time.monotonic() - started_at) * 1000,
+                    outcome="error",
+                    error_type=type(error).__name__,
+                    error_code=getattr(error, "code", None),
+                )
+            )
+            raise
+        emit_event(
+            build_event(
+                "provider.operation.succeeded",
+                operation=operation,
+                provider="fly",
+                workspace_id=(
+                    str(workspace_id) if workspace_id is not None else None
+                ),
+                provider_resource_id=getattr(result, "id", None),
+                duration_ms=(time.monotonic() - started_at) * 1000,
+                outcome="success",
+            )
+        )
+        return result
+
+    return observed
 
 
 def _workspace_text(workspace_id: UUID | str) -> str:
@@ -125,62 +163,6 @@ def deterministic_resource_names(workspace_id: UUID | str) -> WorkspaceResourceN
 
 class FlyProvider:
     """Translate Fly REST resources into provider-neutral records."""
-
-    def __getattribute__(self, name: str):
-        value = super().__getattribute__(name)
-        if name not in _OBSERVED_PROVIDER_METHODS or not callable(value):
-            return value
-
-        def observed(*args, **kwargs):
-            started_at = time.monotonic()
-            operation = name
-            workspace_id = kwargs.get("workspace_id")
-            if workspace_id is None and args:
-                first = args[0]
-                ownership = getattr(first, "ownership", None)
-                workspace_id = getattr(ownership, "workspace_id", None)
-            fields = {
-                "operation": operation,
-                "provider": "fly",
-                "workspace_id": str(workspace_id) if workspace_id is not None else None,
-                "outcome": "started",
-            }
-            emit_event(build_event("provider.operation.started", **fields))
-            try:
-                result = value(*args, **kwargs)
-            except BaseException as error:
-                emit_event(
-                    build_event(
-                        "provider.operation.failed",
-                        operation=operation,
-                        provider="fly",
-                        workspace_id=(
-                            str(workspace_id) if workspace_id is not None else None
-                        ),
-                        duration_ms=(time.monotonic() - started_at) * 1000,
-                        outcome="error",
-                        error_type=type(error).__name__,
-                        error_code=getattr(error, "code", None),
-                    )
-                )
-                raise
-            resource_id = getattr(result, "id", None)
-            emit_event(
-                build_event(
-                    "provider.operation.succeeded",
-                    operation=operation,
-                    provider="fly",
-                    workspace_id=(
-                        str(workspace_id) if workspace_id is not None else None
-                    ),
-                    provider_resource_id=resource_id,
-                    duration_ms=(time.monotonic() - started_at) * 1000,
-                    outcome="success",
-                )
-            )
-            return result
-
-        return observed
 
     def __init__(
         self,
@@ -245,6 +227,7 @@ class FlyProvider:
                 "Fly runtime-container file secrets are not enabled"
             )
 
+    @_observed_provider_operation
     def inspect_app(
         self, name: str, organization: str | None = None
     ) -> AppRecord | None:
@@ -269,6 +252,7 @@ class FlyProvider:
             )
         return app
 
+    @_observed_provider_operation
     def create_app(self, spec: AppSpec) -> AppRecord:
         payload = self.http.post(
             "/apps",
@@ -304,6 +288,7 @@ class FlyProvider:
                 return reconciled
             raise
 
+    @_observed_provider_operation
     def list_volumes(self, app_name: str) -> Sequence[VolumeRecord]:
         payload = self.http.get(
             f"/apps/{_path_segment(app_name)}/volumes",
@@ -322,6 +307,7 @@ class FlyProvider:
             for item in payload
         )
 
+    @_observed_provider_operation
     def create_volume(self, spec: VolumeSpec) -> VolumeRecord:
         payload = self.http.post(
             f"/apps/{_path_segment(spec.app_name)}/volumes",
@@ -371,6 +357,7 @@ class FlyProvider:
                 ) from timeout
             raise
 
+    @_observed_provider_operation
     def inspect_machine(
         self,
         app_name: str,
@@ -410,6 +397,7 @@ class FlyProvider:
             )
         return machine
 
+    @_observed_provider_operation
     def inspect_machine_by_id(
         self, app_name: str, machine_id: str
     ) -> MachineRecord | None:
@@ -425,6 +413,7 @@ class FlyProvider:
             app_name=app_name,
         )
 
+    @_observed_provider_operation
     def create_machine(self, spec: MachineSpec) -> MachineRecord:
         body = self.machine_payload(spec)
         payload = self.http.post(
@@ -603,6 +592,7 @@ class FlyProvider:
             },
         }
 
+    @_observed_provider_operation
     def wait_machine(
         self,
         app_name: str,
@@ -635,6 +625,7 @@ class FlyProvider:
             fallback_id=machine_id,
         )
 
+    @_observed_provider_operation
     def start_machine(self, app_name: str, machine_id: str) -> MachineRecord:
         payload = self.http.post(
             f"/apps/{_path_segment(app_name)}/machines/{_path_segment(machine_id)}/start",
@@ -653,6 +644,7 @@ class FlyProvider:
             fallback_state=MachineState.STARTED,
         )
 
+    @_observed_provider_operation
     def stop_machine(self, app_name: str, machine_id: str) -> MachineRecord:
         payload = self.http.post(
             f"/apps/{_path_segment(app_name)}/machines/{_path_segment(machine_id)}/stop",
@@ -667,12 +659,14 @@ class FlyProvider:
             fallback_state=MachineState.STOPPED,
         )
 
+    @_observed_provider_operation
     def destroy_machine(self, app_name: str, machine_id: str) -> None:
         self.http.delete(
             f"/apps/{_path_segment(app_name)}/machines/{_path_segment(machine_id)}",
             operation="destroy_machine",
         )
 
+    @_observed_provider_operation
     def delete_volume(self, app_name: str, volume_id: str) -> None:
         """Delete a smoke-owned Volume; callers classify a 404 as idempotent."""
 
@@ -681,6 +675,7 @@ class FlyProvider:
             operation="delete_volume",
         )
 
+    @_observed_provider_operation
     def delete_app(self, app_name: str) -> None:
         """Delete a smoke-owned App after its Machine and Volume are gone."""
 
@@ -689,6 +684,7 @@ class FlyProvider:
             operation="delete_app",
         )
 
+    @_observed_provider_operation
     def acquire_machine_lease(
         self,
         app_name: str,
@@ -713,6 +709,7 @@ class FlyProvider:
             )
         return nonce
 
+    @_observed_provider_operation
     def release_machine_lease(
         self,
         app_name: str,
