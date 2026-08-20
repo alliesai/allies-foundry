@@ -664,9 +664,7 @@ def run_machine_replacement_proof(
         provider,
         sleep=sleep,
         jitter=False,
-        # The proof deadline governs the overall run; keep provider phase
-        # setup from failing before the first bounded proof poll can report it.
-        phase_deadline_seconds=min(max(config.timeout_seconds, 0.1), 180),
+        phase_deadline_seconds=min(config.timeout_seconds, 180),
     )
     state = ProofRunState(
         workspace_id=config.workspace_id,
