@@ -4,7 +4,7 @@
 
 - Problem: Foundry API and runtime failures currently require stitching together ordinary process output. Alpha operators need one bounded, privacy-safe event shape that can be correlated with Cloud requests and later sent to SigNoz.
 - Target users: Allies engineers and operators debugging Foundry API/runtime incidents.
-- Source docs/specs: Nabu `projects/allies/planning/obs-001-observability-foundation.md`; Docsyde wide-event pattern; `ENGINEERING_STYLE.md` (AL-05, AL-07–AL-12, FND-01, OSS-03–OSS-05).
+- Source docs/specs: Allies OBS-001 planning spec; Docsyde wide-event pattern; `ENGINEERING_STYLE.md` (AL-05, AL-07–AL-12, FND-01, OSS-03–OSS-05).
 - Success outcome: Foundry Django API and `runtime/allies_runtime` emit the same `WideEventV1` field names and safety rules as Cloud, using stdout as the primary sink and an optional fail-open sink seam.
 
 ## User Stories
