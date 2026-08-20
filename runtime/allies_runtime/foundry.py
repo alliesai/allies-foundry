@@ -1183,9 +1183,6 @@ class FoundryWorker:
                 raise HermesMalformedResponse(
                     "Hermes stream had no valid terminal event"
                 )
-            mark_completed = getattr(stream, "mark_completed", None)
-            if callable(mark_completed):
-                mark_completed()
             await _close_stream(stream)
             stream = None
             try:

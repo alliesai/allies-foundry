@@ -456,7 +456,6 @@ async def test_incremental_profile_stream_terminal_close_is_success(
     stream = await client.stream_profile_incremental("ally-a", "s1", "hello")
     event = await stream.__anext__()
     assert event.name == "execution.completed"
-    stream.mark_completed()
     await stream.aclose()
 
     assert [event["event"] for event in events] == [

@@ -210,7 +210,10 @@ class _ObservedHermesStream:
 
     async def __anext__(self) -> HermesEvent:
         try:
-            return await self._stream.__anext__()
+            event = await self._stream.__anext__()
+            if event.name == "execution.completed":
+                self.mark_completed()
+            return event
         except StopAsyncIteration:
             self._completed = True
             await self._finish(None)
