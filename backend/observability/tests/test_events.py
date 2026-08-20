@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +60,12 @@ def test_event_strings_match_shared_contract_limit(monkeypatch):
     event = build_event("runtime.operation.failed", message="x" * 512)
 
     assert len(event["message"]) <= 256
+
+
+def test_method_is_bounded_at_the_event_boundary():
+    event = build_event("http.request", method="x" * 4096)
+
+    assert event["method"] == "X" * 16
 
 
 def test_event_implementation_conforms_to_shared_contract():
@@ -204,3 +211,32 @@ def test_error_rate_limit_drops_client_flood_but_retains_server_evidence(
     counters = events_module.event_counters()
     assert counters["events_dropped"] >= before_dropped + 4
     assert counters["events_emitted"] >= before_emitted + 1
+
+
+def test_stdout_write_failures_are_counted(monkeypatch):
+    class BrokenStream:
+        buffer = None
+
+        def write(self, _value):
+            raise OSError("stdout unavailable")
+
+    monkeypatch.setattr(events_module.sys, "stdout", BrokenStream())
+    with events_module._stdout_lock:
+        if events_module._stdout_dispatcher is not None:
+            events_module._stdout_dispatcher.close()
+        events_module._stdout_dispatcher = None
+        events_module._stdout_queue_size = None
+
+    before = events_module.event_counters()["events_write_failures"]
+    events_module.emit_event(
+        events_module.build_event("worker.failed", outcome="error"),
+        config=events_module.FoundryObservabilitySettings(success_sample_rate=1),
+    )
+
+    deadline = time.monotonic() + 2
+    while (
+        events_module.event_counters()["events_write_failures"] == before
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
+    assert events_module.event_counters()["events_write_failures"] >= before + 1

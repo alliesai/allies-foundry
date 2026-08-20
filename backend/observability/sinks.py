@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -34,6 +35,7 @@ class BoundedSinkDispatcher:
         *,
         max_queue_size: int = 128,
         enabled: bool = False,
+        on_write_failure: Callable[[], None] | None = None,
     ) -> None:
         if type(max_queue_size) is not int or not 1 <= max_queue_size <= 4096:
             raise ValueError("max_queue_size must be between 1 and 4096")
@@ -41,6 +43,8 @@ class BoundedSinkDispatcher:
         self.enabled = bool(enabled and sink is not None)
         self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=max_queue_size)
         self._dropped = 0
+        self._failed = 0
+        self._on_write_failure = on_write_failure
         self._lock = threading.Lock()
         self._closed = threading.Event()
         self._thread: threading.Thread | None = None
@@ -57,9 +61,27 @@ class BoundedSinkDispatcher:
         with self._lock:
             return self._dropped
 
+    @property
+    def failed(self) -> int:
+        """Number of queued envelopes rejected by the sink adapter."""
+
+        with self._lock:
+            return self._failed
+
     def _drop(self) -> OfferResult:
         with self._lock:
             self._dropped += 1
+        return OfferResult(accepted=False, dropped=True)
+
+    def _fail(self) -> OfferResult:
+        with self._lock:
+            self._dropped += 1
+            self._failed += 1
+        if self._on_write_failure is not None:
+            try:
+                self._on_write_failure()
+            except Exception:  # noqa: BLE001 - diagnostics must not kill the worker
+                return OfferResult(accepted=False, dropped=True)
         return OfferResult(accepted=False, dropped=True)
 
     def offer(self, envelope: bytes) -> OfferResult:
@@ -82,9 +104,9 @@ class BoundedSinkDispatcher:
                 try:
                     result = self.sink.offer(envelope)
                     if not isinstance(result, OfferResult) or not result.accepted:
-                        self._drop()
+                        self._fail()
                 except Exception:  # noqa: BLE001 - adapter failures are isolated
-                    self._drop()
+                    self._fail()
             finally:
                 self._queue.task_done()
             if self._closed.is_set():

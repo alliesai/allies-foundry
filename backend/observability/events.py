@@ -234,7 +234,7 @@ def _field_value(name: str, value: object) -> object | None:
     if name == "route":
         return _route(value)
     if name == "method":
-        return value.strip().upper() if isinstance(value, str) else None
+        return value.strip().upper()[:16] if isinstance(value, str) else None
     if name == "status_code":
         return value if type(value) is int and 100 <= value <= 599 else None
     if name == "duration_ms":
@@ -338,11 +338,22 @@ def serialize_event(event: Mapping[str, object], *, max_bytes: int | None = None
 
 
 class EventCounters:
-    """Process-local bounded counters for operator sampling/drop rates."""
+    """Process-local counters for dispatch acceptance and write failures.
+
+    ``events_emitted`` records acceptance by the bounded stdout queue.  The
+    asynchronous drain reports adapter failures separately as
+    ``events_write_failures`` so queue throughput is not mistaken for durable
+    log delivery.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._values = {"events_emitted": 0, "events_sampled_out": 0, "events_dropped": 0}
+        self._values = {
+            "events_emitted": 0,
+            "events_sampled_out": 0,
+            "events_dropped": 0,
+            "events_write_failures": 0,
+        }
 
     def increment(self, name: str) -> None:
         if name not in self._values:
@@ -418,7 +429,10 @@ class _StdoutSink:
 
 
 _stdout_dispatcher = BoundedSinkDispatcher(
-    _StdoutSink(), max_queue_size=128, enabled=True
+    _StdoutSink(),
+    max_queue_size=128,
+    enabled=True,
+    on_write_failure=lambda: _counters.increment("events_write_failures"),
 )
 _stdout_queue_size = 128
 
@@ -430,7 +444,10 @@ def _offer_stdout(envelope: bytes, *, max_queue_size: int) -> OfferResult:
             if _stdout_dispatcher is not None:
                 _stdout_dispatcher.close()
             _stdout_dispatcher = BoundedSinkDispatcher(
-                _StdoutSink(), max_queue_size=max_queue_size, enabled=True
+                _StdoutSink(),
+                max_queue_size=max_queue_size,
+                enabled=True,
+                on_write_failure=lambda: _counters.increment("events_write_failures"),
             )
             _stdout_queue_size = max_queue_size
         return _stdout_dispatcher.offer(envelope)

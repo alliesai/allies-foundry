@@ -134,6 +134,8 @@ def _value(name: str, value: object) -> object | None:
         return _identifier_digest(value)
     if name in {"request_id", "correlation_id"}:
         return _identifier(value)
+    if name == "method":
+        return value.strip().upper()[:16] if isinstance(value, str) else None
     if name == "error_type":
         return value[:96] if isinstance(value, str) and _CLASS_RE.fullmatch(value) else None
     if name in {
@@ -223,9 +225,16 @@ def serialize_event(event: Mapping[str, object], *, max_bytes: int | None = None
 
 
 class EventCounters:
+    """Process-local counters; emission is queue acceptance, not durable I/O."""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._counts = {"events_emitted": 0, "events_sampled_out": 0, "events_dropped": 0}
+        self._counts = {
+            "events_emitted": 0,
+            "events_sampled_out": 0,
+            "events_dropped": 0,
+            "events_write_failures": 0,
+        }
 
     def increment(self, name: str) -> None:
         with self._lock:
@@ -319,7 +328,8 @@ class _StdoutDispatcher:
             try:
                 if envelope is None:
                     return
-                self._write(envelope)
+                if not self._write(envelope):
+                    _COUNTERS.increment("events_write_failures")
             finally:
                 self._queue.task_done()
             if self._closed.is_set():

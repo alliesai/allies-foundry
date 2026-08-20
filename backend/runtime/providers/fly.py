@@ -44,6 +44,7 @@ from .errors import (
     ProviderUnsupportedTopologyError,
 )
 from .fly_http import FlyHttpClient, FlyTransport
+from .protocol import current_provider_workspace_id
 
 _WORKSPACE_MARKER = "allies_workspace_id"
 _OPERATION_MARKER = "allies_operation_id"
@@ -85,7 +86,7 @@ def _workspace_id_for_call(
         workspace_id = _workspace_id_from_value(value)
         if workspace_id is not None:
             return workspace_id
-    return None
+    return current_provider_workspace_id()
 
 
 @dataclass(frozen=True, slots=True)

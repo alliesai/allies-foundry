@@ -203,6 +203,7 @@ class _ObservedHermesStream:
         self._stream = stream
         self._on_finished = on_finished
         self._finished = False
+        self._completed = False
 
     def __aiter__(self):
         return self
@@ -211,6 +212,7 @@ class _ObservedHermesStream:
         try:
             return await self._stream.__anext__()
         except StopAsyncIteration:
+            self._completed = True
             await self._finish(None)
             raise
         except BaseException as error:
@@ -229,10 +231,10 @@ class _ObservedHermesStream:
         try:
             await self._stream.aclose()
         finally:
-            # A worker closing after a terminal event is a successful stream
-            # completion; errors raised while reading have already finalized
-            # the pair in __anext__.
-            await self._finish(None)
+            if not self._completed:
+                # Closing before the iterator reaches StopAsyncIteration is an
+                # interrupted provider operation, not a successful stream.
+                await self._finish(HermesDisconnected("Hermes stream closed"))
 
     cancel = aclose
 

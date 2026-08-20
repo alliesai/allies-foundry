@@ -56,6 +56,7 @@ def test_adapter_exception_isolated_and_worker_survives():
     _wait_for(finished.is_set)
     assert len(calls) == 2
     assert dispatcher.dropped == 1
+    assert dispatcher.failed == 1
     dispatcher.close()
 
 

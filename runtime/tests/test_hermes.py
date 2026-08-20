@@ -398,6 +398,31 @@ async def test_incremental_profile_stream_emits_one_provider_lifecycle_pair(
 
 
 @pytest.mark.asyncio
+async def test_incremental_profile_stream_close_before_terminal_is_failure(
+    monkeypatch,
+):
+    class Response(FakeResponse):
+        def readline(self, _limit):
+            return b""
+
+    events = []
+    monkeypatch.setattr(
+        "allies_runtime.hermes.emit_runtime_event",
+        lambda event: events.append(event),
+    )
+    client, _ = _client(monkeypatch, Response())
+
+    stream = await client.stream_profile_incremental("ally-a", "s1", "hello")
+    await stream.aclose()
+
+    assert [event["event"] for event in events] == [
+        "provider.operation.started",
+        "provider.operation.failed",
+    ]
+    assert events[-1]["error_type"] == "HermesDisconnected"
+
+
+@pytest.mark.asyncio
 async def test_incremental_profile_stream_passes_overall_deadline_to_adapter(monkeypatch):
     class Response:
         def __init__(self):

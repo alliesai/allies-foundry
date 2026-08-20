@@ -32,6 +32,7 @@ from runtime.providers import (
     deterministic_app_name,
     deterministic_machine_name,
     deterministic_volume_name,
+    provider_workspace_context,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "providers"
@@ -218,6 +219,24 @@ def test_wait_machine_only_emits_nested_inspection_pair(monkeypatch):
         "inspect_machine_by_id",
         "inspect_machine_by_id",
     ]
+    assert all(event["workspace_id"].startswith("id_") for event in events)
+
+
+def test_provider_context_correlates_non_deterministic_call_shapes(monkeypatch):
+    events = []
+    monkeypatch.setenv("ALLIES_OBSERVABILITY_DIGEST_KEY", "test-digest")
+    monkeypatch.setattr(
+        "runtime.providers.fly.emit_event",
+        lambda event: events.append(event),
+    )
+    app_payload = fixture("app.json")
+    app_payload["name"] = "app-01"
+    fake = FakeFlyTransport([TransportResponse(200, app_payload)])
+
+    with provider_workspace_context(WORKSPACE_ID):
+        provider(fake).inspect_app("app-01")
+
+    assert len(events) == 2
     assert all(event["workspace_id"].startswith("id_") for event in events)
 
 

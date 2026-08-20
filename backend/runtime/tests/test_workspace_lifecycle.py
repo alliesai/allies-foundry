@@ -698,3 +698,41 @@ def test_terminal_retryable_failure_does_not_emit_retry_event(monkeypatch):
         event for event in events if event["event"] == "runtime.operation.retried"
     ]
     assert len(retry_events) == MAX_ATTEMPTS - 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_deadline_before_next_claim_does_not_emit_retry_event(monkeypatch):
+    provider = FakeProvider()
+    provider.ensure_app = lambda _spec: (_ for _ in ()).throw(
+        ProviderRetryableError("provider is temporarily unavailable", operation="ensure_app")
+    )
+    events = []
+    monkeypatch.setattr(
+        "runtime.services.workspaces.emit_event",
+        lambda event: events.append(event),
+    )
+    lifecycle = WorkspaceLifecycle(
+        provider, sleep=lambda _: None, jitter=False, phase_deadline_seconds=1
+    )
+    workspace = Workspace.objects.create(id=WORKSPACE_ID, tenant_ref="tenant-deadline")
+    original_claim = lifecycle._claim_or_wait
+    claim_count = 0
+
+    def claim_then_deadline(*args, **kwargs):
+        nonlocal claim_count
+        claim_count += 1
+        if claim_count == 2:
+            raise ProviderRetryableError(
+                "workspace operation did not finish before deadline",
+                operation="workspace_lifecycle",
+            )
+        return original_claim(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "_claim_or_wait", claim_then_deadline)
+
+    with pytest.raises(ProviderRetryableError, match="before deadline"):
+        lifecycle.ensure_workspace(workspace.id, spec())
+
+    assert not [
+        event for event in events if event["event"] == "runtime.operation.retried"
+    ]

@@ -78,6 +78,12 @@ def test_event_strings_match_shared_contract_limit(monkeypatch):
     assert len(event["message"]) <= 256
 
 
+def test_method_is_bounded_at_the_event_boundary():
+    event = observability.build_event("http.request", method="x" * 4096)
+
+    assert event["method"] == "X" * 16
+
+
 def test_serialize_event_rejects_impossibly_small_limit():
     event = observability.build_event("worker.failed")
 
@@ -223,6 +229,33 @@ def test_stdout_dispatcher_close_and_write_failures_are_fail_open(monkeypatch):
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert not dispatcher.offer(b"after-close")
+
+
+def test_stdout_write_failures_are_counted(monkeypatch):
+    class BrokenStream:
+        buffer = None
+
+        def write(self, _value):
+            raise OSError("stdout unavailable")
+
+    dispatcher = observability._StdoutDispatcher(1)
+    monkeypatch.setattr(observability, "_STDOUT_DISPATCHER", dispatcher)
+    monkeypatch.setattr(observability, "_STDOUT_QUEUE_SIZE", 1)
+    monkeypatch.setattr(observability.sys, "stdout", BrokenStream())
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_SUCCESS_SAMPLE_RATE", "1")
+
+    before = observability.event_counters()["events_write_failures"]
+    observability.emit_runtime_event(observability.build_event("worker.failed"))
+
+    deadline = time.monotonic() + 2
+    while (
+        observability.event_counters()["events_write_failures"] == before
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
+    assert observability.event_counters()["events_write_failures"] >= before + 1
+    dispatcher.close()
 
 
 def test_emit_runtime_event_drops_sampled_success(monkeypatch):
