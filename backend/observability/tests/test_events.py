@@ -2,8 +2,10 @@ import json
 from pathlib import Path
 
 import pytest
-from django.http import HttpResponse
+from django.core.exceptions import PermissionDenied, SuspiciousOperation
+from django.http import Http404, HttpResponse
 from django.test import RequestFactory
+from django.urls import Resolver404
 
 from observability.events import (
     ALLOWED_EVENT_NAMES,
@@ -127,3 +129,31 @@ def test_middleware_emits_error_event_and_re_raises(monkeypatch):
     assert captured[0]["outcome"] == "error"
     assert captured[0]["status_code"] == 500
     assert captured[0]["error_type"] == "ValueError"
+
+
+@pytest.mark.parametrize(
+    ("error_type", "status_code"),
+    [
+        (Http404, 404),
+        (Resolver404, 404),
+        (PermissionDenied, 403),
+        (SuspiciousOperation, 400),
+    ],
+)
+def test_middleware_maps_framework_errors_to_client_status(
+    monkeypatch, error_type, status_code
+):
+    captured = []
+
+    def response(_request):
+        raise error_type()
+
+    monkeypatch.setattr(
+        "observability.middleware.emit_event",
+        lambda event, **kwargs: captured.append(event),
+    )
+
+    with pytest.raises(error_type):
+        WideEventMiddleware(response)(RequestFactory().get("/api/v1/fail"))
+
+    assert captured[0]["status_code"] == status_code

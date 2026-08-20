@@ -8,6 +8,9 @@ import time
 from uuid import uuid4
 
 from django.conf import settings
+from django.core.exceptions import PermissionDenied, SuspiciousOperation
+from django.http import Http404
+from django.urls import Resolver404
 
 from .events import build_event, emit_event
 
@@ -43,6 +46,16 @@ def _route_for(request) -> str:
     return "/" + "/".join(safe) if safe else "/"
 
 
+def _status_for_error(error: BaseException) -> int:
+    if isinstance(error, (Http404, Resolver404)):
+        return 404
+    if isinstance(error, PermissionDenied):
+        return 403
+    if isinstance(error, SuspiciousOperation):
+        return 400
+    return 500
+
+
 class WideEventMiddleware:
     """Emit one final request event while preserving response/error semantics."""
 
@@ -64,7 +77,9 @@ class WideEventMiddleware:
             raise
         finally:
             duration_ms = (time.monotonic() - started) * 1000
-            status_code = getattr(response, "status_code", 500 if error else 200)
+            status_code = getattr(
+                response, "status_code", _status_for_error(error) if error else 200
+            )
             outcome = "error" if error is not None or status_code >= 400 else "success"
             fields: dict[str, object] = {
                 "request_id": request_id,

@@ -592,7 +592,6 @@ class FlyProvider:
             },
         }
 
-    @_observed_provider_operation
     def wait_machine(
         self,
         app_name: str,

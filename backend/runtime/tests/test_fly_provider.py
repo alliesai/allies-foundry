@@ -193,6 +193,27 @@ def test_provider_observes_direct_operations_once_and_aliases(monkeypatch):
     assert events[-1]["operation"] == "inspect_machine"
 
 
+def test_wait_machine_only_emits_nested_inspection_pair(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "runtime.providers.fly.emit_event",
+        lambda event: events.append(event),
+    )
+    fake = FakeFlyTransport(
+        [
+            TransportResponse(200, {"ok": True}),
+            TransportResponse(200, fixture("machines.json")[0]),
+        ]
+    )
+
+    provider(fake).wait_machine("workspace-app", "machine-01", timeout_seconds=10)
+
+    assert [event["operation"] for event in events] == [
+        "inspect_machine_by_id",
+        "inspect_machine_by_id",
+    ]
+
+
 def test_machine_payload_has_two_containers_private_mount_and_opaque_ref_only():
     fake = FakeFlyTransport([TransportResponse(200, fixture("machines.json")[0])])
     result = provider(fake).create_machine(machine_spec())
