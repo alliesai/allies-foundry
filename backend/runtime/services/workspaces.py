@@ -380,7 +380,9 @@ class WorkspaceLifecycle:
             if operation is None:
                 self._wait_for_other_operation(deadline)
                 continue
-            self._emit_retry_if_pending(workspace_id, operation)
+            self._emit_retry_if_pending(
+                workspace_id, operation, operation_name="workspace_ensure"
+            )
             self._begin_attempt(operation.phase)
             try:
                 with provider_workspace_context(workspace_id):
@@ -479,7 +481,9 @@ class WorkspaceLifecycle:
             if operation is None:
                 self._wait_for_other_operation(deadline)
                 continue
-            self._emit_retry_if_pending(workspace_id, operation)
+            self._emit_retry_if_pending(
+                workspace_id, operation, operation_name="workspace_replace"
+            )
             self._begin_attempt(operation.phase)
             try:
                 with provider_workspace_context(workspace_id):
@@ -1183,7 +1187,9 @@ class WorkspaceLifecycle:
 
         run_with_sqlite_lock_retry(transaction_once)
 
-    def _emit_retry_if_pending(self, workspace_id: UUID, claim: _Claim) -> None:
+    def _emit_retry_if_pending(
+        self, workspace_id: UUID, claim: _Claim, *, operation_name: str
+    ) -> None:
         """Record a retry only after a new claim has actually been acquired."""
 
         pending = self._retry_reasons.pop(claim.phase, None)
@@ -1193,7 +1199,7 @@ class WorkspaceLifecycle:
         emit_event(
             build_event(
                 "runtime.operation.retried",
-                operation="workspace_lifecycle",
+                operation=operation_name,
                 workspace_id=str(workspace_id),
                 reason_code=reason_code,
                 outcome="retry",

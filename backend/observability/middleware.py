@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from django.conf import settings
 from django.core.exceptions import PermissionDenied, SuspiciousOperation
+from django.core.handlers.exception import response_for_exception
 from django.http import Http404
 from django.urls import Resolver404
 
@@ -111,6 +112,16 @@ class WideEventMiddleware:
             if response is not None:
                 response["X-Request-ID"] = request_id
             _request_id.reset(token)
+
+    def process_exception(self, request, error):
+        """Stamp responses Django creates after the request boundary re-raises."""
+
+        response = response_for_exception(request, error)
+        request_id = getattr(request, "request_id", None)
+        if not isinstance(request_id, str):
+            request_id = _request_id_for(request)
+        response["X-Request-ID"] = request_id
+        return response
 
 
 RequestObservabilityMiddleware = WideEventMiddleware

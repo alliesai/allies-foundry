@@ -698,6 +698,7 @@ def test_terminal_retryable_failure_does_not_emit_retry_event(monkeypatch):
         event for event in events if event["event"] == "runtime.operation.retried"
     ]
     assert len(retry_events) == MAX_ATTEMPTS - 1
+    assert {event["operation"] for event in retry_events} == {"workspace_ensure"}
 
 
 @pytest.mark.django_db(transaction=True)

@@ -371,6 +371,8 @@ _ERROR_RATE_WINDOW_SECONDS = 1.0
 _MAX_CLIENT_ERROR_EVENTS = 16
 _MAX_SERVER_ERROR_EVENTS = 64
 _MAX_SUCCESS_EVENTS = 1024
+_MAX_LIFECYCLE_EVENTS = 256
+_MAX_OTHER_HTTP_EVENTS = 128
 
 
 class _ErrorRateLimiter:
@@ -381,6 +383,8 @@ class _ErrorRateLimiter:
             "client": deque(),
             "server": deque(),
             "success": deque(),
+            "lifecycle": deque(),
+            "http_other": deque(),
         }
         self._lock = threading.Lock()
 
@@ -397,6 +401,11 @@ class _ErrorRateLimiter:
             return "server", _MAX_SERVER_ERROR_EVENTS
         if type(status) is int and 200 <= status < 300:
             return "success", _MAX_SUCCESS_EVENTS
+        event_name = str(event.get("event", ""))
+        if event_name == "http.request":
+            return "http_other", _MAX_OTHER_HTTP_EVENTS
+        if event_name:
+            return "lifecycle", _MAX_LIFECYCLE_EVENTS
         return None
 
     def allow(self, event: Mapping[str, object]) -> bool:

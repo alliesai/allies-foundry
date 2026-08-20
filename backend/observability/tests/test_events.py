@@ -7,7 +7,8 @@ import pytest
 from django.core.exceptions import PermissionDenied, SuspiciousOperation
 from django.http import Http404, HttpResponse
 from django.test import Client, RequestFactory
-from django.urls import Resolver404
+from django.test.utils import override_settings
+from django.urls import Resolver404, path
 
 from observability import events as events_module
 from observability.events import (
@@ -19,6 +20,13 @@ from observability.events import (
 )
 from observability.middleware import WideEventMiddleware, current_request_id
 from observability.settings import MAX_WIDE_EVENT_BYTES
+
+
+def _raise_runtime_error(_request):
+    raise RuntimeError("boom")
+
+
+urlpatterns = [path("raise/", _raise_runtime_error)]
 
 
 def test_event_is_allowlisted_and_redacts_sensitive_text(monkeypatch):
@@ -178,6 +186,25 @@ def test_django_exception_response_echoes_request_id_after_conversion(monkeypatc
     assert captured[0]["status_code"] == 404
 
 
+@override_settings(DEBUG=False, ROOT_URLCONF=__name__)
+def test_django_uncaught_exception_response_echoes_request_id(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        "observability.middleware.emit_event",
+        lambda event, **kwargs: captured.append(event),
+    )
+
+    response = Client(raise_request_exception=False).get(
+        "/raise/",
+        HTTP_HOST="localhost",
+        HTTP_X_REQUEST_ID="req_exception",
+    )
+
+    assert response.status_code == 500
+    assert response["X-Request-ID"] == "req_exception"
+    assert captured[0]["status_code"] == 500
+
+
 @pytest.mark.parametrize("supplied", ["bad id", "x" * 129])
 def test_middleware_replaces_invalid_or_oversized_request_id(monkeypatch, supplied):
     captured = []
@@ -266,6 +293,53 @@ def test_error_rate_limiter_bounds_successful_http_flood(monkeypatch):
         events_module.emit_event(
             events_module.build_event(
                 "http.request", status_code=200, outcome="success"
+            ),
+            config=config,
+        )
+
+    assert events_module.event_counters()["events_dropped"] >= before_dropped + 4
+
+
+def test_error_rate_limiter_bounds_lifecycle_flood(monkeypatch):
+    monkeypatch.setattr(events_module, "_error_rate_limiter", events_module._ErrorRateLimiter())
+    monkeypatch.setattr(
+        events_module,
+        "_offer_stdout",
+        lambda *_args, **_kwargs: events_module.OfferResult(
+            accepted=True, dropped=False
+        ),
+    )
+    config = events_module.FoundryObservabilitySettings(success_sample_rate=1)
+    before_dropped = events_module.event_counters()["events_dropped"]
+
+    for _ in range(events_module._MAX_LIFECYCLE_EVENTS + 4):
+        events_module.emit_event(
+            events_module.build_event(
+                "provider.operation.started", operation="inspect_app", outcome="started"
+            ),
+            config=config,
+        )
+
+    assert events_module.event_counters()["events_dropped"] >= before_dropped + 4
+
+
+@pytest.mark.parametrize("status_code", [101, 302])
+def test_error_rate_limiter_bounds_other_http_status_flood(monkeypatch, status_code):
+    monkeypatch.setattr(events_module, "_error_rate_limiter", events_module._ErrorRateLimiter())
+    monkeypatch.setattr(
+        events_module,
+        "_offer_stdout",
+        lambda *_args, **_kwargs: events_module.OfferResult(
+            accepted=True, dropped=False
+        ),
+    )
+    config = events_module.FoundryObservabilitySettings(success_sample_rate=1)
+    before_dropped = events_module.event_counters()["events_dropped"]
+
+    for _ in range(events_module._MAX_OTHER_HTTP_EVENTS + 4):
+        events_module.emit_event(
+            events_module.build_event(
+                "http.request", status_code=status_code, outcome="success"
             ),
             config=config,
         )

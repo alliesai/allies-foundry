@@ -315,6 +315,49 @@ def test_error_rate_limiter_bounds_successful_http_flood(monkeypatch):
     assert observability.event_counters()["events_dropped"] >= before_dropped + 4
 
 
+def test_error_rate_limiter_bounds_lifecycle_flood(monkeypatch):
+    monkeypatch.setattr(
+        observability,
+        "_ERROR_RATE_LIMITER",
+        observability._ErrorRateLimiter(),
+    )
+    monkeypatch.setattr(observability, "_offer_stdout", lambda *_args, **_kwargs: True)
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_SUCCESS_SAMPLE_RATE", "1")
+    before_dropped = observability.event_counters()["events_dropped"]
+
+    for _ in range(observability._MAX_LIFECYCLE_EVENTS + 4):
+        observability.emit_runtime_event(
+            observability.build_event(
+                "provider.operation.started", operation="inspect_app", outcome="started"
+            )
+        )
+
+    assert observability.event_counters()["events_dropped"] >= before_dropped + 4
+
+
+@pytest.mark.parametrize("status_code", [101, 302])
+def test_error_rate_limiter_bounds_other_http_status_flood(monkeypatch, status_code):
+    monkeypatch.setattr(
+        observability,
+        "_ERROR_RATE_LIMITER",
+        observability._ErrorRateLimiter(),
+    )
+    monkeypatch.setattr(observability, "_offer_stdout", lambda *_args, **_kwargs: True)
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("ALLIES_WIDE_EVENTS_SUCCESS_SAMPLE_RATE", "1")
+    before_dropped = observability.event_counters()["events_dropped"]
+
+    for _ in range(observability._MAX_OTHER_HTTP_EVENTS + 4):
+        observability.emit_runtime_event(
+            observability.build_event(
+                "http.request", status_code=status_code, outcome="success"
+            )
+        )
+
+    assert observability.event_counters()["events_dropped"] >= before_dropped + 4
+
+
 def test_sink_failure_is_fail_open(monkeypatch):
     class BrokenSink:
         def offer(self, envelope):
