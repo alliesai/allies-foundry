@@ -85,6 +85,12 @@ PROFILE_PROVISIONING_MODEL = env_profile_text(
 PROFILE_PROVISIONING_BASE_URL = env_profile_text(
     "PROFILE_PROVISIONING_BASE_URL", "https://api.openai.com/v1", max_length=512
 )
+if not re.fullmatch(
+    r"[a-z][a-z0-9+.-]{1,31}://[^\s]{1,507}",
+    PROFILE_PROVISIONING_BASE_URL,
+    re.IGNORECASE,
+):
+    raise ImproperlyConfigured("PROFILE_PROVISIONING_BASE_URL is not absolute")
 profile_credential_name = env_profile_text(
     "PROFILE_PROVISIONING_CREDENTIAL_NAME", "OPENAI_API_KEY", max_length=64
 )

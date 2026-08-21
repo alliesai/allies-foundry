@@ -106,6 +106,7 @@ def test_production_mode_requires_strong_cloud_service_token():
         ("PROFILE_PROVISIONING_PROVIDER", ""),
         ("PROFILE_PROVISIONING_MODEL", ""),
         ("PROFILE_PROVISIONING_BASE_URL", ""),
+        ("PROFILE_PROVISIONING_BASE_URL", "api.openai.com/v1"),
         ("PROFILE_PROVISIONING_CREDENTIAL_NAME", "api-server-key"),
         ("PROFILE_PROVISIONING_CREDENTIAL_REF", "/run/secrets/provider-key"),
     ],
