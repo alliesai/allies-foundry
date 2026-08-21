@@ -42,14 +42,6 @@ from .schemas import (
 from .schemas import ProfileProvisioningReceipt as ProfileProvisioningReceiptSchema
 
 _PROFILE_ID_NAMESPACE = uuid5(NAMESPACE_URL, "allies-foundry-profile-v1")
-_PROFILE_PROVIDER = "openai"
-_PROFILE_MODEL = "gpt-5.6-luna"
-_PROFILE_BASE_URL = "https://api.openai.com/v1"
-_PROFILE_CREDENTIAL_REFS = {
-    "OPENAI_API_KEY": "file:///run/secrets/openai-api-key",
-}
-
-
 def register(api: NinjaExtraAPI) -> None:
     api.add_exception_handler(NinjaValidationError, _validation_error)
 
@@ -152,11 +144,11 @@ def register(api: NinjaExtraAPI) -> None:
                 payload.ally_ref,
                 ProfileSeed(
                     personality=payload.personality,
-                    provider=_PROFILE_PROVIDER,
-                    model=_PROFILE_MODEL,
-                    base_url=_PROFILE_BASE_URL,
+                    provider=settings.PROFILE_PROVISIONING_PROVIDER,
+                    model=settings.PROFILE_PROVISIONING_MODEL,
+                    base_url=settings.PROFILE_PROVISIONING_BASE_URL,
                     first_chat_instruction=_first_chat_instruction(payload.job),
-                    credential_refs=_PROFILE_CREDENTIAL_REFS,
+                    credential_refs=settings.PROFILE_PROVISIONING_CREDENTIAL_REFS,
                 ),
             )
             receipt = ProfileProvisioningReceiptSchema(
@@ -170,14 +162,6 @@ def register(api: NinjaExtraAPI) -> None:
             return JsonResponse(receipt.model_dump(), status=200)
         except RuntimeDomainError as exc:
             return _profile_provisioning_error(exc)
-        except (TypeError, ValueError):
-            return JsonResponse(
-                {
-                    "code": "PROFILE_UNAVAILABLE",
-                    "message": "profile provisioning is unavailable",
-                },
-                status=503,
-            )
 
     @api.post("/runtime/attempts/{attempt_id}/lease/renew", auth=None)
     def renew(request: HttpRequest, attempt_id):
@@ -314,7 +298,9 @@ def _bearer(request: HttpRequest) -> str:
 def _authenticate_cloud_service(request: HttpRequest) -> None:
     token = _bearer(request)
     configured = getattr(settings, "ALLIES_CLOUD_SERVICE_TOKEN", None)
-    if not configured or not secrets.compare_digest(token, configured):
+    if not configured or not secrets.compare_digest(
+        token.encode(), configured.encode()
+    ):
         raise RuntimeAuthorizationError("invalid service credential")
 
 

@@ -17,7 +17,6 @@ from pathlib import Path
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
-
 from observability.settings import FoundryObservabilitySettings
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -68,6 +67,22 @@ if not DEBUG and (
     raise ImproperlyConfigured(
         "ALLIES_CLOUD_SERVICE_TOKEN must be a strong token outside debug"
     )
+
+PROFILE_PROVISIONING_PROVIDER = os.getenv(
+    "PROFILE_PROVISIONING_PROVIDER", "openai"
+)
+PROFILE_PROVISIONING_MODEL = os.getenv(
+    "PROFILE_PROVISIONING_MODEL", "gpt-5.6-luna"
+)
+PROFILE_PROVISIONING_BASE_URL = os.getenv(
+    "PROFILE_PROVISIONING_BASE_URL", "https://api.openai.com/v1"
+)
+PROFILE_PROVISIONING_CREDENTIAL_REFS = {
+    os.getenv("PROFILE_PROVISIONING_CREDENTIAL_NAME", "OPENAI_API_KEY"): os.getenv(
+        "PROFILE_PROVISIONING_CREDENTIAL_REF",
+        "file:///run/secrets/openai-api-key",
+    )
+}
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 if not SECRET_KEY:

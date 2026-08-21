@@ -95,6 +95,28 @@ def test_fixture_request_creates_pending_profile_without_private_receipt_fields(
     assert contract["request"]["job"] in profile.seed_payload["first_chat_instruction"]
 
 
+def test_provisioning_seed_uses_deployment_settings(
+    workspace, contract, service_token, settings
+):
+    settings.PROFILE_PROVISIONING_PROVIDER = "test-provider"
+    settings.PROFILE_PROVISIONING_MODEL = "test-model"
+    settings.PROFILE_PROVISIONING_BASE_URL = "https://provider.example/v1"
+    settings.PROFILE_PROVISIONING_CREDENTIAL_REFS = {
+        "PROVIDER_TOKEN": "file:///run/secrets/provider-token"
+    }
+
+    response = post_profile(contract["request"])
+
+    assert response.status_code == 200
+    profile = RuntimeProfile.objects.get(workspace=workspace)
+    assert profile.seed_payload["provider"] == "test-provider"
+    assert profile.seed_payload["model"] == "test-model"
+    assert profile.seed_payload["base_url"] == "https://provider.example/v1"
+    assert profile.seed_payload["credential_refs"] == {
+        "PROVIDER_TOKEN": "file:///run/secrets/provider-token"
+    }
+
+
 def test_exact_replay_is_idempotent_and_changed_seed_does_not_mutate(
     workspace, contract, service_token
 ):
@@ -142,7 +164,7 @@ def test_active_profile_state_is_returned_truthfully(
     assert active.json()["evidence_digest"] == pending.json()["evidence_digest"]
 
 
-@pytest.mark.parametrize("token", [None, "wrong-service-token"])
+@pytest.mark.parametrize("token", [None, "wrong-service-token", "ÿ"])
 def test_missing_or_invalid_service_bearer_is_the_same_401(
     workspace, contract, service_token, token
 ):
