@@ -54,6 +54,19 @@ def env_networks(name: str) -> tuple[IPv4Network | IPv6Network, ...]:
 DEBUG = env_bool("DJANGO_DEBUG", default=False)
 database_url = os.getenv("DATABASE_URL")
 
+ALLIES_CLOUD_SERVICE_TOKEN = os.getenv("ALLIES_CLOUD_SERVICE_TOKEN")
+if not DEBUG and not ALLIES_CLOUD_SERVICE_TOKEN:
+    raise ImproperlyConfigured(
+        "ALLIES_CLOUD_SERVICE_TOKEN is required when DJANGO_DEBUG is false"
+    )
+if not DEBUG and (
+    len(ALLIES_CLOUD_SERVICE_TOKEN) < 32
+    or any(character.isspace() for character in ALLIES_CLOUD_SERVICE_TOKEN)
+):
+    raise ImproperlyConfigured(
+        "ALLIES_CLOUD_SERVICE_TOKEN must be a strong token outside debug"
+    )
+
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 if not SECRET_KEY:
     if not DEBUG or database_url:

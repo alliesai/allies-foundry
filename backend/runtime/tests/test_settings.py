@@ -29,8 +29,10 @@ def run_settings_probe(**overrides):
         "DJANGO_TRUST_PROXY_HEADERS",
         "DJANGO_TRUSTED_PROXY_IPS",
         "RAILWAY_PUBLIC_DOMAIN",
+        "ALLIES_CLOUD_SERVICE_TOKEN",
     ):
         environment.pop(name, None)
+    environment["ALLIES_CLOUD_SERVICE_TOKEN"] = "s" * 32
     environment.update(overrides)
     return subprocess.run(
         [sys.executable, "-c", PROBE],
@@ -77,6 +79,21 @@ def test_production_mode_requires_database_url():
 
     assert result.returncode != 0
     assert "DATABASE_URL is required" in result.stderr
+
+
+def test_production_mode_requires_strong_cloud_service_token():
+    common = {
+        "DJANGO_DEBUG": "false",
+        "DJANGO_SECRET_KEY": "synthetic-test-secret",
+        "DJANGO_ALLOWED_HOSTS": "localhost",
+        "DATABASE_URL": "sqlite:///test-production.sqlite3",
+    }
+
+    missing = run_settings_probe(**common, ALLIES_CLOUD_SERVICE_TOKEN="")
+    weak = run_settings_probe(**common, ALLIES_CLOUD_SERVICE_TOKEN="short")
+
+    assert "ALLIES_CLOUD_SERVICE_TOKEN is required" in missing.stderr
+    assert "ALLIES_CLOUD_SERVICE_TOKEN must be a strong token" in weak.stderr
 
 
 def test_proxy_header_trust_requires_explicit_proxy_networks():
