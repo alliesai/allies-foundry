@@ -14,10 +14,11 @@ from django.utils import timezone
 from runtime.contracts import (
     ExecutionCommand,
     FoundryEventEnvelope,
+    build_event_envelope,
     command_fingerprint,
     event_fingerprint,
 )
-from runtime.exceptions import RuntimeConflictError
+from runtime.exceptions import RuntimeConflictError, RuntimeValidationError
 from runtime.models import (
     ConversationBinding,
     Execution,
@@ -118,6 +119,25 @@ def test_fixture_is_strict_and_fingerprints_are_reproducible(contract):
     assert command_fingerprint(command) == command.fingerprint
     assert event_fingerprint(event) == event.fingerprint
     assert command.payload.text == "normalized user text"
+
+
+def test_cloud_projection_budget_allows_only_terminal_sequence_513(delivery):
+    event = delivery.event
+    event.sequence = 513
+    event.event_type = "message.delta"
+    event.payload = {"text": "beyond the non-terminal budget"}
+    with pytest.raises(RuntimeValidationError, match="projection budget"):
+        build_event_envelope(event.attempt.execution, event.attempt, event)
+
+    event.event_type = "execution.completed"
+    event.payload = {"run_id": "run-1", "status": "completed"}
+    envelope = build_event_envelope(event.attempt.execution, event.attempt, event)
+    assert envelope is not None
+    assert envelope.foundry.attempt_sequence == 513
+
+    event.sequence = 514
+    with pytest.raises(RuntimeValidationError, match="projection budget"):
+        build_event_envelope(event.attempt.execution, event.attempt, event)
 
 
 def test_command_exact_replay_and_conflict_do_not_duplicate(binding, contract):

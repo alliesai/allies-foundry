@@ -237,6 +237,15 @@ def build_event_envelope(execution, attempt, event) -> FoundryEventEnvelope | No
     )
     if any(value in (None, "") for value in required):
         return None
+    terminal = event_type in {
+        "execution.completed",
+        "execution.stopped",
+        "execution.failed",
+    }
+    if event.sequence > (513 if terminal else 512):
+        raise RuntimeValidationError(
+            "event exceeds the bounded Cloud projection budget"
+        )
     payload = _wire_event_payload(event_type, event.payload)
     envelope = FoundryEventEnvelope(
         schema_version=CONTRACT_VERSION,

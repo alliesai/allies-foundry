@@ -254,18 +254,6 @@ def test_projection_event_budget_reserves_sequence_513_for_terminal_truth(
 ):
     context, _execution, claim = claimed_execution
 
-    with pytest.raises(RuntimeValidationError, match="1 to 512"):
-        append_runtime_event(
-            context,
-            claim.attempt_id,
-            claim.lease_token,
-            uuid4(),
-            claim.stream_id,
-            513,
-            "message.delta",
-            {"text": "beyond the non-terminal budget"},
-        )
-
     with pytest.raises(RuntimeValidationError, match="1 to 513"):
         complete_attempt(
             context,
@@ -279,6 +267,27 @@ def test_projection_event_budget_reserves_sequence_513_for_terminal_truth(
                 "payload": {"run_id": "run-1", "status": "completed"},
             },
         )
+
+    dispatch(context, claim)
+    bind_effective_session(context, claim)
+    receipt = complete_attempt(
+        context,
+        claim.attempt_id,
+        claim.lease_token,
+        {"code": "ok"},
+        terminal_event={
+            "event_id": uuid4(),
+            "stream_id": claim.stream_id,
+            "sequence": 513,
+            "payload": {"run_id": "run-1", "status": "completed"},
+        },
+    )
+
+    assert receipt.status == AttemptStatus.SUCCEEDED
+    assert (
+        ExecutionEvent.objects.get(attempt_id=claim.attempt_id, sequence=513).event_type
+        == "execution.completed"
+    )
 
 
 def test_machine_fence_does_not_requeue_dispatched_work(claimed_execution):
