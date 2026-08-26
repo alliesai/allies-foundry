@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from django.db import IntegrityError, transaction
@@ -28,12 +27,6 @@ from .validation import (
 )
 
 _PROFILE_ID_NAMESPACE = uuid5(NAMESPACE_URL, "allies-foundry-profile-v1")
-
-
-@dataclass(frozen=True, slots=True)
-class ContractExecutionResult:
-    execution: Execution
-    created: bool
 
 
 def create_execution(
@@ -73,16 +66,16 @@ def create_execution_intent(command: ExecutionCommand) -> ExecutionReceipt:
     command = _coerce_command(command)
     validate_command(command)
     workspace, profile = _resolve_command_binding(command)
-    result = run_with_sqlite_lock_retry(
+    execution, created = run_with_sqlite_lock_retry(
         lambda: _create_contract_execution_once(command, workspace.id, profile.id)
     )
     return ExecutionReceipt(
         schema_version="v1",
         kind="execution.receipt",
-        status="accepted" if result.created is True else "duplicate",
-        command_id=result.execution.command_id or command.command_id,
+        status="accepted" if created is True else "duplicate",
+        command_id=execution.command_id or command.command_id,
         idempotency_key=command.idempotency_key,
-        fingerprint=result.execution.command_fingerprint or command.fingerprint,
+        fingerprint=execution.command_fingerprint or command.fingerprint,
     )
 
 
@@ -155,7 +148,7 @@ def _create_contract_execution_once(
     command: ExecutionCommand,
     workspace_id: UUID,
     profile_id: UUID,
-) -> ContractExecutionResult:
+) -> tuple[Execution, bool]:
     workspace = Workspace.objects.select_for_update().get(pk=workspace_id)
     profile = RuntimeProfile.objects.select_for_update().get(
         pk=profile_id, workspace_id=workspace.id
@@ -174,7 +167,7 @@ def _create_contract_execution_once(
     )
     if existing is not None:
         _ensure_contract_replay(existing, command, profile_id)
-        return ContractExecutionResult(existing, False)
+        return existing, False
     existing_command = Execution.objects.filter(command_id=command.command_id).first()
     if existing_command is not None:
         raise RuntimeConflictError(
@@ -205,7 +198,7 @@ def _create_contract_execution_once(
         raise RuntimeConflictError(
             "execution identity conflicts with existing state"
         ) from exc
-    return ContractExecutionResult(execution, True)
+    return execution, True
 
 
 def _ensure_contract_replay(
