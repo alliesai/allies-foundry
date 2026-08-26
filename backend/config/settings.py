@@ -18,6 +18,7 @@ from pathlib import Path
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
+
 from observability.settings import FoundryObservabilitySettings
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -75,6 +76,30 @@ if not DEBUG and (
     raise ImproperlyConfigured(
         "ALLIES_CLOUD_SERVICE_TOKEN must be a strong token outside debug"
     )
+
+ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = env_bool(
+    "ALLIES_CLOUD_EVENT_DELIVERY_ENABLED", default=False
+)
+ALLIES_CLOUD_URL = os.getenv("ALLIES_CLOUD_URL")
+ALLIES_CLOUD_EVENT_SERVICE_TOKEN = os.getenv("ALLIES_CLOUD_EVENT_SERVICE_TOKEN")
+if ALLIES_CLOUD_EVENT_DELIVERY_ENABLED:
+    if not ALLIES_CLOUD_URL or not ALLIES_CLOUD_EVENT_SERVICE_TOKEN:
+        raise ImproperlyConfigured(
+            "ALLIES_CLOUD_URL and ALLIES_CLOUD_EVENT_SERVICE_TOKEN are required "
+            "when event delivery is enabled"
+        )
+    cloud_url = re.fullmatch(
+        r"https://[^\s/?#]+(?:/[^\s?#]*)?", ALLIES_CLOUD_URL, re.IGNORECASE
+    )
+    if cloud_url is None:
+        raise ImproperlyConfigured("ALLIES_CLOUD_URL must be an HTTPS origin")
+    if (
+        len(ALLIES_CLOUD_EVENT_SERVICE_TOKEN) < 32
+        or any(character.isspace() for character in ALLIES_CLOUD_EVENT_SERVICE_TOKEN)
+    ):
+        raise ImproperlyConfigured(
+            "ALLIES_CLOUD_EVENT_SERVICE_TOKEN must be a strong token"
+        )
 
 PROFILE_PROVISIONING_PROVIDER = env_profile_text(
     "PROFILE_PROVISIONING_PROVIDER", "openai", max_length=128

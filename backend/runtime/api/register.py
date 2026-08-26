@@ -11,12 +11,17 @@ from runtime.exceptions import (
     RuntimeConflictError,
     RuntimeDomainError,
     RuntimeIdempotencyConflictError,
+    RuntimeNotFoundError,
     RuntimeValidationError,
 )
 from runtime.models import Workspace
 from runtime.services.attempts import complete_attempt, fail_attempt
 from runtime.services.claims import claim_next_execution
 from runtime.services.events import append_runtime_event
+from runtime.services.executions import (
+    create_execution_intent,
+    reconcile_execution_intent,
+)
 from runtime.services.leases import acknowledge_stopped, renew_lease
 from runtime.services.profiles import (
     ProfileSeed,
@@ -33,6 +38,7 @@ from .schemas import (
     CleanupReceiptRequest,
     CompleteRequest,
     EventRequest,
+    ExecutionCommand,
     FailRequest,
     MaterializationReceiptRequest,
     ProfileProvisioningRequest,
@@ -42,6 +48,8 @@ from .schemas import (
 from .schemas import ProfileProvisioningReceipt as ProfileProvisioningReceiptSchema
 
 _PROFILE_ID_NAMESPACE = uuid5(NAMESPACE_URL, "allies-foundry-profile-v1")
+
+
 def register(api: NinjaExtraAPI) -> None:
     api.add_exception_handler(NinjaValidationError, _validation_error)
 
@@ -162,6 +170,30 @@ def register(api: NinjaExtraAPI) -> None:
             return JsonResponse(receipt.model_dump(), status=200)
         except RuntimeDomainError as exc:
             return _profile_provisioning_error(exc)
+
+    @api.post("/internal/executions", auth=None)
+    def execution_create(request: HttpRequest, payload: ExecutionCommand):
+        try:
+            _authenticate_cloud_service(request)
+            receipt = create_execution_intent(payload)
+            return JsonResponse(receipt.model_dump(mode="json"), status=200)
+        except RuntimeDomainError as exc:
+            return _execution_error(exc)
+
+    @api.get("/internal/executions/reconcile", auth=None)
+    def execution_reconcile(request: HttpRequest):
+        try:
+            _authenticate_cloud_service(request)
+            receipt = reconcile_execution_intent(
+                request.GET.get("idempotency_key", ""),
+                request.GET.get("fingerprint", ""),
+            )
+            return JsonResponse(
+                receipt.model_dump(mode="json", exclude_none=True),
+                status=200,
+            )
+        except RuntimeDomainError as exc:
+            return _execution_error(exc)
 
     @api.post("/runtime/attempts/{attempt_id}/lease/renew", auth=None)
     def renew(request: HttpRequest, attempt_id):
@@ -337,6 +369,31 @@ def _profile_provisioning_error(exc: RuntimeDomainError) -> JsonResponse:
         code = "PROFILE_UNAVAILABLE"
     return JsonResponse(
         {"code": code, "message": "profile provisioning conflicts with existing state"},
+        status=409,
+    )
+
+
+def _execution_error(exc: RuntimeDomainError) -> JsonResponse:
+    if isinstance(exc, RuntimeAuthorizationError):
+        return JsonResponse(
+            {"code": "INVALID_CREDENTIAL", "message": "request is not authorized"},
+            status=401,
+        )
+    if isinstance(exc, RuntimeNotFoundError):
+        return JsonResponse(
+            {"code": "NOT_FOUND", "message": "execution binding is unavailable"},
+            status=404,
+        )
+    if isinstance(exc, RuntimeValidationError):
+        return JsonResponse(
+            {"code": "INVALID_REQUEST", "message": "request is invalid"},
+            status=422,
+        )
+    return JsonResponse(
+        {
+            "code": "CONFLICT",
+            "message": "execution request conflicts with existing state",
+        },
         status=409,
     )
 
