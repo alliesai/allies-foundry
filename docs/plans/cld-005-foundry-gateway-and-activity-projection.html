@@ -1,0 +1,301 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CLD-005 Foundry plan</title><style>:root{color-scheme:light;--ink:#17202a;--muted:#5f6b76;--line:#d9e1e8;--panel:#f6f8fa;--accent:#1f6feb}*{box-sizing:border-box}body{margin:0;background:#fff;color:var(--ink);font:15px/1.6 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:1180px;margin:0 auto;padding:34px 42px 80px}header{border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:28px}h1{font-size:32px;line-height:1.2;margin:0 0 12px}h2{font-size:24px;margin:34px 0 12px;border-bottom:1px solid var(--line);padding-bottom:6px}h3{font-size:19px;margin:26px 0 8px}p,ul,ol{max-width:1000px}li{margin:4px 0}code{background:#eef2f6;border-radius:4px;padding:1px 4px;font-size:.92em}pre{background:#10161d;color:#e6edf3;padding:16px;overflow:auto;border-radius:8px;line-height:1.45}table{border-collapse:collapse;width:100%;margin:14px 0 22px;font-size:13px}th,td{border:1px solid var(--line);padding:8px 9px;vertical-align:top;text-align:left}th{background:var(--panel)}.meta{color:var(--muted);font-size:13px}.overview{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:18px 0 30px}.card{border:1px solid var(--line);border-radius:8px;padding:14px;background:var(--panel)}.card h3{margin:0 0 6px;font-size:15px}.mermaid{background:#f6f8fa;border:1px solid var(--line);padding:16px;border-radius:8px;overflow:auto;margin:18px 0}@media(max-width:760px){main{padding:22px 16px}.overview{grid-template-columns:1fr}table{font-size:12px}}</style></head><body><main><header><h1>CLD-005 Foundry gateway and Cloud activity projection</h1><div class="meta">Foundry implementation plan - generated 2026-08-25T15:59:54.371216+00:00</div></header><section class="overview"><div class="card"><h3>Repository</h3><div>Foundry</div><div class="meta">Cross-repository CLD-005 implementation plan</div></div><div class="card"><h3>Privacy boundary</h3><div>Unresolved dispatch bytes are retained only for reconciliation.</div><div class="meta">Resolved rows follow owning-data deletion policy.</div></div></section><section class="mermaid"><div class="mermaid">flowchart LR
+A["Pending / retryable"] --> B["Reconciliation-needed"]
+B --> C["Resolved cleanup"]
+C --> D["Owner deletion policy"]</div></section><article><h1>CLD-005 Foundry gateway and Cloud activity projection plan</h1>
+<h2>Feature Overview</h2>
+<ul>
+<li>Problem: Foundry FND-007 already owns executions, attempts, leases, ordered runtime events, and terminal/session truth, but its public internal API only exposes runtime-authenticated operations and profile provisioning. Cloud needs a versioned server-to-server command, reconciliation receipt, and safe event publication boundary.</li>
+<li>Target users: Cloud's managed-conversation boundary and operators validating runtime work; runtime workers remain the only callers of lease/event mutation APIs.</li>
+<li>Source docs/specs: Accepted Nabu <code>projects/allies/engineering/specs/cld-005-foundry-gateway-and-activity-projection.md</code>; Cloud architecture contract; Foundry <code>backend/runtime/models.py</code>, <code>services/executions.py</code>, <code>services/events.py</code>, <code>services/attempts.py</code>, <code>api/register.py</code>, and FND-007 tests.</li>
+<li>Success outcome: Authenticated Cloud commands create/replay exactly one execution by workspace/idempotency identity; Cloud can reconcile without side effects; normalized events are published with stable composite identity, bounded safe payloads, and no runtime authority leakage.</li>
+</ul>
+<h2>User Stories</h2>
+<ol>
+<li>As Cloud, I want a strict v1 execution command and receipt, so a lost HTTP response can be retried or reconciled without a second Hermes stream.</li>
+<li>As Cloud, I want ordered, authenticated lifecycle events, so Cloud can project truthful product activity while Foundry remains runtime truth owner.</li>
+<li>As an operator, I want contract fixtures and sanitized delivery evidence, so schema drift, stale generations, and unsafe payloads fail before deployment.</li>
+</ol>
+<h2>Scope</h2>
+<h3>In Scope</h3>
+<ul>
+<li>Strict v1 command, receipt, reconciliation, and event-envelope DTOs with canonical JSON/SHA-256 fingerprints and unknown-version rejection. A future v2 rollout must define its own compatibility window and migration.</li>
+<li>Cloud-service-authenticated execution-intent and reconciliation endpoints.</li>
+<li>Execution correlation to immutable Cloud binding/intent references without trusting caller-supplied runtime Workspace/profile/attempt authority.</li>
+<li>Event publication/outbox tied to durable FND-007 event append and terminal/session evidence, with bounded delivery retry to Cloud. The wire vocabulary uses <code>execution.accepted</code>; any internal FND-007 <code>execution.dispatched</code> event is translated at the publisher and never emitted as a v1 wire kind.</li>
+<li>Contract fixtures, API/service tests, migrations, and sanitized staging compatibility evidence.</li>
+</ul>
+<h3>Out of Scope</h3>
+<ul>
+<li>Reworking FND-007 execution, lease, Machine, Hermes, provider, or session internals.</li>
+<li>Cloud conversation/message/activity models, Interface APIs, replay/stop/retry/repair UX, or direct Interface access.</li>
+<li>Returning Hermes profile keys, lease tokens, runtime addresses, provider payloads, or raw exceptions to Cloud/public surfaces.</li>
+</ul>
+<h3>Dependencies and Assumptions</h3>
+<ul>
+<li>Cloud Phase 0 is a hard cross-repository prerequisite: Cloud must complete its early-stage UUID identity reset for all non-waitlist tables and reconcile the CLD-004 base before Foundry implementation is enabled. Foundry remains UUID-native; its execution, attempt, lease, profile, and event UUIDs stay private and are not substituted for Cloud product IDs. Waitlist rows/data remain preserved in Cloud and their existing public-facing contract is compatibility-tested.</li>
+<li><code>Execution</code> uniqueness <code>(workspace,idempotency_key)</code>, payload digest validation, and <code>ExecutionEvent</code> attempt-local event/sequence uniqueness remain authoritative.</li>
+<li><code>RuntimeProfile</code> mapping is deterministic from Cloud binding (<code>uuid5</code> namespace already used by profile provisioning); Foundry resolves its own profile and Workspace records.</li>
+<li>FND-007 terminal completion has already performed the effective session update; publication of <code>execution.completed</code> is gated on that durable evidence.</li>
+<li>HTTPS bearer <code>ALLIES_CLOUD_SERVICE_TOKEN</code> is rotatable deployment configuration; runtime bearer and lease credentials stay on runtime-only endpoints.</li>
+<li>Event delivery uses a 60-second outbox lease, at most 8 deliveries, capped exponential backoff <code>min(300s, 2^(attempt-1))</code> plus bounded 0–25% jitter. A Cloud <code>409 sequence_gap</code> is held/retryable, never terminal.</li>
+</ul>
+<h2>Contract and Shape Definitions</h2>
+<h3>Function and Service Shapes</h3>
+<table>
+<thead>
+<tr>
+<th>Location</th>
+<th>Symbol</th>
+<th>Signature</th>
+<th>Inputs and validation</th>
+<th>Return value</th>
+<th>Side effects / errors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>backend/runtime/contracts/execution.py</code></td>
+<td><code>parse_execution_command</code></td>
+<td><code>parse_execution_command(raw: Mapping) -&gt; ExecutionCommand</code></td>
+<td>Strict v1, <code>extra=forbid</code>, workspace scope, Cloud correlation, bounded NFC text, fingerprint; unknown versions rejected</td>
+<td>Typed command</td>
+<td>Raises <code>RuntimeValidationError</code>/<code>RuntimeIdempotencyConflictError</code>; never infers private authority</td>
+</tr>
+<tr>
+<td><code>backend/runtime/services/executions.py</code></td>
+<td><code>create_cloud_execution</code></td>
+<td><code>create_cloud_execution(command: ExecutionCommand) -&gt; ExecutionReceipt</code></td>
+<td>Authenticated service context, immutable <code>cloud_binding_id</code>, profile/Workspace lookup, exact idempotency key/fingerprint</td>
+<td><code>accepted</code> or exact <code>duplicate</code> receipt; conflict/invalid/privacy-safe unavailable</td>
+<td>Transaction calls existing <code>create_execution</code>; persists correlation and outbox linkage; unique race converges</td>
+</tr>
+<tr>
+<td><code>backend/runtime/services/executions.py</code></td>
+<td><code>reconcile_cloud_execution</code></td>
+<td><code>reconcile_cloud_execution(workspace_id, idempotency_key, fingerprint) -&gt; ReconciliationReceipt</code></td>
+<td>Read-only, bounded key/fingerprint, service auth</td>
+<td>Original receipt, <code>not_found</code>, or <code>conflict</code></td>
+<td>No create/claim/lease side effect</td>
+</tr>
+<tr>
+<td><code>backend/runtime/services/publication.py</code></td>
+<td><code>publish_execution_event</code></td>
+<td><code>publish_execution_event(event: ExecutionEvent) -&gt; DeliveryResult</code></td>
+<td>Build allowlisted envelope from event/attempt/execution, current generation and Cloud correlation; translate internal <code>execution.dispatched</code> to wire <code>execution.accepted</code>; canonical fingerprint</td>
+<td><code>sent</code>, <code>duplicate</code>, <code>held_sequence_gap</code>, or retryable result</td>
+<td>HTTP POST to Cloud with 5-second timeout/body bound; stores attempt/fence and safe error code only</td>
+</tr>
+<tr>
+<td><code>backend/runtime/services/publication.py</code></td>
+<td><code>enqueue_event_publication</code></td>
+<td><code>enqueue_event_publication(event_id: UUID) -&gt; None</code></td>
+<td>Called in same transaction as event append/terminal receipt</td>
+<td>None</td>
+<td>Upserts immutable outbox row; commit-triggered task only</td>
+</tr>
+</tbody>
+</table>
+<h3>API and Transport Contracts</h3>
+<table>
+<thead>
+<tr>
+<th>Consumer</th>
+<th>Method and path / event</th>
+<th>Authentication and authorization</th>
+<th>Request schema</th>
+<th>Success response schema</th>
+<th>Error responses / retry semantics</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cloud gateway</td>
+<td><code>POST /api/v1/internal/executions</code></td>
+<td><code>_authenticate_cloud_service</code> bearer; Foundry derives Workspace/profile from <code>cloud_binding_id</code> and service records</td>
+<td><code>ExecutionCommand</code></td>
+<td><code>ExecutionReceipt</code> (<code>accepted</code>/<code>duplicate</code>) with Cloud IDs and opaque internal receipt digest; private refs never serialized</td>
+<td><code>401</code> invalid credential; <code>404</code> privacy-safe binding denial; <code>409</code> fingerprint/profile conflict; <code>422</code> invalid/oversize; <code>503</code> unavailable; exact retry only</td>
+</tr>
+<tr>
+<td>Cloud gateway</td>
+<td><code>GET /api/v1/internal/executions/reconcile</code></td>
+<td>Same bearer; no write capability</td>
+<td><code>idempotency_key</code>, <code>fingerprint</code> query</td>
+<td><code>ReconciliationReceipt</code> (<code>accepted</code>, <code>not_found</code>, <code>conflict</code>)</td>
+<td><code>401/404/409/422/503</code>; no side effect</td>
+</tr>
+<tr>
+<td>Foundry publisher</td>
+<td><code>POST /api/v1/internal/foundry/events</code> (Cloud-owned receiver)</td>
+<td>Cloud validates Foundry bearer; Foundry sends only authenticated envelopes</td>
+<td><code>FoundryEventEnvelope</code> with wire <code>execution.accepted</code> (internal <code>execution.dispatched</code> translated)</td>
+<td><code>202 {event_id,status}</code></td>
+<td>Exact envelope retry on timeout/5xx/408/429 and <code>409 sequence_gap</code>; <code>401/404/422</code> and irreconcilable fingerprint conflict are terminal; never regenerate event ID/fingerprint</td>
+</tr>
+</tbody>
+</table>
+<p>Representative command:</p>
+<pre><code class="language-json">{
+  &quot;schema_version&quot;:&quot;v1&quot;,&quot;kind&quot;:&quot;execution.command&quot;,&quot;producer&quot;:&quot;cloud&quot;,&quot;service_identity&quot;:&quot;cloud-service&quot;,
+  &quot;command_id&quot;:&quot;550e8400-e29b-41d4-a716-446655440000&quot;,&quot;idempotency_key&quot;:&quot;650e8400-e29b-41d4-a716-446655440000&quot;,
+  &quot;scope&quot;:{&quot;kind&quot;:&quot;workspace&quot;,&quot;cloud_workspace_id&quot;:&quot;750e8400-e29b-41d4-a716-446655440000&quot;},
+  &quot;conversation_turn_ordinal&quot;:12,
+  &quot;cloud&quot;:{&quot;ally_id&quot;:&quot;850e8400-e29b-41d4-a716-446655440000&quot;,&quot;conversation_id&quot;:&quot;950e8400-e29b-41d4-a716-446655440000&quot;,&quot;message_id&quot;:&quot;a50e8400-e29b-41d4-a716-446655440000&quot;,&quot;intent_id&quot;:&quot;b50e8400-e29b-41d4-a716-446655440000&quot;,&quot;cloud_binding_id&quot;:&quot;c50e8400-e29b-41d4-a716-446655440000&quot;},
+  &quot;source_kind&quot;:&quot;conversation_message&quot;,&quot;payload&quot;:{&quot;kind&quot;:&quot;execution_input&quot;,&quot;text&quot;:&quot;normalized user text&quot;},
+  &quot;issued_at&quot;:&quot;2026-08-25T12:00:00Z&quot;,&quot;deadline_at&quot;:&quot;2026-08-25T12:00:05Z&quot;,
+  &quot;fingerprint&quot;:&quot;canonical-json-sha256:v1:&lt;64 lowercase hex&gt;&quot;
+}
+</code></pre>
+<p>Representative event:</p>
+<pre><code class="language-json">{
+  &quot;schema_version&quot;:&quot;v1&quot;,&quot;kind&quot;:&quot;execution.event&quot;,&quot;producer&quot;:&quot;foundry&quot;,&quot;service_identity&quot;:&quot;foundry-service&quot;,
+  &quot;event_id&quot;:&quot;d50e8400-e29b-41d4-a716-446655440000&quot;,&quot;event_dedupe_key&quot;:&quot;execution:attempt:generation:event&quot;,
+  &quot;scope&quot;:{&quot;kind&quot;:&quot;workspace&quot;,&quot;cloud_workspace_id&quot;:&quot;750e8400-e29b-41d4-a716-446655440000&quot;},
+  &quot;cloud&quot;:{&quot;ally_id&quot;:&quot;850e8400-e29b-41d4-a716-446655440000&quot;,&quot;conversation_id&quot;:&quot;950e8400-e29b-41d4-a716-446655440000&quot;,&quot;intent_id&quot;:&quot;b50e8400-e29b-41d4-a716-446655440000&quot;,&quot;cloud_binding_id&quot;:&quot;c50e8400-e29b-41d4-a716-446655440000&quot;},
+  &quot;conversation_turn_ordinal&quot;:12,
+  &quot;foundry&quot;:{&quot;execution_id&quot;:&quot;e50e8400-e29b-41d4-a716-446655440000&quot;,&quot;attempt_id&quot;:&quot;f50e8400-e29b-41d4-a716-446655440000&quot;,&quot;generation&quot;:3,&quot;attempt_sequence&quot;:7},
+  &quot;event_type&quot;:&quot;message.delta&quot;,&quot;payload&quot;:{&quot;kind&quot;:&quot;assistant_delta&quot;,&quot;text&quot;:&quot;safe bounded fragment&quot;},
+  &quot;issued_at&quot;:&quot;2026-08-25T12:00:01Z&quot;,&quot;fingerprint&quot;:&quot;canonical-json-sha256:v1:&lt;64 lowercase hex&gt;&quot;
+}
+</code></pre>
+<p>The stable fingerprint projection uses NFC strings, sorted keys, compact JSON, ASCII escaping, <code>allow_nan=false</code>, UTF-8 SHA-256, and the <code>canonical-json-sha256:v1:</code> label. Timestamps, receipt times, retry counters, and transport headers are excluded. The immutable serialized envelope is the sole fingerprint source; persisted outbox state stores that fingerprint and never derives an optional delivery fingerprint. Reject unknown versions/kinds/fields. A future v2 rollout must publish a new fixture, compatibility window, and migration plan before accepting another version.</p>
+<h3>Schema and Data Shapes</h3>
+<table>
+<thead>
+<tr>
+<th>Schema / model</th>
+<th>Location</th>
+<th>Fields and types</th>
+<th>Required / nullable / defaults</th>
+<th>Validation and invariants</th>
+<th>Compatibility / migration notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Execution</code> correlation</td>
+<td><code>backend/runtime/models.py</code></td>
+<td>UUID <code>cloud_binding_id</code>, <code>cloud_workspace_id</code>, <code>cloud_ally_id</code>, <code>cloud_conversation_id</code>, <code>cloud_message_id</code>, <code>cloud_intent_id</code>; immutable <code>conversation_turn_ordinal</code>; <code>command_fingerprint</code></td>
+<td>Correlation required for CLD-005 commands; legacy/internal executions nullable</td>
+<td>Ordinal is accepted from Cloud only once, included in the canonical fingerprint, and echoed unchanged in every event; all Cloud IDs are UUIDs, bounded, and non-secret; workspace/idempotency uniqueness remains</td>
+<td>Additive migration after the Cloud UUID/CLD-004 gate; existing FND-007 executions remain valid with null correlation</td>
+</tr>
+<tr>
+<td><code>ExecutionEvent</code> publication identity</td>
+<td><code>backend/runtime/models.py</code></td>
+<td>Existing event/attempt/sequence/payload digest; immutable Cloud <code>conversation_turn_ordinal</code>; generation/attempt identity; envelope fingerprint</td>
+<td>No optional delivery fingerprint field; the serialized immutable envelope is the sole fingerprint source</td>
+<td>Composite identity remains <code>(attempt,event_id)</code> and <code>(attempt,sequence)</code>; Cloud ordering key is <code>(conversation_turn_ordinal,generation,attempt_id,attempt_sequence,event_id)</code> and stale generations are rejected/held; payload is allowlisted and &lt;=16 KiB</td>
+<td>No event rewrite; avoid a second persisted fingerprint authority</td>
+</tr>
+<tr>
+<td><code>CloudEventOutbox</code></td>
+<td><code>backend/runtime/models.py</code> or focused publication app</td>
+<td>event, immutable canonical UTF-8 envelope bytes/blob, byte length, SHA-256/fingerprint, delivery state, attempt count, next attempt, lease, safe error code, timestamps</td>
+<td>New rows only for Cloud-correlated events; state <code>pending</code> default</td>
+<td>Persist exact bounded bytes at append time; transmit the stored bytes directly (no DTO reserialization, newline normalization, or timestamp rebuild); every retry/restart must match captured request bytes, length, and hash; unique event/fingerprint; bounded attempts/backoff; no token/raw provider body; terminal delivery does not alter runtime truth</td>
+<td>New migration; delete/retention follows existing event policy</td>
+</tr>
+<tr>
+<td><code>ExecutionCommand</code>, <code>ExecutionReceipt</code>, <code>FoundryEventEnvelope</code></td>
+<td><code>backend/runtime/contracts/*.py</code></td>
+<td>Strict typed DTOs matching JSON above</td>
+<td><code>extra=forbid</code>; private Foundry refs are internal-only fields</td>
+<td>Scope/correlation binding, size, digest, event registry, attempt sequence, generation checks</td>
+<td>Strict v1 fixture consumed by Cloud and Foundry; future v2 compatibility is a separate rollout artifact</td>
+</tr>
+</tbody>
+</table>
+<h3>Frontend Interaction Shapes (if applicable)</h3>
+<p>Not applicable. Foundry never serves Interface state; Cloud owns customer-facing DTOs.</p>
+<h2>Phases</h2>
+<h3>Phase 0 - Gate on Cloud UUID reset and CLD-004 reconciliation</h3>
+<ul>
+<li>Goal: Prevent Foundry from publishing a contract against stale Cloud identity shapes. Cloud completes its non-waitlist UUID PK/FK reset and reconciles CLD-004 (<code>db3f590</code> versus the current Cloud base) before this repository enables CLD-005 traffic.</li>
+<li>Work items: Review Cloud's UUID-native DTO/route/fixture contract; update Foundry shared fixtures and type annotations so every <code>cloud_*</code> correlation value is a UUID; preserve Foundry-private execution/attempt/lease/profile/event UUIDs as internal-only fields. Verify Cloud waitlist preservation evidence and current waitlist contract compatibility, but make no Foundry migration or model change for waitlist data. If the CLD-004 contract is absent or still uses prefixed IDs, stop at the gate and do not add a compatibility parser.</li>
+<li>Validation/rollback: Require Cloud's Phase 0 checks (fresh schema, UUID FK constraints, waitlist before/after tests, <code>makemigrations --check</code>) plus Foundry fixture parity and strict-v1 parser tests. A failed gate rolls back only the pending Foundry fixture/route deployment; runtime execution truth remains unchanged and no Cloud event delivery is enabled.</li>
+</ul>
+<h3>Phase 1 - Freeze the joint v1 contract</h3>
+<ul>
+<li>Goal: Publish one executable schema and fingerprint implementation for Cloud and Foundry.</li>
+<li>Work items: Add contract modules, canonicalization helpers, allowlisted event registry (<code>execution.accepted</code>, <code>execution.awaiting_action</code>, <code>message.delta</code>, <code>activity.started</code>, <code>activity.completed</code>, <code>execution.completed</code>, <code>execution.stopped</code>, <code>execution.failed</code>), explicit internal <code>execution.dispatched</code>→wire <code>execution.accepted</code> translation, exact shared v1 JSON fixtures, and parity tests in both repositories. Unknown versions are rejected; v2 compatibility is deferred to a separate rollout.</li>
+<li>Impacted files/systems: <code>backend/runtime/contracts/**</code>, <code>docs/contracts/foundry-execution-gateway-v1.json</code>, runtime contract tests, Cloud fixture test.</li>
+<li>Exit criteria: Both repos produce identical fingerprints; unknown fields/kinds/versions, unsafe payloads, NaN/Infinity, and size violations fail closed.</li>
+</ul>
+<h3>Phase 2 - Add Cloud command and reconciliation endpoints</h3>
+<ul>
+<li>Goal: Accept exactly one Cloud execution intent and expose read-only lost-response recovery.</li>
+<li>Work items: Extend schemas/register routes; authenticate Cloud service token separately from runtime token; resolve binding→Workspace/profile; call existing <code>create_execution</code> in a transaction; persist correlation and receipt digest; map duplicate/conflict/invalid/privacy-safe unavailable; add API/service/concurrency tests and migration.</li>
+<li>Impacted files/systems: <code>backend/runtime/api/schemas.py</code>, <code>backend/runtime/api/register.py</code>, <code>backend/runtime/services/executions.py</code>, <code>backend/runtime/models.py</code>, migrations, tests.</li>
+<li>Exit criteria: Same workspace/key/fingerprint returns one execution; different profile/payload/binding conflicts without mutation; reconciliation never creates work; response serializers contain no lease/session/provider/runtime authority.</li>
+</ul>
+<h3>Phase 3 - Publish normalized events to Cloud</h3>
+<ul>
+<li>Goal: Make durable FND-007 events deliverable to Cloud without changing runtime truth.</li>
+<li>Work items: Add outbox row in the same transaction as <code>append_event</code> and terminal/session completion; build and persist bounded canonical UTF-8 envelope bytes (including immutable timestamps), byte length, and SHA-256/fingerprint once; translate internal dispatch evidence to wire <code>execution.accepted</code>; echo immutable Cloud <code>conversation_turn_ordinal</code> unchanged in every event; post stored bytes directly with 5-second timeout/body bound and rotatable token, without DTO reserialization, newline normalization, or new timestamps; use 60-second leases, at most 8 deliveries, <code>min(300s,2^(attempt-1)) + 0–25% jitter</code>; classify 2xx duplicate as success, <code>409 sequence_gap</code> as held/retryable, <code>401/404/422</code> or irreconcilable fingerprint conflict as terminal, and timeout/408/429/5xx/network as retryable; keep raw provider payload out of logs while retaining only the bounded contract envelope required for exact retry.</li>
+<li>Impacted files/systems: <code>backend/runtime/services/events.py</code>, <code>attempts.py</code>, <code>publication.py</code>, Celery task registration/settings, models/migration, API and contract tests.</li>
+<li>Exit criteria: Event publication preserves event ID/fingerprint/turn ordinal on retry; out-of-order N+1 delivery remains held until N is accepted or an operator/CLD-006 repair resolves it; fresh attempts with sequence 1 remain distinct by generation/attempt identity and stale generations cannot advance projection; concurrent outbox workers cannot double-send a terminal event; event order and composite identity match FND-007; terminal publication is gated by effective session update; duplicate Cloud response does not create another outbox event; exhausted delivery writes <code>delivery_exhausted</code> with operator-reconcilable identity. No automated replay/reconciliation protocol is added.</li>
+</ul>
+<h3>Phase 4 - Staging compatibility and rollout</h3>
+<ul>
+<li>Goal: Prove Cloud/Foundry can deploy independently and recover safely.</li>
+<li>Work items: Deploy Foundry endpoint and contract fixture first; configure staging Cloud URL/token only in secret store; run sanitized command→claim→event→terminal flow; verify strict v1 unknown-version rejection; publish delivery metrics without IDs/payloads; keep one global command/publication flag disabled by default and document global rollback. Future v2 compatibility is a separate rollout.</li>
+<li>Impacted files/systems: CI/staging docs and secret inventory; no provider/IaC changes in this plan.</li>
+<li>Exit criteria: Cross-repo fixture tests and staging evidence pass; disabling Cloud publication leaves Foundry truth intact and outbox retryable; rotating token does not expose or persist old secret.</li>
+</ul>
+<h2>Acceptance Criteria</h2>
+<ol>
+<li>Cloud's Phase 0 evidence proves non-waitlist Cloud identifiers are UUID-native and waitlist rows/contract are preserved before Foundry traffic is enabled.</li>
+<li>Valid Cloud command creates one workspace-scoped execution intent; exact duplicate replays receipt; conflicting key/fingerprint/profile/binding is rejected without mutation.</li>
+<li>Reconciliation returns existing receipt, not-found, or conflict and never creates an execution or lease.</li>
+<li>Foundry rejects unknown version/kind/field, malformed fingerprint, oversized/unsafe text, invalid UUID scope, cross-workspace binding, stale generation, and caller-supplied private authority.</li>
+<li>Events carry stable composite identity <code>(execution, attempt, generation, event_id)</code> and attempt-local sequence plus immutable Cloud <code>conversation_turn_ordinal</code>; publication retries exact envelopes and never regenerates work.</li>
+<li><code>execution.completed</code> is published only after FND-007 durable terminal event and effective session update; failed/stopped/awaiting-action events remain truthful and bounded.</li>
+<li>No Cloud/public response, log, metric, trace, fixture, or outbox record contains lease tokens, profile/session keys, runtime addresses, provider bodies, raw tool payloads, credentials, or unsafe exceptions.</li>
+<li>Contract and API tests run without a live Fly Machine; sanitized staging evidence proves deployed compatibility.</li>
+<li>Internal <code>execution.dispatched</code> is translated to one wire <code>execution.accepted</code>; both repositories consume the same fixture and reject contradictory event kinds.</li>
+<li>Out-of-order events return held/retryable <code>sequence_gap</code> rather than terminal loss; generation/attempt identity disambiguates fresh attempt-local sequence values, Cloud command dispatch uses a separate maximum of 5 attempts, Foundry event delivery uses a maximum of 8 deliveries, and exhausted state/operator recovery tests are explicit without automated replay.</li>
+</ol>
+<h2>Backend Considerations (if applicable)</h2>
+<h3>Query Optimization Plan</h3>
+<ul>
+<li>Hotspots/endpoints: command create/replay, reconciliation lookup, event append/outbox enqueue, outbox claim.</li>
+<li>Query-shape choices: <code>select_related("workspace","profile")</code>; lock execution by workspace/idempotency; use existing unique indexes and add correlation index only where lookup evidence requires; claim outbox with <code>select_for_update(skip_locked=True)</code> and bounded batch 20.</li>
+<li>Expected query-count change: constant-query command and event append; no per-event relation loop; publication task batches due rows.</li>
+<li>Measurement/monitoring plan: query-count tests, PostgreSQL concurrency test, sanitized latency/error counters, inspect migration indexes before staging.</li>
+</ul>
+<h3>N+1 Prevention</h3>
+<ul>
+<li>Relation access map: command resolves one Workspace/profile; envelope builder loads one execution→attempt→event; outbox worker uses <code>select_related</code> and does not query per payload field.</li>
+<li>Prefetch/select plan: <code>select_related</code> on execution/profile/workspace/attempt; no unbounded prefetch.</li>
+<li>N+1 regression guardrails: query-count tests for command, reconciliation, and publication; reviewer check that event batching does not call ORM inside a network loop.</li>
+</ul>
+<h3>Detailed Unit Test Cases</h3>
+<ul>
+<li>Happy path: accepted command, duplicate receipt, reconciliation accepted/not-found, each allowlisted event, terminal/session gate, outbox sent.</li>
+<li>Validation and bad input: unknown versions/kinds/fields, bad digest, oversized/unsafe payload, invalid timestamp/deadline, invalid sequence/generation, caller private ID mismatch.</li>
+<li>Auth/RBAC boundaries: missing/invalid Cloud bearer, runtime token cannot access Cloud command, foreign binding/workspace privacy-safe denial, stale machine generation.</li>
+<li>Idempotency/retry behavior: concurrent same key, exact retry after 503/timeout, conflicting retry, duplicate outbox delivery, Cloud duplicate response, 60-second lease expiry, eight-delivery exhaustion, capped backoff/jitter bounds, operator receipt, retention, and exact-identity recovery; process restart after lease claim must resend byte-identical persisted envelope bytes (same captured request bytes, byte length, and SHA-256), and DTO reserialization/timestamp rebuild or fingerprint mismatch must fail the test.</li>
+<li>Failure-path behavior: malformed Cloud response, Cloud 401/404/409/422/5xx, timeout, <code>409 sequence_gap</code>, N+1-before-N delivery, fresh attempts sharing sequence 1, stale-generation event, concurrent outbox workers, partial DB/outbox failure, terminal event publication failure, terminal/session gate, and token rotation.</li>
+</ul>
+<h2>Test Plan</h2>
+<ul>
+<li>Unit tests: <code>runtime/tests/test_cld005_contract.py</code>, UUID fixture/parity tests, execution/API tests, publication/outbox tests, existing FND-007 event/terminal suites.</li>
+<li>Integration/API tests: Django client with fake Cloud receiver and service bearer; shared <code>docs/contracts/foundry-execution-gateway-v1.json</code> parity; no live Fly Machine.</li>
+<li>Regression checks: <code>runtime/tests/test_fnd007_execution.py</code>, <code>runtime/tests/test_services.py</code>, <code>runtime/tests/test_api.py</code>, migrations, existing profile provisioning and runtime auth tests.</li>
+<li>Manual verification checklist: inspect OpenAPI route registration; send one command and exact duplicate; force timeout and reconcile; append safe event and duplicate; append conflicting sequence; send N+1 before N and verify held/retryable response; verify terminal gate and sanitized logs; rotate Cloud token and retry; verify global flag rollback.</li>
+<li>Commands: <code>make sync</code>; <code>make check</code>; <code>make validate</code>; <code>make test APP=runtime/tests/test_cld005_contract.py runtime/tests/test_uuid_fixture_parity.py runtime/tests/test_fnd007_execution.py runtime/tests/test_services.py runtime/tests/test_api.py</code>; <code>make runtime-test</code>; <code>make lint</code>; <code>make format</code> (inspect diff). Cloud-side gate commands remain required: <code>make check</code>, fresh <code>make migrate</code>, <code>makemigrations --check</code>, and waitlist contract/preservation tests.</li>
+<li>CI basis: <code>.github/workflows/ci.yml</code> runs locked backend/runtime validation, migrations, production configuration checks, and Codecov; <code>scripts/validate.py</code> runs backend/runtime tests and coverage XML; staging HTTPS workflow remains a health redirect check only.</li>
+</ul>
+<h2>Risks and Mitigations</h2>
+<ul>
+<li>Risk: Cloud/Foundry schema drift. Mitigation: checked-in strict v1 fixture, unknown-version rejection, Foundry-first deployment, CI parity; future v2 requires a separate compatibility artifact. Rollback/fallback: disable the one global command/publication flag and retain strict v1 parser.</li>
+<li>Risk: Cloud UUID reset or CLD-004 base drift invalidates correlation. Mitigation: Phase 0 gate, UUID-only shared fixtures, explicit commit ancestry/contract evidence, and waitlist preservation checks. Rollback/fallback: keep Foundry routes disabled and revert only fixture/route deployment; do not add a compatibility parser or alter Foundry-private UUIDs.</li>
+<li>Risk: Duplicate runtime work after ambiguous response. Mitigation: existing unique <code>(workspace,idempotency_key)</code>, persisted digest, exact retry/reconciliation, no side-effect lookup. Rollback/fallback: preserve execution/outbox and reconcile; never generate a new key.</li>
+<li>Risk: Event replay/order or stale-generation corruption. Mitigation: existing attempt event/sequence constraints plus composite envelope identity, immutable turn ordinal, generation/attempt identity, and stale-generation rejection. Translate internal <code>execution.dispatched</code> to wire <code>execution.accepted</code>; treat Cloud <code>409 sequence_gap</code> as held/retryable and leave gap recovery to operator/CLD-006 repair. Concurrent workers use leases and unique event identity. Rollback/fallback: stop delivery, retain Foundry event truth, retry sequence gaps up to the eight-delivery event budget, then write <code>delivery_exhausted</code> with operator reconciliation identity; no automated replay.</li>
+<li>Risk: Process restart or timestamp reconstruction changes a retried event body. Mitigation: persist the bounded canonical serialized envelope and fingerprint in <code>CloudEventOutbox</code> at append time; retries read those bytes rather than rebuilding the envelope. Restart/timeout and body/fingerprint mismatch tests are release gates. Rollback/fallback: quarantine the outbox row and retain runtime truth if persisted bytes fail validation; never emit a newly timestamped retry.</li>
+<li>Risk: Private runtime data leakage. Mitigation: explicit allowlist/strict serializers, bounded payload, safe error codes, redaction tests, no raw outbox body/logging. Rollback/fallback: reject unsafe event and quarantine delivery; do not silently redact unknown fields.</li>
+<li>Risk: Credential or cross-repo rollout failure. Mitigation: rotatable secret settings, timeout/body bounds, fake receiver, staging evidence, deployment order Foundry then Cloud. Rollback/fallback: revoke/rotate token, disable publication, keep runtime execution truth unchanged.</li>
+<li>Retry policy: Cloud command dispatch is a separate 60-second lease with maximum 5 attempts; Foundry publication is a 60-second lease with maximum 8 deliveries. Both use backoff <code>min(300s, 2^(attempt-1))</code> with 0–25% jitter. Retryable event outcomes: timeout, network error, 408, 409 <code>sequence_gap</code>, 429, and 5xx. Terminal: invalid credential 401, privacy-safe binding denial 404, schema/size 422, and irreconcilable fingerprint conflict. Event-gap exhaustion occurs only after the eighth delivery and stores event identity, turn ordinal, immutable envelope fingerprint, sequence, safe error code, attempt count, and timestamps; operator/CLD-006 repair reuses the same envelope identity and recovery/retention tests prove no duplicate runtime work.</li>
+<li>Open decision before implementation: confirm final route aliases and whether outbox belongs in <code>runtime</code> or a new integration app; whichever is chosen must preserve the contract and transaction boundary above.</li>
+</ul></article></main></body></html>
