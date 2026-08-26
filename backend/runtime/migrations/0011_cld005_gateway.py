@@ -175,7 +175,14 @@ class Migration(migrations.Migration):
         migrations.AddConstraint(
             model_name="executioneventdelivery",
             constraint=models.CheckConstraint(
-                condition=models.Q(("byte_length__gt", 0), ("byte_length__lte", 65536)),
+                condition=models.Q(
+                    ("byte_length", 0),
+                    ("state__in", ["delivered", "exhausted"]),
+                )
+                | (
+                    models.Q(("byte_length__gt", 0))
+                    & models.Q(("byte_length__lte", 65536))
+                ),
                 name="runtime_delivery_bytes_bounded",
             ),
         ),

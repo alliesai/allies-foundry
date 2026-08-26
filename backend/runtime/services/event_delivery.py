@@ -164,8 +164,13 @@ def mark_event_delivery(
                 row.next_attempt_at = observed_at + timedelta(
                     seconds=_backoff_seconds(row.delivery_attempts)
                 )
+        if row.state in {EventDeliveryState.DELIVERED, EventDeliveryState.EXHAUSTED}:
+            row.envelope_bytes = b""
+            row.byte_length = 0
         row.save(
             update_fields=[
+                "envelope_bytes",
+                "byte_length",
                 "state",
                 "delivered_at",
                 "lease_expires_at",
@@ -180,6 +185,8 @@ def mark_event_delivery(
 def publish_pending_event_deliveries(limit: int = MAX_DELIVERY_BATCH) -> DeliveryReport:
     """Deliver a bounded batch; the outbox remains the retry authority."""
 
+    if not getattr(settings, "ALLIES_CLOUD_EVENT_DELIVERY_ENABLED", False):
+        return DeliveryReport()
     claims = claim_event_deliveries(limit)
     delivered = deferred = exhausted = 0
     for claim in claims:

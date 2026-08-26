@@ -317,6 +317,25 @@ def _configure_delivery(settings):
     settings.ALLIES_CLOUD_EVENT_SERVICE_TOKEN = "s" * 32
 
 
+def test_disabled_delivery_does_not_consume_attempts(delivery, settings, monkeypatch):
+    settings.ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = False
+    calls = []
+    monkeypatch.setattr(
+        event_delivery,
+        "_post_to_cloud",
+        lambda _body: calls.append(True) or (503, "delivery_disabled"),
+    )
+
+    for _ in range(event_delivery.MAX_DELIVERY_ATTEMPTS + 1):
+        assert publish_pending_event_deliveries() == event_delivery.DeliveryReport()
+
+    delivery.refresh_from_db()
+    assert delivery.state == "pending"
+    assert delivery.delivery_attempts == 0
+    assert delivery.envelope_bytes
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -445,6 +464,8 @@ def test_event_delivery_fences_a_late_lease_result(delivery):
     )
     assert marked is not None
     assert marked.state == "delivered"
+    assert marked.envelope_bytes == b""
+    assert marked.byte_length == 0
 
 
 @pytest.mark.parametrize("cloud_status", ["sequence_gap", "conflict"])
@@ -468,6 +489,8 @@ def test_event_delivery_maps_cloud_409_statuses(
     else:
         assert report.exhausted == 1
         assert delivery.state == "exhausted"
+        assert delivery.envelope_bytes == b""
+        assert delivery.byte_length == 0
 
 
 def test_event_delivery_backoff_has_bounded_jitter(monkeypatch):

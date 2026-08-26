@@ -597,7 +597,7 @@ class ExecutionEvent(models.Model):
 
 
 class ExecutionEventDelivery(models.Model):
-    """Bounded, immutable wire envelope queued after an internal event commit."""
+    """Bounded wire envelope erased after delivery reaches a terminal state."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     event = models.OneToOneField(
@@ -636,7 +636,14 @@ class ExecutionEventDelivery(models.Model):
                 name="runtime_delivery_attempts_bounded",
             ),
             models.CheckConstraint(
-                condition=Q(byte_length__gt=0) & Q(byte_length__lte=64 * 1024),
+                condition=Q(
+                    state__in=[
+                        EventDeliveryState.DELIVERED,
+                        EventDeliveryState.EXHAUSTED,
+                    ],
+                    byte_length=0,
+                )
+                | (Q(byte_length__gt=0) & Q(byte_length__lte=64 * 1024)),
                 name="runtime_delivery_bytes_bounded",
             ),
             models.CheckConstraint(
@@ -655,19 +662,36 @@ class ExecutionEventDelivery(models.Model):
 
     def save(self, *args, **kwargs):
         if not self._state.adding:
-            previous = type(self).objects.only(
-                "event_id", "envelope_bytes", "byte_length", "fingerprint"
-            ).get(pk=self.pk)
-            if (
+            previous = (
+                type(self)
+                .objects.only(
+                    "event_id", "envelope_bytes", "byte_length", "fingerprint"
+                )
+                .get(pk=self.pk)
+            )
+            identity_changed = (
                 previous.event_id != self.event_id
-                or previous.envelope_bytes != self.envelope_bytes
-                or previous.byte_length != self.byte_length
                 or previous.fingerprint != self.fingerprint
-            ):
+            )
+            payload_changed = (
+                previous.envelope_bytes != self.envelope_bytes
+                or previous.byte_length != self.byte_length
+            )
+            terminal_erasure = (
+                self.state
+                in {EventDeliveryState.DELIVERED, EventDeliveryState.EXHAUSTED}
+                and self.envelope_bytes == b""
+                and self.byte_length == 0
+            )
+            if identity_changed or payload_changed and not terminal_erasure:
                 raise RuntimeConflictError("event delivery envelope is immutable")
         if not isinstance(self.envelope_bytes, bytes):
             raise RuntimeValidationError("delivery envelope must be UTF-8 bytes")
-        if not 0 < len(self.envelope_bytes) <= 64 * 1024:
+        terminal_erasure = (
+            self.state in {EventDeliveryState.DELIVERED, EventDeliveryState.EXHAUSTED}
+            and self.envelope_bytes == b""
+        )
+        if not terminal_erasure and not 0 < len(self.envelope_bytes) <= 64 * 1024:
             raise RuntimeValidationError("delivery envelope is too large")
         if self.byte_length != len(self.envelope_bytes):
             raise RuntimeValidationError("delivery byte length is invalid")
