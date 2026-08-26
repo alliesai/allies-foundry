@@ -4,6 +4,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from django.conf import settings
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from ninja.errors import ValidationError as NinjaValidationError
+from ninja.security import HttpBearer
 from ninja_extra import NinjaExtraAPI
 
 from runtime.exceptions import (
@@ -48,6 +49,17 @@ from .schemas import (
 from .schemas import ProfileProvisioningReceipt as ProfileProvisioningReceiptSchema
 
 _PROFILE_ID_NAMESPACE = uuid5(NAMESPACE_URL, "allies-foundry-profile-v1")
+
+
+class CloudServiceAuth(HttpBearer):
+    def authenticate(self, request: HttpRequest, token: str):
+        configured = getattr(settings, "ALLIES_CLOUD_SERVICE_TOKEN", None)
+        if configured and secrets.compare_digest(token.encode(), configured.encode()):
+            return token
+        return None
+
+
+_cloud_service_auth = CloudServiceAuth()
 
 
 def register(api: NinjaExtraAPI) -> None:
@@ -171,19 +183,17 @@ def register(api: NinjaExtraAPI) -> None:
         except RuntimeDomainError as exc:
             return _profile_provisioning_error(exc)
 
-    @api.post("/internal/executions", auth=None)
+    @api.post("/internal/executions", auth=_cloud_service_auth)
     def execution_create(request: HttpRequest, payload: ExecutionCommand):
         try:
-            _authenticate_cloud_service(request)
             receipt = create_execution_intent(payload)
             return JsonResponse(receipt.model_dump(mode="json"), status=200)
         except RuntimeDomainError as exc:
             return _execution_error(exc)
 
-    @api.get("/internal/executions/reconcile", auth=None)
+    @api.get("/internal/executions/reconcile", auth=_cloud_service_auth)
     def execution_reconcile(request: HttpRequest):
         try:
-            _authenticate_cloud_service(request)
             receipt = reconcile_execution_intent(
                 request.GET.get("idempotency_key", ""),
                 request.GET.get("fingerprint", ""),

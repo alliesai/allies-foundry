@@ -100,38 +100,20 @@ def reconcile_execution_intent(
     executions = list(
         Execution.objects.filter(idempotency_key=str(key)).order_by("created_at", "id")
     )
-    if not executions:
-        return ReconciliationReceipt(
-            schema_version="v1",
-            kind="execution.reconciliation",
-            status="not_found",
-            idempotency_key=key,
-            fingerprint=fingerprint,
-        )
-    if len(executions) != 1:
-        return ReconciliationReceipt(
-            schema_version="v1",
-            kind="execution.reconciliation",
-            status="conflict",
-            idempotency_key=key,
-            fingerprint=fingerprint,
-        )
-    execution = executions[0]
-    if execution.command_fingerprint != fingerprint:
-        return ReconciliationReceipt(
-            schema_version="v1",
-            kind="execution.reconciliation",
-            status="conflict",
-            idempotency_key=key,
-            fingerprint=fingerprint,
-        )
+    status = "not_found"
+    command_id = None
+    if len(executions) != 0:
+        status = "conflict"
+    if len(executions) == 1 and executions[0].command_fingerprint == fingerprint:
+        status = "accepted"
+        command_id = executions[0].command_id
     return ReconciliationReceipt(
         schema_version="v1",
         kind="execution.reconciliation",
-        status="accepted",
+        status=status,
         idempotency_key=key,
         fingerprint=fingerprint,
-        command_id=execution.command_id,
+        command_id=command_id,
     )
 
 

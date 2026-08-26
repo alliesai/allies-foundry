@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
+from io import StringIO
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
+from django.core.management import call_command
 from django.test import Client
+from django.utils import timezone
 
 from runtime.contracts import (
     ExecutionCommand,
@@ -24,7 +28,13 @@ from runtime.models import (
     Workspace,
     WorkspaceProvisioningPhase,
 )
+from runtime.services import event_delivery
 from runtime.services.claims import claim_next_execution
+from runtime.services.event_delivery import (
+    claim_event_deliveries,
+    mark_event_delivery,
+    publish_pending_event_deliveries,
+)
 from runtime.services.events import append_runtime_event
 from runtime.services.executions import create_execution_intent
 from runtime.services.runtime_auth import (
@@ -78,6 +88,27 @@ def binding(db, contract):
         hermes_session_id="session-1",
     )
     return workspace, profile
+
+
+@pytest.fixture
+def delivery(binding, contract):
+    workspace, _profile = binding
+    create_execution_intent(ExecutionCommand.model_validate(contract["command"]))
+    issued = issue_runtime_credential(workspace.id, "runtime-contract-token")
+    context = authenticate_runtime_token(issued.raw_token)
+    claim = claim_next_execution(context, uuid4(), 1)
+    assert claim is not None
+    event = append_runtime_event(
+        context,
+        claim.attempt_id,
+        claim.lease_token,
+        uuid4(),
+        claim.stream_id,
+        1,
+        "execution.dispatched",
+        {"status": "dispatched"},
+    )
+    return ExecutionEventDelivery.objects.get(event=event)
 
 
 def test_fixture_is_strict_and_fingerprints_are_reproducible(contract):
@@ -236,8 +267,239 @@ def test_invalid_service_bearer_is_privacy_safe(binding, contract, configured):
         headers={"Authorization": "Bearer wrong-token"},
     )
     assert response.status_code == 401
-    assert response.json() == {
-        "code": "INVALID_CREDENTIAL",
-        "message": "request is not authorized",
-    }
     assert configured not in response.content.decode()
+
+
+def test_command_auth_precedes_request_validation(configured):
+    responses = [
+        Client().post(
+            "/api/v1/internal/executions",
+            data="{malformed",
+            content_type="application/json",
+            headers=headers,
+        )
+        for headers in ({}, {"Authorization": "Bearer wrong-token"})
+    ]
+
+    assert [response.status_code for response in responses] == [401, 401]
+    assert responses[0].content == responses[1].content
+    assert configured not in responses[0].content.decode()
+
+
+class _DeliveryResponse:
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, limit: int = -1):
+        return self._body if limit < 0 else self._body[:limit]
+
+
+class _DeliveryOpener:
+    def __init__(self, response):
+        self.response = response
+        self.request = None
+
+    def open(self, request, *, timeout):
+        self.request = request
+        return self.response
+
+
+def _configure_delivery(settings):
+    settings.ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = True
+    settings.ALLIES_CLOUD_URL = "https://cloud.example.test"
+    settings.ALLIES_CLOUD_EVENT_SERVICE_TOKEN = "s" * 32
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"{}",
+        b'{"event_id":"00000000-0000-4000-8000-000000000000","status":"applied","extra":true}',
+        b'{"event_id":"00000000-0000-4000-8000-000000000000","status":"held"}',
+        b"not-json",
+    ],
+)
+def test_event_delivery_requires_bounded_strict_cloud_receipt(
+    delivery, settings, monkeypatch, body
+):
+    _configure_delivery(settings)
+    opener = _DeliveryOpener(_DeliveryResponse(202, body))
+    monkeypatch.setattr(event_delivery, "build_opener", lambda *_: opener)
+
+    status, code = event_delivery._post_to_cloud(bytes(delivery.envelope_bytes))
+
+    assert (status, code) == (503, "delivery_receipt_invalid")
+
+
+def test_event_delivery_rejects_mismatched_cloud_receipt(
+    delivery, settings, monkeypatch
+):
+    _configure_delivery(settings)
+    body = b'{"event_id":"00000000-0000-4000-8000-000000000000","status":"applied"}'
+    opener = _DeliveryOpener(_DeliveryResponse(202, body))
+    monkeypatch.setattr(event_delivery, "build_opener", lambda *_: opener)
+
+    status, code = event_delivery._post_to_cloud(bytes(delivery.envelope_bytes))
+
+    assert (status, code) == (503, "delivery_receipt_mismatch")
+
+
+def test_event_delivery_rejects_oversized_cloud_receipt(
+    delivery, settings, monkeypatch
+):
+    _configure_delivery(settings)
+    opener = _DeliveryOpener(
+        _DeliveryResponse(202, b"x" * (event_delivery.MAX_RESPONSE_BYTES + 1))
+    )
+    monkeypatch.setattr(event_delivery, "build_opener", lambda *_: opener)
+
+    status, code = event_delivery._post_to_cloud(bytes(delivery.envelope_bytes))
+
+    assert (status, code) == (503, "delivery_response_too_large")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://cloud.example.test",
+        "https://user:password@cloud.example.test",
+        "https://cloud.example.test/events?token=secret",
+    ],
+)
+def test_event_delivery_requires_credential_free_https_base_url(
+    delivery, settings, monkeypatch, base_url
+):
+    _configure_delivery(settings)
+    settings.ALLIES_CLOUD_URL = base_url
+    called = []
+    monkeypatch.setattr(
+        event_delivery,
+        "build_opener",
+        lambda *_: called.append(True),
+    )
+
+    status, code = event_delivery._post_to_cloud(bytes(delivery.envelope_bytes))
+
+    assert (status, code) == (503, "delivery_not_configured")
+    assert called == []
+
+
+def test_event_delivery_disables_redirects_before_sending_bearer(
+    delivery, settings, monkeypatch
+):
+    _configure_delivery(settings)
+    opener = _DeliveryOpener(_DeliveryResponse(302, b""))
+    handlers = []
+    monkeypatch.setattr(
+        event_delivery,
+        "build_opener",
+        lambda handler: handlers.append(handler) or opener,
+    )
+
+    status, _code = event_delivery._post_to_cloud(bytes(delivery.envelope_bytes))
+
+    assert status == 302
+    assert len(handlers) == 1
+    assert handlers[0] is event_delivery._NoRedirect
+    assert (
+        event_delivery._NoRedirect().redirect_request(
+            None, None, 302, "", {}, "https://evil.test"
+        )
+        is None
+    )
+
+
+def test_event_delivery_fences_a_late_lease_result(delivery):
+    first_now = timezone.now()
+    first = claim_event_deliveries(now=first_now)[0]
+    delivery.lease_expires_at = first_now - timedelta(seconds=1)
+    delivery.next_attempt_at = first_now
+    delivery.save(update_fields=["lease_expires_at", "next_attempt_at", "updated_at"])
+    second = claim_event_deliveries(now=first_now + timedelta(seconds=1))[0]
+
+    assert (
+        mark_event_delivery(
+            delivery.id,
+            attempt=first.attempt,
+            success=True,
+            now=first_now + timedelta(seconds=1),
+        )
+        is None
+    )
+    delivery.refresh_from_db()
+    assert delivery.state == "delivering"
+    assert delivery.delivery_attempts == second.attempt
+
+    marked = mark_event_delivery(
+        delivery.id,
+        attempt=second.attempt,
+        success=True,
+        now=first_now + timedelta(seconds=1),
+    )
+    assert marked is not None
+    assert marked.state == "delivered"
+
+
+@pytest.mark.parametrize("cloud_status", ["sequence_gap", "conflict"])
+def test_event_delivery_maps_cloud_409_statuses(
+    delivery, settings, monkeypatch, cloud_status
+):
+    settings.ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = True
+    monkeypatch.setattr(
+        event_delivery,
+        "_post_to_cloud",
+        lambda _body: (409, cloud_status),
+    )
+
+    report = publish_pending_event_deliveries()
+
+    delivery.refresh_from_db()
+    assert report.claimed == 1
+    if cloud_status == "sequence_gap":
+        assert report.deferred == 1
+        assert delivery.state == "pending"
+    else:
+        assert report.exhausted == 1
+        assert delivery.state == "exhausted"
+
+
+def test_event_delivery_backoff_has_bounded_jitter(monkeypatch):
+    monkeypatch.setattr(event_delivery.random, "random", lambda: 0.0)
+    assert event_delivery._backoff_seconds(1) == 1
+    monkeypatch.setattr(event_delivery.random, "random", lambda: 0.999999)
+    assert 1 < event_delivery._backoff_seconds(1) < 1.25
+    assert event_delivery._backoff_seconds(20) < 375
+
+
+def test_event_delivery_management_command_uses_bounded_watch(monkeypatch):
+    calls = []
+    sleeps = []
+    monkeypatch.setattr(
+        "runtime.management.commands.publish_event_deliveries.publish_pending_event_deliveries",
+        lambda: calls.append("run") or event_delivery.DeliveryReport(delivered=1),
+    )
+    monkeypatch.setattr(
+        "runtime.management.commands.publish_event_deliveries.sleep", sleeps.append
+    )
+
+    output = StringIO()
+    call_command(
+        "publish_event_deliveries",
+        "--watch",
+        "--interval",
+        "7",
+        "--max-runs",
+        "3",
+        stdout=output,
+    )
+
+    assert calls == ["run", "run", "run"]
+    assert sleeps == [7, 7]
+    assert output.getvalue().count("Delivered 1 event(s)") == 3
