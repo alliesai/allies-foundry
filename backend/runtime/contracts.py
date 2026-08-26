@@ -54,7 +54,7 @@ class FoundryCorrelation(ContractModel):
     execution_id: UUID
     attempt_id: UUID
     generation: StrictInt = Field(..., ge=0, le=2_147_483_647)
-    attempt_sequence: StrictInt = Field(..., ge=1, le=100_000)
+    attempt_sequence: StrictInt = Field(..., ge=1, le=513)
 
 
 class ExecutionCommand(ContractModel):

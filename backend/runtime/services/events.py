@@ -192,9 +192,11 @@ def _append_event_once(
         isinstance(sequence, bool)
         or not isinstance(sequence, int)
         or sequence <= 0
-        or sequence > 100000
+        or sequence > 512
     ):
-        raise RuntimeValidationError("sequence must be an integer from 1 to 100000")
+        raise RuntimeValidationError(
+            "non-terminal sequence must be an integer from 1 to 512"
+        )
     validate_nonempty(event_type, "event_type", max_length=64)
     if stream_id:
         validate_nonempty(stream_id, "stream_id", max_length=255)

@@ -249,6 +249,38 @@ def test_runtime_event_append_rejects_unknown_or_unsafe_payload(claimed_executio
         )
 
 
+def test_projection_event_budget_reserves_sequence_513_for_terminal_truth(
+    claimed_execution,
+):
+    context, _execution, claim = claimed_execution
+
+    with pytest.raises(RuntimeValidationError, match="1 to 512"):
+        append_runtime_event(
+            context,
+            claim.attempt_id,
+            claim.lease_token,
+            uuid4(),
+            claim.stream_id,
+            513,
+            "message.delta",
+            {"text": "beyond the non-terminal budget"},
+        )
+
+    with pytest.raises(RuntimeValidationError, match="1 to 513"):
+        complete_attempt(
+            context,
+            claim.attempt_id,
+            claim.lease_token,
+            {"code": "ok"},
+            terminal_event={
+                "event_id": uuid4(),
+                "stream_id": claim.stream_id,
+                "sequence": 514,
+                "payload": {"run_id": "run-1", "status": "completed"},
+            },
+        )
+
+
 def test_machine_fence_does_not_requeue_dispatched_work(claimed_execution):
     context, execution, claim = claimed_execution
     dispatch(context, claim)
