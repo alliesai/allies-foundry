@@ -21,6 +21,7 @@ fly tokens create org --org <slug> --expiry 168h --name "Foundry local Docker"
 ```
 
 Paste the returned short-lived token into `FLY_API_TOKEN` in `env.fly.local`.
+Replace the example `DJANGO_SECRET_KEY` with a strong random local value before starting Compose.
 Set `FLY_ORG`, `FLY_REGION`, `RUNTIME_IMAGE`, and `HERMES_IMAGE`; keep
 `FLY_MULTI_CONTAINER_ENABLED=true` and `FLY_FILE_SECRETS_ENABLED=true`. Set a
 strong `ALLIES_CLOUD_SERVICE_TOKEN` and the profile provider API key used only
