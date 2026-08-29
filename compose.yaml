@@ -9,7 +9,6 @@ x-foundry-service: &foundry-service
   environment: &foundry-environment
     DATABASE_URL: postgresql://foundry:foundry-local-only@postgres:5432/foundry
     DJANGO_DEBUG: "true"
-    DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,host.docker.internal,foundry}
     ALLIES_CLOUD_EVENT_DELIVERY_ENABLED: ${ALLIES_CLOUD_EVENT_DELIVERY_ENABLED:-false}
     ALLIES_CLOUD_URL: ${ALLIES_CLOUD_URL:-}
     ALLIES_CLOUD_EVENT_SERVICE_TOKEN: ${ALLIES_CLOUD_EVENT_SERVICE_TOKEN:-}

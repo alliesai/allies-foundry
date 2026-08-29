@@ -30,6 +30,7 @@ LEASE_SECONDS = 60.0
 DEFAULT_RENEW_INTERVAL = 20.0
 DEFAULT_STOP_SAFETY_MARGIN = 5.0
 DEFAULT_PROFILE_RECONCILE_INTERVAL = 5.0
+MAX_PROFILE_RECONCILIATION_RETRY_DELAY = 5.0
 
 
 class FoundryTransport(Protocol):
@@ -977,6 +978,7 @@ class FoundryWorker:
         self._profiles_reconciled = profile_reconciler is None
         self._profile_reconcile_interval = profile_reconcile_interval
         self._last_profile_reconciliation: float | None = None
+        self._profile_reconciliation_retry_attempts = 0
         self._active: set[asyncio.Task[Any]] = set()
         self._ambiguous_claims: dict[str, float] = {}
         self._stopping = False
@@ -1439,6 +1441,13 @@ class FoundryWorker:
             await self._reconcile_profiles(force=force)
         except (ResponseLossError, RateLimitedError, ServiceUnavailableError) as error:
             self._profiles_reconciled = False
+            self._profile_reconciliation_retry_attempts += 1
+            base_delay = max(retry_delay, 0.01)
+            exponent = min(self._profile_reconciliation_retry_attempts - 1, 8)
+            bounded_delay = min(
+                MAX_PROFILE_RECONCILIATION_RETRY_DELAY,
+                base_delay * (2**exponent),
+            )
             emit_runtime_event(
                 build_event(
                     "runtime.operation.retried",
@@ -1447,8 +1456,9 @@ class FoundryWorker:
                     error_type=type(error).__name__,
                 )
             )
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(bounded_delay)
             return False
+        self._profile_reconciliation_retry_attempts = 0
         return True
 
     async def _reconcile_profiles(self, *, force: bool = False) -> None:
