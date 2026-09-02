@@ -30,9 +30,9 @@ _REQUIRED_SETTINGS = (
     "HERMES_IMAGE",
     "PROFILE_PROVISIONING_API_KEY",
 )
-# Covers the 180-second Fly deploy bound, CLI calls, and cleanup overhead while
-# keeping retries from entering the credential bootstrap concurrently.
-_ACTIVATION_CLAIM_SECONDS = 600
+# Covers the 180-second Fly deploy bound, the lifecycle's bounded phase loops,
+# CLI calls, and cleanup overhead while keeping retries out of the full flow.
+_ACTIVATION_CLAIM_SECONDS = 900
 _MACHINE_PHASES = frozenset(
     {
         WorkspaceProvisioningPhase.MACHINE_CREATED,
@@ -190,8 +190,6 @@ class Command(BaseCommand):
                         required["FLY_REGION"],
                     )
                 )
-            self._release_activation_claim(workspace_id, activation_claim)
-            activation_claim = None
             binding = WorkspaceLifecycle(provider, jitter=False).ensure_workspace(
                 workspace_id,
                 spec,
