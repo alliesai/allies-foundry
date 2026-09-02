@@ -216,12 +216,20 @@ def register(api: NinjaExtraAPI) -> None:
                     },
                     status=202,
                 )
+            if exc.terminal:
+                return JsonResponse(
+                    {
+                        "code": "ACTIVATION_FAILED",
+                        "message": "workspace activation failed",
+                    },
+                    status=422,
+                )
             return JsonResponse(
                 {
-                    "code": "ACTIVATION_FAILED",
-                    "message": "workspace activation failed",
+                    "code": "ACTIVATION_UNAVAILABLE",
+                    "message": "workspace activation unavailable",
                 },
-                status=422,
+                status=503,
             )
         except WorkspaceNotRegisteredError:
             return JsonResponse(

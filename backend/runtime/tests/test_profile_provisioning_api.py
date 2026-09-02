@@ -159,6 +159,25 @@ def test_activation_endpoint_reports_only_retryable_failure_as_pending(
     }
 
 
+def test_activation_endpoint_reports_terminal_failure_as_unrecoverable(
+    workspace, service_token, monkeypatch
+):
+    monkeypatch.setattr(
+        "runtime.api.register.ActivateFlyWorkspaceCommand.handle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ActivationCommandError("terminal state", terminal=True)
+        ),
+    )
+
+    response = post_activation(workspace.tenant_ref)
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "ACTIVATION_FAILED",
+        "message": "workspace activation failed",
+    }
+
+
 def test_activation_endpoint_reports_unregistered_workspace_as_not_found(
     db, service_token
 ):

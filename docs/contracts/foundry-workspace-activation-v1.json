@@ -40,8 +40,8 @@
   },
   "retry": {
     "202": "Cloud retries the same workspace identity after backoff",
-    "422_activation_failed": "Cloud records repair-required because lifecycle state is terminal",
-    "503": "Cloud retries while deployment configuration is unavailable"
+    "422_activation_failed": "Cloud records repair-required because lifecycle state or credentials are terminal",
+    "503": "Cloud retries while preflight, deployment configuration, or runtime infrastructure is unavailable"
   },
   "implementation_exception": {
     "rule": "OSS-07",
