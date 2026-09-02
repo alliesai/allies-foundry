@@ -254,20 +254,20 @@ class Command(BaseCommand):
         if workspace.provisioning_phase == WorkspaceProvisioningPhase.FAILED:
             raise ActivationCommandError("Workspace activation failed", retryable=False)
         if (
-            workspace.provisioning_claim_token
-            and workspace.provisioning_claim_expires_at
-            and workspace.provisioning_claim_expires_at > now
+            workspace.activation_claim_token
+            and workspace.activation_claim_expires_at
+            and workspace.activation_claim_expires_at > now
         ):
             return None
         token = uuid4().hex
-        workspace.provisioning_claim_token = token
-        workspace.provisioning_claim_expires_at = now + timedelta(
+        workspace.activation_claim_token = token
+        workspace.activation_claim_expires_at = now + timedelta(
             seconds=_ACTIVATION_CLAIM_SECONDS
         )
         workspace.save(
             update_fields=(
-                "provisioning_claim_token",
-                "provisioning_claim_expires_at",
+                "activation_claim_token",
+                "activation_claim_expires_at",
                 "updated_at",
             )
         )
@@ -277,10 +277,10 @@ class Command(BaseCommand):
     def _release_activation_claim(workspace_id: UUID, token: str) -> None:
         Workspace.objects.filter(
             pk=workspace_id,
-            provisioning_claim_token=token,
+            activation_claim_token=token,
         ).update(
-            provisioning_claim_token=None,
-            provisioning_claim_expires_at=None,
+            activation_claim_token=None,
+            activation_claim_expires_at=None,
             updated_at=timezone.now(),
         )
 
