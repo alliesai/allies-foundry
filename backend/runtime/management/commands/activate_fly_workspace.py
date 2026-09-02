@@ -5,7 +5,7 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
+from django.db import OperationalError, transaction
 from django.utils import timezone
 
 from runtime.models import RuntimeCredential, Workspace, WorkspaceProvisioningPhase
@@ -16,6 +16,7 @@ from runtime.services.continuity_proof import (
     ProofCredentialHandle,
     ProofDependencyCredentialBootstrap,
     ProofDependencyCredentialHandle,
+    _FlySecretCommandError,
     proof_workspace_spec,
 )
 from runtime.services.workspaces import WorkspaceLifecycle, WorkspaceSpec
@@ -51,6 +52,12 @@ class ActivationCommandError(CommandError):
 
 class WorkspaceNotRegisteredError(CommandError):
     """The requested Cloud workspace has not been registered in Foundry."""
+
+
+def _activation_failure_is_retryable(exc: BaseException) -> bool:
+    return isinstance(exc, (OperationalError, _FlySecretCommandError)) or (
+        isinstance(exc, ProviderError) and exc.retryable
+    )
 
 
 class Command(BaseCommand):
@@ -197,7 +204,7 @@ class Command(BaseCommand):
                 machine_name,
                 existing_machine,
             )
-            resumable_failure = isinstance(exc, ProviderError) and exc.retryable
+            resumable_failure = _activation_failure_is_retryable(exc)
             if (credential_prepared or cleanup_owned_dependencies) and not (
                 machine_may_exist or resumable_failure
             ):
@@ -215,6 +222,7 @@ class Command(BaseCommand):
                         "resume it."
                     )
                 )
+            self.stderr.write(self.style.ERROR(f"Activation failed: {exc}"))
             raise ActivationCommandError(
                 "Fly workspace activation failed",
                 retryable=resumable_failure,
