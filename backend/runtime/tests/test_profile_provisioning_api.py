@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from django.core.management.base import CommandError
 from django.test import Client
 
 from runtime.models import (
@@ -104,6 +105,23 @@ def test_activation_endpoint_rejects_path_body_mismatch(workspace, service_token
     assert response.json() == {
         "code": "INVALID_REQUEST",
         "message": "request is invalid",
+    }
+
+
+def test_activation_endpoint_does_not_mask_permanent_command_failure(
+    workspace, service_token, monkeypatch
+):
+    monkeypatch.setattr(
+        "runtime.api.register.ActivateFlyWorkspaceCommand.handle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(CommandError("invalid config")),
+    )
+
+    response = post_activation(workspace.tenant_ref)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": "ACTIVATION_UNAVAILABLE",
+        "message": "workspace activation unavailable",
     }
 
 

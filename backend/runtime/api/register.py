@@ -17,6 +17,9 @@ from runtime.exceptions import (
     RuntimeValidationError,
 )
 from runtime.management.commands.activate_fly_workspace import (
+    ActivationCommandError,
+)
+from runtime.management.commands.activate_fly_workspace import (
     Command as ActivateFlyWorkspaceCommand,
 )
 from runtime.services.attempts import complete_attempt, fail_attempt
@@ -200,12 +203,20 @@ def register(api: NinjaExtraAPI) -> None:
             ActivateFlyWorkspaceCommand().handle(workspace_id=str(workspace_id))
         except RuntimeDomainError as exc:
             return _profile_provisioning_error(exc)
-        except CommandError:
+        except ActivationCommandError as exc:
             # A provider timeout may happen after a remote side effect. The
             # lifecycle command is resumable, so Cloud retries this workspace.
             return JsonResponse(
                 {"version": 1, "workspace_id": str(workspace_id), "status": "pending"},
-                status=202,
+                status=202 if exc.retryable else 503,
+            )
+        except CommandError:
+            return JsonResponse(
+                {
+                    "code": "ACTIVATION_UNAVAILABLE",
+                    "message": "workspace activation unavailable",
+                },
+                status=503,
             )
         return JsonResponse(
             WorkspaceActivationReceipt(

@@ -35,6 +35,14 @@ _MACHINE_PHASES = frozenset(
 )
 
 
+class ActivationCommandError(CommandError):
+    """Activation failed, with an explicit retryability classification."""
+
+    def __init__(self, message, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 class Command(BaseCommand):
     help = "Activate one registered workspace on Fly for local end-to-end testing."
 
@@ -189,7 +197,10 @@ class Command(BaseCommand):
                         "resume it."
                     )
                 )
-            raise CommandError("Fly workspace activation failed") from exc
+            raise ActivationCommandError(
+                "Fly workspace activation failed",
+                retryable=resumable_failure or machine_may_exist,
+            ) from exc
 
         self.stdout.write(
             self.style.SUCCESS(
