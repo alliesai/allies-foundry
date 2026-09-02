@@ -1,7 +1,9 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
+import allies_mnemosyne.provider as provider_module
 from allies_mnemosyne import ALLOWED_TOOLS, AlliesMnemosyneProvider
 
 
@@ -135,6 +137,24 @@ def test_explicit_write_retention_gate_rejects_forbidden_data(tmp_path, content)
     assert delegate.calls == []
 
 
+def test_retention_gate_allows_durable_commitment_language(tmp_path):
+    delegate = FakeDelegate()
+    provider = ready_provider(tmp_path, delegate=delegate)
+
+    result = json.loads(
+        provider.handle_tool_call(
+            "mnemosyne_remember",
+            {
+                "content": "The user is committed to a 10-minute daily walk",
+                "source": "preference",
+            },
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert delegate.calls[-1][1]["scope"] == "global"
+
+
 def test_write_disables_llm_extraction(tmp_path):
     provider = ready_provider(tmp_path)
     result = json.loads(
@@ -215,6 +235,50 @@ def test_profile_paths_and_immutable_identity_are_checked(tmp_path):
         }
     )
     assert error == "profile_identity_invalid"
+
+
+def test_initialize_shuts_down_delegate_after_invariant_failure(tmp_path, monkeypatch):
+    class FakeConnection:
+        def execute(self, _query):
+            return None
+
+    class InitializedDelegate:
+        def __init__(self):
+            self._beam = SimpleNamespace(
+                db_path=tmp_path / "outside" / "ally-1" / "mnemosyne.db",
+                conn=FakeConnection(),
+            )
+            self._surface_beam = None
+            self.shutdown_called = False
+
+        def initialize(self, _session_id, **_kwargs):
+            return None
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    delegate = InitializedDelegate()
+    original_import = provider_module.importlib.import_module
+
+    def import_module(name):
+        if name == "mnemosyne_hermes":
+            return SimpleNamespace(MnemosyneMemoryProvider=lambda: delegate)
+        return original_import(name)
+
+    monkeypatch.setattr(provider_module.importlib, "import_module", import_module)
+    provider = AlliesMnemosyneProvider()
+    profile = (tmp_path / "profile").resolve()
+
+    provider.initialize(
+        "session",
+        hermes_home=str(profile),
+        profile_root=str(profile),
+        agent_identity="ally-1",
+        agent_context="conversation",
+    )
+
+    assert provider.status()["available"] is False
+    assert delegate.shutdown_called is True
 
 
 def test_profile_config_controls_mode_and_tools_without_hermes_core_changes(tmp_path):

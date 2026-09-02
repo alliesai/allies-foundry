@@ -88,8 +88,8 @@ _TRANSCRIPT_RE = re.compile(
 )
 _EPHEMERAL_RE = re.compile(
     r"(?i)(?:one[- ]off|one[- ]time|temporary|scratchpad|just\s+computed|"
-    r"completed\s+(?:status|artifact)|artifact(?:\s+id|\s+identifier)?|"
-    r"commit(?:\s+sha|\s+identifier|\s+id)?)"
+    r"completed\s+(?:status|artifact)|artifact\s+(?:id|identifier)\b|"
+    r"commit\s+(?:sha|identifier|id)\b)"
 )
 _COMMIT_RE = re.compile(r"\b[0-9a-f]{7,64}\b", re.IGNORECASE)
 _SAFE_SOURCES = frozenset(
@@ -414,6 +414,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
         if self._agent_context.lower() in {"cron", "flush", "subagent", "background"}:
             self._reason = "context_skipped"
             return
+        delegate: Any = None
         try:
             memory_data = memory_root / "data"
             memory_data.mkdir(parents=True, exist_ok=True)
@@ -496,6 +497,8 @@ class AlliesMnemosyneProvider(MemoryProvider):
             self._available = True
             self._reason = "ready"
         except BaseException as exc:  # noqa: BLE001 - lifecycle faults fail soft
+            if delegate is not None:
+                _invoke(delegate.shutdown)
             self._available = False
             self._reason = _safe_reason(exc)
             self._delegate = None
