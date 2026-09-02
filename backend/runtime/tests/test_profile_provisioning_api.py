@@ -62,6 +62,51 @@ def post_profile(payload, *, token="test-service-token"):
     )
 
 
+def post_activation(workspace_id, *, token="test-service-token"):
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+    return Client().post(
+        f"/api/v1/internal/workspaces/{workspace_id}/activation",
+        data=json.dumps({"version": 1, "workspace_id": str(workspace_id)}),
+        content_type="application/json",
+        headers=headers,
+    )
+
+
+def test_activation_endpoint_invokes_existing_lifecycle(
+    workspace, service_token, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        "runtime.api.register.ActivateFlyWorkspaceCommand.handle",
+        lambda _command, **options: calls.append(options),
+    )
+
+    response = post_activation(workspace.tenant_ref)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "version": 1,
+        "workspace_id": workspace.tenant_ref,
+        "status": "active",
+    }
+    assert calls == [{"workspace_id": workspace.tenant_ref}]
+
+
+def test_activation_endpoint_rejects_path_body_mismatch(workspace, service_token):
+    response = Client().post(
+        f"/api/v1/internal/workspaces/{workspace.tenant_ref}/activation",
+        data=json.dumps({"version": 1, "workspace_id": str(uuid4())}),
+        content_type="application/json",
+        headers={"Authorization": "Bearer test-service-token"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "INVALID_REQUEST",
+        "message": "request is invalid",
+    }
+
+
 def test_fixture_request_creates_pending_profile_without_private_receipt_fields(
     workspace, contract, service_token
 ):
