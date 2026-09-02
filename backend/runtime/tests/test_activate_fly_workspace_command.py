@@ -168,6 +168,21 @@ def test_command_rejects_missing_activation_settings():
 
 
 @pytest.mark.django_db
+def test_activation_claim_serializes_credential_bootstrap():
+    from runtime.management.commands.activate_fly_workspace import Command
+
+    workspace = Workspace.objects.create(tenant_ref=str(uuid4()))
+
+    first = Command._claim_activation(workspace.id)
+    second = Command._claim_activation(workspace.id)
+
+    assert first is not None
+    assert second is None
+    Command._release_activation_claim(workspace.id, first)
+    assert Command._claim_activation(workspace.id) is not None
+
+
+@pytest.mark.django_db
 def test_active_generation_must_have_a_ready_recorded_machine(monkeypatch):
     configure_activation(monkeypatch)
     tenant_ref = uuid4()
@@ -207,8 +222,10 @@ def test_resumable_failure_retains_credentials_when_machine_appears(monkeypatch)
     lifecycle = FailingLifecycle(provider, workspace.id, create_machine=True)
     patch_command_dependencies(monkeypatch, provider, lifecycle)
 
-    with pytest.raises(CommandError, match="activation failed"):
+    with pytest.raises(CommandError, match="activation failed") as error:
         call_command("activate_fly_workspace", str(tenant_ref))
+
+    assert error.value.retryable is True
 
     assert FakeCredentialBootstrap.instances[0].cleanup_calls == []
     assert FakeDependencyBootstrap.instances[0].cleanup_calls == []
@@ -227,8 +244,10 @@ def test_terminal_failure_does_not_revoke_existing_active_credential(monkeypatch
     provider = CommandProvider()
     patch_command_dependencies(monkeypatch, provider, TerminalLifecycle())
 
-    with pytest.raises(CommandError, match="activation failed"):
+    with pytest.raises(CommandError, match="activation failed") as error:
         call_command("activate_fly_workspace", str(tenant_ref))
+
+    assert error.value.retryable is False
 
     credential.refresh_from_db()
     assert credential.revoked_at is None

@@ -9,6 +9,7 @@ import pytest
 from django.core.management.base import CommandError
 from django.test import Client
 
+from runtime.management.commands.activate_fly_workspace import ActivationCommandError
 from runtime.models import (
     RuntimeProfile,
     RuntimeProfileLifecycleState,
@@ -122,6 +123,38 @@ def test_activation_endpoint_does_not_mask_permanent_command_failure(
     assert response.json() == {
         "code": "ACTIVATION_UNAVAILABLE",
         "message": "workspace activation unavailable",
+    }
+
+
+def test_activation_endpoint_reports_only_retryable_failure_as_pending(
+    workspace, service_token, monkeypatch
+):
+    monkeypatch.setattr(
+        "runtime.api.register.ActivateFlyWorkspaceCommand.handle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ActivationCommandError("provider timeout", retryable=True)
+        ),
+    )
+
+    response = post_activation(workspace.tenant_ref)
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "version": 1,
+        "workspace_id": workspace.tenant_ref,
+        "status": "pending",
+    }
+
+
+def test_activation_endpoint_reports_unregistered_workspace_as_not_found(
+    db, service_token
+):
+    response = post_activation(uuid4())
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "code": "WORKSPACE_NOT_FOUND",
+        "message": "workspace is unavailable",
     }
 
 

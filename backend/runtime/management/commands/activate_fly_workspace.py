@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from uuid import UUID, uuid4
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+from django.utils import timezone
 
 from runtime.models import RuntimeCredential, Workspace, WorkspaceProvisioningPhase
 from runtime.providers import FlyProvider, ProviderError, deterministic_resource_names
@@ -43,6 +46,10 @@ class ActivationCommandError(CommandError):
         self.retryable = retryable
 
 
+class WorkspaceNotRegisteredError(CommandError):
+    """The requested Cloud workspace has not been registered in Foundry."""
+
+
 class Command(BaseCommand):
     help = "Activate one registered workspace on Fly for local end-to-end testing."
 
@@ -59,6 +66,12 @@ class Command(BaseCommand):
         missing = sorted(name for name, value in required.items() if not value)
         if missing:
             raise CommandError(f"Missing required settings: {', '.join(missing)}")
+
+        activation_claim = self._claim_activation(workspace_id)
+        if activation_claim is None:
+            raise ActivationCommandError(
+                "Workspace activation is already in progress", retryable=True
+            )
 
         names = deterministic_resource_names(workspace_id)
         app_name = names.app
@@ -167,6 +180,8 @@ class Command(BaseCommand):
                         required["FLY_REGION"],
                     )
                 )
+            self._release_activation_claim(workspace_id, activation_claim)
+            activation_claim = None
             binding = WorkspaceLifecycle(provider, jitter=False).ensure_workspace(
                 workspace_id,
                 spec,
@@ -199,8 +214,11 @@ class Command(BaseCommand):
                 )
             raise ActivationCommandError(
                 "Fly workspace activation failed",
-                retryable=resumable_failure or machine_may_exist,
+                retryable=resumable_failure,
             ) from exc
+        finally:
+            if activation_claim is not None:
+                self._release_activation_claim(workspace_id, activation_claim)
 
         self.stdout.write(
             self.style.SUCCESS(
@@ -215,7 +233,43 @@ class Command(BaseCommand):
             tenant_ref = str(UUID(value))
             return Workspace.objects.get(tenant_ref=tenant_ref)
         except (TypeError, ValueError, Workspace.DoesNotExist) as exc:
-            raise CommandError("workspace_id is not registered") from exc
+            raise WorkspaceNotRegisteredError("workspace_id is not registered") from exc
+
+    @staticmethod
+    @transaction.atomic
+    def _claim_activation(workspace_id: UUID) -> str | None:
+        workspace = Workspace.objects.select_for_update().get(pk=workspace_id)
+        now = timezone.now()
+        if workspace.provisioning_phase == WorkspaceProvisioningPhase.FAILED:
+            raise ActivationCommandError("Workspace activation failed", retryable=False)
+        if (
+            workspace.provisioning_claim_token
+            and workspace.provisioning_claim_expires_at
+            and workspace.provisioning_claim_expires_at > now
+        ):
+            return None
+        token = uuid4().hex
+        workspace.provisioning_claim_token = token
+        workspace.provisioning_claim_expires_at = now + timedelta(seconds=60)
+        workspace.save(
+            update_fields=(
+                "provisioning_claim_token",
+                "provisioning_claim_expires_at",
+                "updated_at",
+            )
+        )
+        return token
+
+    @staticmethod
+    def _release_activation_claim(workspace_id: UUID, token: str) -> None:
+        Workspace.objects.filter(
+            pk=workspace_id,
+            provisioning_claim_token=token,
+        ).update(
+            provisioning_claim_token=None,
+            provisioning_claim_expires_at=None,
+            updated_at=timezone.now(),
+        )
 
     @staticmethod
     def _active_credential(
