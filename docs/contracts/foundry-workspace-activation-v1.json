@@ -44,9 +44,11 @@
     "503": "Cloud retries while deployment configuration is unavailable"
   },
   "implementation_exception": {
+    "rule": "OSS-07",
     "scope": "The v1 activation service is Fly-only and currently composes the existing Fly management command.",
     "reason": "The staging fix must reuse the already-proven lifecycle and credential bootstrap without duplicating provider orchestration.",
     "risk": "The API service is coupled to Fly-specific settings until activation composition moves behind a provider-neutral service.",
+    "mitigation": "Keep the endpoint bearer-authenticated, retain strict workspace and receipt validation, and move provider orchestration behind the existing provider-neutral workspace seam before introducing another provider.",
     "owner": "Foundry",
     "revisit_condition": "Before adding a second workspace provider or promoting the activation contract beyond Fly-backed Allies environments."
   }

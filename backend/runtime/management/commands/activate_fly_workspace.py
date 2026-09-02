@@ -29,6 +29,9 @@ _REQUIRED_SETTINGS = (
     "HERMES_IMAGE",
     "PROFILE_PROVISIONING_API_KEY",
 )
+# Covers the 180-second Fly deploy bound, CLI calls, and cleanup overhead while
+# keeping retries from entering the credential bootstrap concurrently.
+_ACTIVATION_CLAIM_SECONDS = 600
 _MACHINE_PHASES = frozenset(
     {
         WorkspaceProvisioningPhase.MACHINE_CREATED,
@@ -250,7 +253,9 @@ class Command(BaseCommand):
             return None
         token = uuid4().hex
         workspace.provisioning_claim_token = token
-        workspace.provisioning_claim_expires_at = now + timedelta(seconds=60)
+        workspace.provisioning_claim_expires_at = now + timedelta(
+            seconds=_ACTIVATION_CLAIM_SECONDS
+        )
         workspace.save(
             update_fields=(
                 "provisioning_claim_token",

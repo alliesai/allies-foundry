@@ -109,6 +109,19 @@ def test_activation_endpoint_rejects_path_body_mismatch(workspace, service_token
     }
 
 
+@pytest.mark.parametrize("token", [None, "wrong-service-token"])
+def test_activation_endpoint_rejects_missing_or_invalid_service_bearer(
+    workspace, service_token, token
+):
+    response = post_activation(workspace.tenant_ref, token=token)
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "code": "INVALID_CREDENTIAL",
+        "message": "request is not authorized",
+    }
+
+
 def test_activation_endpoint_does_not_mask_permanent_command_failure(
     workspace, service_token, monkeypatch
 ):
