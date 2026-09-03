@@ -262,6 +262,39 @@ async def test_profile_session_create_uses_selected_profile_credential(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_profile_bootstrap_uses_strict_private_payload(monkeypatch):
+    response = FakeResponse(
+        json.dumps(
+            {
+                "object": "hermes.session.bootstrap",
+                "session_id": "candidate-1",
+                "message_id": "8ef84387-581e-4e6f-a31d-6fbca75d95f4",
+                "status": "created",
+            }
+        ).encode(),
+        status=201,
+    )
+    client, calls = _client(monkeypatch, response)
+    bootstrap = {
+        "kind": "assistant_message",
+        "message_id": "8ef84387-581e-4e6f-a31d-6fbca75d95f4",
+        "text": "Hi, I'm Nova.",
+    }
+
+    result = await client.bootstrap_session("ally-a", "candidate-1", bootstrap)
+
+    assert result.status == "created"
+    assert calls[0][0].endswith("/p/ally-a/api/sessions/candidate-1/bootstrap")
+    assert json.loads(calls[0][3]) == {
+        "schema_version": "v1",
+        "kind": "assistant_transcript_bootstrap",
+        "message_id": bootstrap["message_id"],
+        "text": bootstrap["text"],
+    }
+    assert response.closed
+
+
+@pytest.mark.asyncio
 async def test_profile_credential_resolution_does_not_block_the_event_loop():
     started = Event()
     release = Event()

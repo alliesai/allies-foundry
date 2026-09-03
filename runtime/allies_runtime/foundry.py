@@ -21,8 +21,19 @@ from datetime import datetime
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from .errors import HermesError, HermesHistoryMismatch, HermesMalformedResponse
-from .hermes import HermesEvent, stable_session_identifiers, validate_stream_message
+from .errors import (
+    HermesDisconnected,
+    HermesError,
+    HermesHistoryMismatch,
+    HermesMalformedResponse,
+    HermesTimeout,
+)
+from .hermes import (
+    HermesBootstrap,
+    HermesEvent,
+    stable_session_identifiers,
+    validate_stream_message,
+)
 from .observability import build_event, emit_runtime_event
 
 MAX_CLAIM_SLOTS = 8
@@ -31,6 +42,10 @@ DEFAULT_RENEW_INTERVAL = 20.0
 DEFAULT_STOP_SAFETY_MARGIN = 5.0
 DEFAULT_PROFILE_RECONCILE_INTERVAL = 5.0
 MAX_PROFILE_RECONCILIATION_RETRY_DELAY = 5.0
+
+
+class _BootstrapResponseLost(HermesError):
+    code = "bootstrap_response_lost"
 
 
 class FoundryTransport(Protocol):
@@ -941,6 +956,25 @@ async def _stream_events(
     return replay()
 
 
+def _first_turn_bootstrap(value: Any) -> HermesBootstrap | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {
+        "kind",
+        "message_id",
+        "text",
+    }:
+        raise InvalidRequestError("Execution bootstrap was invalid")
+    if value.get("kind") != "assistant_message":
+        raise InvalidRequestError("Execution bootstrap was invalid")
+    try:
+        message_id = str(UUID(str(value.get("message_id"))))
+        text = validate_stream_message(value.get("text"))
+    except (TypeError, ValueError):
+        raise InvalidRequestError("Execution bootstrap was invalid") from None
+    return HermesBootstrap(message_id=message_id, text=text)
+
+
 class FoundryWorker:
     """Bounded claim/stream supervisor for one runtime process."""
 
@@ -1004,6 +1038,55 @@ class FoundryWorker:
     async def run_claim(self, claim: FoundryClaim) -> Any:
         return await self._run_claim(claim)
 
+    async def _bootstrap_first_turn(
+        self, claim: FoundryClaim, session_id: str
+    ) -> None:
+        """Seed Hermes before the first durable Foundry checkpoint."""
+
+        bootstrap = _first_turn_bootstrap(claim.payload.get("bootstrap"))
+        if bootstrap is None:
+            return
+        if claim.session_id is not None:
+            raise InvalidRequestError("Execution bootstrap arrived after binding")
+        ensure_session = getattr(self.hermes, "ensure_profile_session", None)
+        bootstrap_session = getattr(self.hermes, "bootstrap_session", None)
+        if not callable(ensure_session) or not callable(bootstrap_session):
+            raise HermesError("Hermes session bootstrap was unavailable")
+        ensured = ensure_session(
+            claim.hermes_profile_key,
+            session_id,
+            model=claim.model,
+        )
+        if inspect.isawaitable(ensured):
+            await ensured
+
+        def send_bootstrap() -> Any:
+            result = bootstrap_session(
+                claim.hermes_profile_key,
+                session_id,
+                bootstrap,
+            )
+            return result
+
+        try:
+            result = send_bootstrap()
+            if inspect.isawaitable(result):
+                result = await result
+        except (HermesTimeout, HermesDisconnected):
+            try:
+                result = send_bootstrap()
+                if inspect.isawaitable(result):
+                    result = await result
+            except (HermesTimeout, HermesDisconnected):
+                raise _BootstrapResponseLost()
+        status = (
+            result.get("status")
+            if isinstance(result, Mapping)
+            else getattr(result, "status", None)
+        )
+        if status not in {"created", "duplicate"}:
+            raise HermesMalformedResponse("Hermes bootstrap response was malformed")
+
     async def _renew_loop(
         self, claim: FoundryClaim, stream: Any, lost: asyncio.Event
     ) -> None:
@@ -1051,6 +1134,9 @@ class FoundryWorker:
 
             identifiers = stable_session_identifiers(claim.profile_id, conversation_id)
             session_id = claim.session_id or identifiers.candidate_id
+            bootstrap = _first_turn_bootstrap(claim.payload.get("bootstrap"))
+            if bootstrap is not None and claim.session_id is not None:
+                raise InvalidRequestError("Execution bootstrap arrived after binding")
             history_verified = False
             expected_history_marker = claim.payload.get("proof_expected_history_marker")
             if expected_history_marker is not None:
@@ -1077,6 +1163,9 @@ class FoundryWorker:
                 if history_verified is not True:
                     raise HermesHistoryMismatch()
 
+            if bootstrap is not None:
+                await self._bootstrap_first_turn(claim, session_id)
+
             sequence = 1
             dispatch_payload = {"status": "dispatched"}
             try:
@@ -1099,7 +1188,7 @@ class FoundryWorker:
                     claim.lease_token,
                     reason="dispatch_response_lost",
                 )
-            if claim.session_id is None:
+            if claim.session_id is None and bootstrap is None:
                 ensure_session = getattr(self.hermes, "ensure_profile_session", None)
                 if not callable(ensure_session):
                     raise HermesError("Hermes session operations were unavailable")
@@ -1238,6 +1327,15 @@ class FoundryWorker:
             try:
                 return await self.foundry.stopped(
                     claim.attempt_id, claim.lease_token, reason="cancelled"
+                )
+            except FoundryError:
+                return None
+        except _BootstrapResponseLost:
+            try:
+                return await self.foundry.stopped(
+                    claim.attempt_id,
+                    claim.lease_token,
+                    reason="bootstrap_response_lost",
                 )
             except FoundryError:
                 return None
