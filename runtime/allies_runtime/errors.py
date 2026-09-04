@@ -58,8 +58,8 @@ __all__ = [
     "HermesHistoryMismatch",
     "HermesMalformedResponse",
     "HermesSessionExists",
-    "HermesTranscriptConflict",
     "HermesTimeout",
+    "HermesTranscriptConflict",
     "HermesUnavailable",
     "IdentityIsolationError",
 ]

@@ -4,7 +4,11 @@ from dataclasses import dataclass, replace
 
 import pytest
 
-from allies_runtime.errors import HermesDisconnected, HermesMalformedResponse, HermesTimeout
+from allies_runtime.errors import (
+    HermesDisconnected,
+    HermesMalformedResponse,
+    HermesTimeout,
+)
 from allies_runtime.foundry import (
     EventReceipt,
     FencedError,
@@ -257,6 +261,71 @@ async def test_two_bootstrap_response_losses_requeue_before_dispatch():
     assert foundry.events == []
     assert foundry.stops == ["bootstrap_response_lost"]
     assert hermes.streams == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_bound_session_before_any_hermes_call():
+    foundry = RecordingFoundry()
+    hermes = RecordingHermes()
+    bootstrap = {
+        "kind": "assistant_message",
+        "message_id": "8ef84387-581e-4e6f-a31d-6fbca75d95f4",
+        "text": "Hi, I'm Nova.",
+    }
+
+    result = await FoundryWorker(foundry, hermes).run_claim(
+        claim(session_id="session-1", bootstrap=bootstrap)
+    )
+
+    assert result.status == "failed"
+    assert hermes.ensured == []
+    assert hermes.bootstraps == []
+    assert hermes.streams == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_rejects_malformed_acknowledgement_before_dispatch():
+    class MalformedBootstrapHermes(RecordingHermes):
+        async def bootstrap_session(self, profile_key, session_id, bootstrap):
+            return {"status": "unexpected"}
+
+    foundry = RecordingFoundry()
+    hermes = MalformedBootstrapHermes()
+    bootstrap = {
+        "kind": "assistant_message",
+        "message_id": "8ef84387-581e-4e6f-a31d-6fbca75d95f4",
+        "text": "Hi, I'm Nova.",
+    }
+
+    result = await FoundryWorker(foundry, hermes).run_claim(
+        claim(bootstrap=bootstrap)
+    )
+
+    assert result.status == "failed"
+    assert foundry.events == []
+    assert hermes.streams == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bootstrap",
+    [
+        {},
+        {"kind": "user_message", "message_id": "bad", "text": "hello"},
+        {"kind": "assistant_message", "message_id": "bad", "text": "hello"},
+    ],
+)
+async def test_bootstrap_rejects_invalid_claim_shape(bootstrap):
+    foundry = RecordingFoundry()
+    hermes = RecordingHermes()
+
+    result = await FoundryWorker(foundry, hermes).run_claim(
+        claim(bootstrap=bootstrap)
+    )
+
+    assert result.status == "failed"
+    assert foundry.events == []
+    assert hermes.ensured == []
 
 
 @pytest.mark.asyncio

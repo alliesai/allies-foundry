@@ -30,8 +30,8 @@ from .errors import (
     HermesError,
     HermesMalformedResponse,
     HermesSessionExists,
-    HermesTranscriptConflict,
     HermesTimeout,
+    HermesTranscriptConflict,
     HermesUnavailable,
 )
 from .observability import build_event, emit_runtime_event
@@ -126,7 +126,7 @@ def _bootstrap_fields(
     elif isinstance(bootstrap, Mapping):
         value = bootstrap
     else:
-        raise ValueError("Hermes bootstrap must be an assistant message object")
+        raise TypeError("Hermes bootstrap must be an assistant message object")
     if set(value) != {"kind", "message_id", "text"} or value.get(
         "kind"
     ) != "assistant_message":
@@ -1406,9 +1406,9 @@ __all__ = [
     "TEST_CREDENTIAL_PREFIX",
     "CancellableHermesStream",
     "CredentialResolver",
-    "HermesClient",
     "HermesBootstrap",
     "HermesBootstrapResult",
+    "HermesClient",
     "HermesEvent",
     "HermesHealth",
     "HermesSession",
