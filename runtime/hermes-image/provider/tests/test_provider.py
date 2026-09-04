@@ -278,7 +278,12 @@ def test_initialize_shuts_down_delegate_after_invariant_failure(tmp_path, monkey
     )
 
     assert provider.status()["available"] is False
+    assert provider.status()["reason"] == "mnemosyne_database_outside_profile"
     assert delegate.shutdown_called is True
+
+
+def test_safe_reason_does_not_expose_untrusted_exception_text():
+    assert provider_module._safe_reason(RuntimeError("secret path")) == "runtime"
 
 
 def test_profile_config_controls_mode_and_tools_without_hermes_core_changes(tmp_path):
