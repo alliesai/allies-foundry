@@ -634,7 +634,7 @@ def test_event_delivery_command_bounds_power_work_around_delivery(monkeypatch):
     monkeypatch.setattr(
         f"{command_path}.process_runtime_wakes",
         lambda *, limit: calls.append(("wake", limit))
-        or type("Wake", (), {"started": 0, "failed": 0})(),
+        or type("Wake", (), {"started": 0, "failed": 0, "unavailable": 1})(),
     )
     monkeypatch.setattr(
         f"{command_path}.publish_pending_event_deliveries",
@@ -648,10 +648,11 @@ def test_event_delivery_command_bounds_power_work_around_delivery(monkeypatch):
     monkeypatch.setattr(
         f"{command_path}.stop_idle_workspaces",
         lambda *, limit: calls.append(("idle", limit))
-        or type("Idle", (), {"stopped": 0})(),
+        or type("Idle", (), {"stopped": 0, "unavailable": 2})(),
     )
 
-    call_command("publish_event_deliveries", stdout=StringIO())
+    output = StringIO()
+    call_command("publish_event_deliveries", stdout=output)
 
     assert calls == [
         ("wake", 1),
@@ -659,3 +660,5 @@ def test_event_delivery_command_bounds_power_work_around_delivery(monkeypatch):
         ("cleanup", None),
         ("idle", 1),
     ]
+    assert "wake unavailable 1" in output.getvalue()
+    assert "idle unavailable 2" in output.getvalue()

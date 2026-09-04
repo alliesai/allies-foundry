@@ -485,6 +485,45 @@ async def test_profile_reconciliation_retries_not_ready_receipt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_profile_reconciliation_retries_fenced_readiness_receipt(monkeypatch):
+    class Reconciler:
+        async def reconcile(self):
+            return None
+
+    class ReadinessFoundry:
+        def __init__(self):
+            self.last_reconciliation_snapshot = RuntimeReconciliationSnapshot(
+                machine_generation=7,
+                runtime_start_epoch=12,
+                profiles=(),
+            )
+            self.calls = 0
+
+        async def report_readiness(self, **_payload):
+            self.calls += 1
+            if self.calls == 1:
+                raise FencedError("runtime start epoch changed")
+
+    foundry = ReadinessFoundry()
+    worker = FoundryWorker(
+        foundry,
+        FakeHermesClient(),
+        profile_reconciler=Reconciler(),
+    )
+    delays: list[float] = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+
+    assert not await worker._reconcile_profiles_or_wait(force=True, retry_delay=1.0)
+    assert await worker._reconcile_profiles_or_wait(force=True, retry_delay=1.0)
+    assert foundry.calls == 2
+    assert delays == [1.0]
+
+
+@pytest.mark.asyncio
 async def test_worker_renewal_loss_closes_stream_and_stops_before_completion():
     claim = {**CLAIM, "hermes_profile_key": "ally-a"}
     foundry, transport = client(

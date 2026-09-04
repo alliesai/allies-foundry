@@ -949,6 +949,23 @@ def test_idle_stop_is_gated_and_clears_deadline(workspace):
 
 
 @override_settings(ALLIES_RUNTIME_IDLE_STOP_ENABLED=True)
+def test_failed_idle_stop_parks_expired_deadline(workspace):
+    now = timezone.now()
+    workspace.speculative_keep_warm_until = now - timedelta(seconds=1)
+    workspace.save(update_fields=["speculative_keep_warm_until", "updated_at"])
+    provider = FakePowerProvider(workspace, state=MachineState.DESTROYED)
+
+    first = stop_idle_workspaces(provider=provider, now=now)
+    workspace.refresh_from_db()
+    second = stop_idle_workspaces(provider=provider, now=now + timedelta(seconds=1))
+
+    assert first.failed == 1
+    assert workspace.speculative_keep_warm_until is None
+    assert second.examined == 0
+    assert provider.inspect_calls == 1
+
+
+@override_settings(ALLIES_RUNTIME_IDLE_STOP_ENABLED=True)
 def test_failed_provisioning_with_retained_binding_can_idle_stop(workspace):
     now = timezone.now()
     workspace.provisioning_phase = WorkspaceProvisioningPhase.FAILED

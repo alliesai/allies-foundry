@@ -364,7 +364,7 @@ def _process_stop_claim(
             _finalize_stop(claim)
             return RuntimePowerReport(stopped=1)
         if machine.state is not MachineState.STARTED:
-            _mark_operation_failed(claim, now=now)
+            _mark_operation_failed(claim, now=now, clear_keep_warm=True)
             return RuntimePowerReport(failed=1)
         _prepare_stop(claim, now)
         try:
@@ -372,20 +372,23 @@ def _process_stop_claim(
                 provider.stop_machine(workspace.fly_app_ref, workspace.machine_ref)
         except ProviderError as exc:
             if not exc.uncertain:
-                _mark_operation_failed(claim, now=now)
+                _mark_operation_failed(claim, now=now, clear_keep_warm=True)
                 return RuntimePowerReport(failed=1)
             inspected = _inspect_machine(provider, workspace)
             if inspected is None or inspected.state is not MachineState.STOPPED:
-                _mark_operation_failed(claim, now=now)
+                _mark_operation_failed(claim, now=now, clear_keep_warm=True)
                 return RuntimePowerReport(failed=1)
         _finalize_stop(claim)
         _emit_power_event("runtime.operation.succeeded", workspace, "stopped")
         return RuntimePowerReport(stopped=1)
-    except (ProviderError, RuntimeConflictError, Workspace.DoesNotExist):
+    except RuntimeConflictError:
         _mark_operation_failed(claim, now=now)
         return RuntimePowerReport(failed=1)
+    except (ProviderError, Workspace.DoesNotExist):
+        _mark_operation_failed(claim, now=now, clear_keep_warm=True)
+        return RuntimePowerReport(failed=1)
     except Exception as exc:  # noqa: BLE001 - maintenance must keep iterating
-        _mark_operation_failed(claim, now=now)
+        _mark_operation_failed(claim, now=now, clear_keep_warm=True)
         if workspace is not None:
             _emit_power_event(
                 "runtime.operation.failed",
@@ -688,6 +691,7 @@ def _mark_operation_failed(
     *,
     now: datetime | None = None,
     retry_execution: bool = False,
+    clear_keep_warm: bool = False,
 ) -> None:
     workspace = (
         Workspace.objects.select_for_update().filter(pk=claim.workspace_id).first()
@@ -703,6 +707,7 @@ def _mark_operation_failed(
         workspace,
         now=now,
         retry_execution=retry_execution,
+        clear_keep_warm=clear_keep_warm,
     )
 
 
@@ -711,6 +716,7 @@ def _mark_operation_failed_locked(
     *,
     now: datetime | None = None,
     retry_execution: bool = False,
+    clear_keep_warm: bool = False,
 ) -> None:
     operation_id = workspace.runtime_operation_id
     observed_at = now or timezone.now()
@@ -754,6 +760,8 @@ def _mark_operation_failed_locked(
             ]
         )
         return
+    if clear_keep_warm:
+        workspace.speculative_keep_warm_until = None
     workspace.runtime_operation_id = None
     workspace.runtime_operation_state = RuntimeOperationState.IDLE
     workspace.runtime_operation_trigger = None
@@ -768,6 +776,7 @@ def _mark_operation_failed_locked(
             "runtime_operation_trigger",
             "runtime_operation_requested_at",
             "runtime_operation_retry_count",
+            "speculative_keep_warm_until",
             "activation_claim_token",
             "activation_claim_expires_at",
             "updated_at",

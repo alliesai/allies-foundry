@@ -1620,11 +1620,19 @@ class FoundryWorker:
                     status=503,
                     code="HERMES_NOT_READY",
                 )
-            await self.foundry.report_readiness(
-                boot_id=self.boot_id,
-                reconciled_generation=snapshot.machine_generation,
-                runtime_start_epoch=snapshot.runtime_start_epoch,
-            )
+            try:
+                await self.foundry.report_readiness(
+                    boot_id=self.boot_id,
+                    reconciled_generation=snapshot.machine_generation,
+                    runtime_start_epoch=snapshot.runtime_start_epoch,
+                )
+            except FencedError as error:
+                self._profiles_reconciled = False
+                raise NotReadyError(
+                    "runtime readiness receipt was fenced",
+                    status=error.status,
+                    code="NOT_READY",
+                ) from error
             self._last_readiness_report = self._clock()
 
     async def _hermes_ready(self) -> bool:

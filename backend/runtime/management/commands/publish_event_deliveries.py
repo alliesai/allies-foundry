@@ -88,12 +88,15 @@ class Command(BaseCommand):
         exhausted = report.exhausted if report is not None else 0
         wake_started = wake.started if wake is not None else 0
         wake_failed = wake.failed if wake is not None else 0
+        wake_unavailable = wake.unavailable if wake is not None else 0
         idle_stopped = idle.stopped if idle is not None else 0
+        idle_unavailable = idle.unavailable if idle is not None else 0
         self.stdout.write(
             f"Wake started {wake_started}; wake failed {wake_failed}; "
+            f"wake unavailable {wake_unavailable}; "
             f"Delivered {delivered} event(s); deferred {deferred}; "
             f"exhausted {exhausted}; expired {expired} intent(s); "
-            f"idle stopped {idle_stopped}."
+            f"idle stopped {idle_stopped}; idle unavailable {idle_unavailable}."
         )
 
 
