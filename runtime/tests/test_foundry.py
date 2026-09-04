@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import urllib.error
 from collections import deque
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -21,6 +22,7 @@ from allies_runtime.foundry import (
     NotReadyError,
     RateLimitedError,
     ResponseLossError,
+    RuntimeReconciliationSnapshot,
     ServiceUnavailableError,
     deterministic_event_id,
 )
@@ -101,6 +103,51 @@ async def test_client_sends_two_headers_and_parses_contract():
     assert transport.calls[1][2]["X-Foundry-Lease-Token"] == "lease-secret"
     assert transport.calls[0][3] == {"claim_id": "claim-1", "available_slots": 2}
     assert "lease-secret" not in repr(claim)
+
+
+@pytest.mark.asyncio
+async def test_client_reconciliation_snapshot_and_readiness_receipt():
+    foundry, transport = client(
+        {
+            "status": 200,
+            "body": {
+                "version": 1,
+                "machine_generation": 7,
+                "runtime_start_epoch": 12,
+                "profiles": [],
+            },
+        },
+        {
+            "status": 200,
+            "body": {
+                "status": "ready",
+                "generation": 7,
+                "runtime_start_epoch": 12,
+                "accepted_at": "2026-08-25T12:00:01Z",
+            },
+        },
+    )
+
+    snapshot = await foundry.reconciliation_snapshot()
+    receipt = await foundry.report_readiness(
+        boot_id="00000000-0000-4000-8000-000000000009",
+        reconciled_generation=snapshot.machine_generation,
+        runtime_start_epoch=snapshot.runtime_start_epoch,
+    )
+
+    assert snapshot.runtime_start_epoch == 12
+    assert receipt["status"] == "ready"
+    assert transport.calls[1][3] == {
+        "boot_id": "00000000-0000-4000-8000-000000000009",
+        "reconciled_generation": 7,
+        "runtime_start_epoch": 12,
+    }
+    with pytest.raises(ValueError, match="boot_id must be a UUID"):
+        await foundry.report_readiness(
+            boot_id="not-a-uuid",
+            reconciled_generation=7,
+            runtime_start_epoch=12,
+        )
 
 
 @pytest.mark.asyncio
@@ -1003,3 +1050,118 @@ async def test_cancellable_stream_handles_closed_and_running_generators():
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert calls == ["closed"]
+
+
+@pytest.mark.asyncio
+async def test_worker_reports_readiness_and_heartbeats_after_profile_reconciliation():
+    class Reconciler:
+        def __init__(self):
+            self.calls = 0
+
+        async def reconcile(self):
+            self.calls += 1
+
+    class ReadinessFoundry:
+        def __init__(self):
+            self.last_reconciliation_snapshot = RuntimeReconciliationSnapshot(
+                machine_generation=7,
+                runtime_start_epoch=12,
+                profiles=(),
+            )
+            self.receipts = []
+
+        async def report_readiness(self, **payload):
+            self.receipts.append(payload)
+
+    now = [0.0]
+    foundry = ReadinessFoundry()
+    reconciler = Reconciler()
+    worker = FoundryWorker(
+        foundry,
+        FakeHermesClient(),
+        profile_reconciler=reconciler,
+        profile_reconcile_interval=1.0,
+        readiness_heartbeat_interval=15.0,
+        clock=lambda: now[0],
+        boot_id="00000000-0000-4000-8000-000000000009",
+    )
+
+    await worker._reconcile_profiles(force=True)
+    now[0] = 2.0
+    await worker._reconcile_profiles()
+    now[0] = 16.0
+    await worker._reconcile_profiles()
+
+    assert reconciler.calls == 3
+    assert foundry.receipts == [
+        {
+            "boot_id": "00000000-0000-4000-8000-000000000009",
+            "reconciled_generation": 7,
+            "runtime_start_epoch": 12,
+        },
+        {
+            "boot_id": "00000000-0000-4000-8000-000000000009",
+            "reconciled_generation": 7,
+            "runtime_start_epoch": 12,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_report_readiness_until_hermes_is_ready():
+    class Reconciler:
+        async def reconcile(self):
+            return None
+
+    class ReadinessFoundry:
+        last_reconciliation_snapshot = RuntimeReconciliationSnapshot(
+            machine_generation=7,
+            runtime_start_epoch=12,
+            profiles=(),
+        )
+
+        async def report_readiness(self, **_payload):
+            raise AssertionError("readiness must not be reported")
+
+    worker = FoundryWorker(
+        ReadinessFoundry(),
+        FakeHermesClient(health_status="degraded"),
+        profile_reconciler=Reconciler(),
+    )
+
+    with pytest.raises(ServiceUnavailableError, match="Hermes is not ready"):
+        await worker._reconcile_profiles(force=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hermes", "expected"),
+    [
+        (object(), True),
+        (SimpleNamespace(health=lambda: SimpleNamespace(status="healthy")), True),
+        (
+            SimpleNamespace(
+                health_detailed=lambda: SimpleNamespace(status="degraded")
+            ),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                health_detailed=lambda: SimpleNamespace(
+                    status="degraded",
+                    readiness={
+                        "checks": {
+                            "gateway": {"status": "ok", "state": "running"}
+                        }
+                    },
+                )
+            ),
+            True,
+        ),
+        (SimpleNamespace(health=lambda: SimpleNamespace(status="unknown")), False),
+    ],
+    ids=["no-health-api", "legacy-health", "degraded", "gateway-ready", "unknown"],
+)
+async def test_worker_hermes_health_compatibility_and_degraded_gateway(hermes, expected):
+    worker = FoundryWorker(object(), hermes)
+    assert await worker._hermes_ready() is expected

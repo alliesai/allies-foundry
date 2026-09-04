@@ -35,6 +35,7 @@ from runtime.models import (
 from .profiles import profile_is_claim_ready
 from .retry import run_with_sqlite_lock_retry
 from .runtime_auth import RuntimeContext
+from .runtime_readiness import require_current_runtime_ready_locked
 
 LEASE_SECONDS = 60
 MAX_AVAILABLE_SLOTS = 8
@@ -104,6 +105,7 @@ def _claim_next_execution_once(
         or not workspace.machine_ref
     ):
         raise RuntimeNotReadyError("workspace is not ready for claims")
+    require_current_runtime_ready_locked(workspace, context)
 
     _reconcile_expired_leases(workspace)
 
