@@ -127,6 +127,14 @@ _FORBIDDEN_ARGUMENT_KEYS = frozenset(
 _INIT_ENV_LOCK = threading.RLock()
 
 
+class _ProviderInvariantError(RuntimeError):
+    """An authored, safe-to-report provider invariant failure."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -142,6 +150,8 @@ def _under(path: Path, root: Path) -> bool:
 def _safe_reason(exc: BaseException) -> str:
     """Return a reason code without echoing provider/user/path data."""
 
+    if isinstance(exc, _ProviderInvariantError):
+        return exc.reason_code
     return type(exc).__name__.lower().replace("error", "") or "provider_fault"
 
 
@@ -308,7 +318,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
             }
             selected = [discovered.get(name) for name in sorted(ALLOWED_TOOLS)]
             if any(item is None for item in selected):
-                raise ValueError("reviewed_tool_missing")
+                raise _ProviderInvariantError("reviewed_tool_missing")
             self._schema_hash = hashlib.sha256(
                 _canonical_json(selected).encode("utf-8")
             ).hexdigest()
@@ -319,7 +329,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
                 pass
             fixture_key = (version, ",".join(ALLOWED_TOOLS))
             if self._schema_hash != REVIEWED_SCHEMA_HASHES.get(fixture_key):
-                raise ValueError("reviewed_schema_drift")
+                raise _ProviderInvariantError("reviewed_schema_drift")
             self._schemas = {name: discovered[name] for name in ALLOWED_TOOLS}
             self._schema_error = ""
             return self._schemas
@@ -419,7 +429,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
             memory_data = memory_root / "data"
             memory_data.mkdir(parents=True, exist_ok=True)
             if not _under(memory_data.resolve(strict=False), root):
-                raise ValueError("memory_data_outside_profile")
+                raise _ProviderInvariantError("memory_data_outside_profile")
             with _INIT_ENV_LOCK:
                 previous = {
                     key: os.environ.get(key)
@@ -478,22 +488,26 @@ class AlliesMnemosyneProvider(MemoryProvider):
             if candidate is None:
                 candidate = getattr(delegate, "_db_path", None)
             if beam is None or candidate is None:
-                raise RuntimeError("mnemosyne_database_unavailable")
+                raise _ProviderInvariantError("mnemosyne_database_unavailable")
             connection = getattr(beam, "conn", None)
             if connection is None:
-                raise RuntimeError("mnemosyne_database_connection_unavailable")
+                raise _ProviderInvariantError(
+                    "mnemosyne_database_connection_unavailable"
+                )
             connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             db_path = Path(candidate).resolve(strict=False)
             profile_real = root.resolve(strict=False)
             if not _under(db_path, profile_real):
-                raise RuntimeError("mnemosyne_database_outside_profile")
+                raise _ProviderInvariantError("mnemosyne_database_outside_profile")
             if identity.lower() not in {part.lower() for part in db_path.parts}:
-                raise RuntimeError("mnemosyne_database_not_profile_keyed")
+                raise _ProviderInvariantError("mnemosyne_database_not_profile_keyed")
             if getattr(delegate, "_surface_beam", None) is not None:
-                raise RuntimeError("shared_surface_initialized")
+                raise _ProviderInvariantError("shared_surface_initialized")
             self._db_path = db_path
             if self._mode == "narrow_tools" and not self._discover_schemas():
-                raise RuntimeError(self._schema_error or "reviewed_schema_drift")
+                raise _ProviderInvariantError(
+                    self._schema_error or "reviewed_schema_drift"
+                )
             self._available = True
             self._reason = "ready"
         except BaseException as exc:  # noqa: BLE001 - lifecycle faults fail soft
