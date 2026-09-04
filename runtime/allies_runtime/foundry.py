@@ -1050,9 +1050,7 @@ class FoundryWorker:
     async def run_claim(self, claim: FoundryClaim) -> Any:
         return await self._run_claim(claim)
 
-    async def _bootstrap_first_turn(
-        self, claim: FoundryClaim, session_id: str
-    ) -> None:
+    async def _bootstrap_first_turn(self, claim: FoundryClaim, session_id: str) -> None:
         """Seed Hermes before the first durable Foundry checkpoint."""
 
         bootstrap = _first_turn_bootstrap(claim.payload.get("bootstrap"))
@@ -1064,13 +1062,16 @@ class FoundryWorker:
         bootstrap_session = getattr(self.hermes, "bootstrap_session", None)
         if not callable(ensure_session) or not callable(bootstrap_session):
             raise HermesError("Hermes session bootstrap was unavailable")
-        ensured = ensure_session(
-            claim.hermes_profile_key,
-            session_id,
-            model=claim.model,
-        )
-        if inspect.isawaitable(ensured):
-            await ensured
+        try:
+            ensured = ensure_session(
+                claim.hermes_profile_key,
+                session_id,
+                model=claim.model,
+            )
+            if inspect.isawaitable(ensured):
+                await ensured
+        except (HermesTimeout, HermesDisconnected):
+            raise _BootstrapResponseLost() from None
 
         def send_bootstrap() -> Any:
             result = bootstrap_session(
