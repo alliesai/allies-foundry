@@ -167,11 +167,31 @@ def _request_runtime_intent_once(
         )
 
     if workspace.runtime_operation_state != RuntimeOperationState.IDLE:
+        if workspace.runtime_operation_state == RuntimeOperationState.STOPPING:
+            workspace.runtime_operation_id = uuid4()
+            workspace.runtime_operation_state = RuntimeOperationState.REQUESTED
+            workspace.runtime_operation_trigger = RuntimeOperationTrigger.SPECULATIVE
+            workspace.runtime_operation_requested_at = now
+            workspace.runtime_operation_retry_count = 0
+            workspace.activation_claim_token = None
+            workspace.activation_claim_expires_at = None
         operation_id = workspace.runtime_operation_id
         if operation_id is None:
             raise RuntimeConflictError("runtime operation state has no identity")
         _extend_keep_warm(workspace, now)
-        workspace.save(update_fields=["speculative_keep_warm_until", "updated_at"])
+        workspace.save(
+            update_fields=[
+                "runtime_operation_id",
+                "runtime_operation_state",
+                "runtime_operation_trigger",
+                "runtime_operation_requested_at",
+                "runtime_operation_retry_count",
+                "activation_claim_token",
+                "activation_claim_expires_at",
+                "speculative_keep_warm_until",
+                "updated_at",
+            ]
+        )
         return _create_intent(
             workspace,
             idempotency_key,

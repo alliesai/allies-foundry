@@ -953,6 +953,37 @@ def test_prompt_during_idle_stop_invalidates_stop_claim(workspace):
     assert workspace.activation_claim_token is None
 
 
+def test_composing_during_idle_stop_invalidates_stop_claim(workspace):
+    now = timezone.now()
+    old_operation_id = uuid4()
+    workspace.runtime_operation_id = old_operation_id
+    workspace.runtime_operation_state = RuntimeOperationState.STOPPING
+    workspace.runtime_operation_requested_at = now
+    workspace.activation_claim_token = "old-stop-token"
+    workspace.activation_claim_expires_at = now + timedelta(seconds=30)
+    workspace.save(
+        update_fields=[
+            "runtime_operation_id",
+            "runtime_operation_state",
+            "runtime_operation_requested_at",
+            "activation_claim_token",
+            "activation_claim_expires_at",
+            "updated_at",
+        ]
+    )
+
+    receipt = request_runtime_intent(
+        workspace.id, "composing_started", uuid4(), now, now=now
+    )
+
+    workspace.refresh_from_db()
+    assert receipt.status == RuntimeIntentOutcome.WAKING
+    assert receipt.operation_id != old_operation_id
+    assert workspace.runtime_operation_state == RuntimeOperationState.REQUESTED
+    assert workspace.runtime_operation_trigger == RuntimeOperationTrigger.SPECULATIVE
+    assert workspace.activation_claim_token is None
+
+
 @override_settings(ALLIES_RUNTIME_IDLE_STOP_ENABLED=True)
 def test_idle_stop_is_gated_and_clears_deadline(workspace):
     now = timezone.now()
