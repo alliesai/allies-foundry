@@ -292,7 +292,12 @@ def _process_wake_claim(
             _mark_awaiting_readiness(claim)
             return RuntimePowerReport(awaiting_readiness=1)
         if machine.state is not MachineState.STOPPED:
-            _mark_operation_failed(claim, now=now)
+            _mark_operation_failed(
+                claim,
+                now=now,
+                retry_execution=machine.state
+                in {MachineState.CREATED, MachineState.UNKNOWN},
+            )
             return RuntimePowerReport(failed=1)
         try:
             with provider_workspace_context(workspace.id):

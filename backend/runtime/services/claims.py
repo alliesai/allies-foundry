@@ -19,6 +19,7 @@ from runtime.exceptions import (
     RuntimeValidationError,
 )
 from runtime.models import (
+    IN_FLIGHT_PROVISIONING_PHASES,
     Attempt,
     AttemptStatus,
     Execution,
@@ -29,7 +30,6 @@ from runtime.models import (
     RuntimeProfile,
     RuntimeProfileLifecycleState,
     Workspace,
-    WorkspaceProvisioningPhase,
 )
 
 from .profiles import profile_is_claim_ready
@@ -98,7 +98,7 @@ def _claim_next_execution_once(
         raise RuntimeLeaseConflictError("runtime workspace does not exist")
     _check_context_generation(workspace, context)
     if (
-        workspace.provisioning_phase != WorkspaceProvisioningPhase.IDLE
+        workspace.provisioning_phase in IN_FLIGHT_PROVISIONING_PHASES
         or workspace.machine_generation <= 0
         or not workspace.fly_app_ref
         or not workspace.volume_ref

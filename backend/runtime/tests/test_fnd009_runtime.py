@@ -205,6 +205,93 @@ def test_failed_provisioning_with_retained_binding_can_wake(workspace):
     assert provider.start_calls == 1
 
 
+def test_failed_provisioning_with_retained_binding_can_claim_after_wake(workspace):
+    issued = issue_runtime_credential(workspace.id, "runtime-secret")
+    workspace.provisioning_phase = WorkspaceProvisioningPhase.FAILED
+    workspace.save(update_fields=["provisioning_phase", "updated_at"])
+    profile = RuntimeProfile.objects.create(
+        workspace=workspace,
+        ally_ref="retained-ally",
+        hermes_profile_key="retained-ally",
+        lifecycle_state=RuntimeProfileLifecycleState.ACTIVE,
+        materialized_generation=workspace.machine_generation,
+    )
+    execution = create_execution(
+        workspace.id,
+        profile.id,
+        "retained-turn",
+        {"message": "hello", "cloud_conversation_ref": "retained-cloud"},
+    )
+    now = timezone.now()
+    provider = FakePowerProvider(workspace)
+
+    wake = process_runtime_wakes(provider=provider, now=now)
+    context = authenticate_runtime_token(issued.raw_token)
+    workspace.refresh_from_db()
+    accept_runtime_readiness(
+        context,
+        uuid4(),
+        workspace.machine_generation,
+        workspace.runtime_start_epoch,
+        now=now,
+    )
+    claim = claim_next_execution(context, uuid4(), 1)
+
+    assert wake.started == 1
+    assert claim is not None
+    assert claim.execution_id == execution.id
+
+
+@pytest.mark.parametrize("state", [MachineState.CREATED, MachineState.UNKNOWN])
+def test_execution_wake_retries_transitional_machine_state(workspace, state):
+    profile = RuntimeProfile.objects.create(
+        workspace=workspace,
+        ally_ref=f"transitional-{state}",
+        hermes_profile_key=f"transitional-{state}",
+        lifecycle_state=RuntimeProfileLifecycleState.ACTIVE,
+        materialized_generation=workspace.machine_generation,
+    )
+    create_execution(
+        workspace.id,
+        profile.id,
+        f"transitional-{state}",
+        {"message": "hello", "cloud_conversation_ref": f"state-{state}"},
+    )
+    provider = FakePowerProvider(workspace, state=state)
+    now = timezone.now()
+
+    report = process_runtime_wakes(provider=provider, now=now)
+
+    workspace.refresh_from_db()
+    assert report.failed == 1
+    assert workspace.runtime_operation_state == RuntimeOperationState.REQUESTED
+    assert workspace.runtime_operation_retry_count == 1
+    assert workspace.runtime_operation_requested_at == now + timedelta(seconds=5)
+
+
+def test_execution_wake_parks_destroyed_machine(workspace):
+    profile = RuntimeProfile.objects.create(
+        workspace=workspace,
+        ally_ref="destroyed-ally",
+        hermes_profile_key="destroyed-ally",
+        lifecycle_state=RuntimeProfileLifecycleState.ACTIVE,
+        materialized_generation=workspace.machine_generation,
+    )
+    create_execution(
+        workspace.id,
+        profile.id,
+        "destroyed-turn",
+        {"message": "hello", "cloud_conversation_ref": "destroyed"},
+    )
+    provider = FakePowerProvider(workspace, state=MachineState.DESTROYED)
+
+    report = process_runtime_wakes(provider=provider, now=timezone.now())
+
+    workspace.refresh_from_db()
+    assert report.failed == 1
+    assert workspace.runtime_operation_state == RuntimeOperationState.IDLE
+
+
 def test_uncertain_start_inspects_before_retry(workspace):
     now = timezone.now()
     provider = FakePowerProvider(workspace)
