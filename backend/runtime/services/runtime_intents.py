@@ -127,6 +127,7 @@ def _request_runtime_intent_once(
 
     if is_runtime_ready(workspace, now=now):
         _extend_keep_warm(workspace, now)
+        workspace.save(update_fields=["speculative_keep_warm_until", "updated_at"])
         return _create_intent(
             workspace,
             idempotency_key,
@@ -164,6 +165,7 @@ def _request_runtime_intent_once(
         if operation_id is None:
             raise RuntimeConflictError("runtime operation state has no identity")
         _extend_keep_warm(workspace, now)
+        workspace.save(update_fields=["speculative_keep_warm_until", "updated_at"])
         return _create_intent(
             workspace,
             idempotency_key,

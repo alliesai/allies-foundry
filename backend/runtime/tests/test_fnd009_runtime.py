@@ -164,6 +164,66 @@ def test_workspace_limit_applies_while_intents_coalesce(workspace):
     assert len({receipt.operation_id for receipt in receipts[:30]}) == 1
 
 
+@override_settings(ALLIES_RUNTIME_KEEP_WARM_SECONDS=600)
+def test_ready_intent_persists_keep_warm_extension(workspace):
+    now = timezone.now()
+    workspace.ready_generation = workspace.machine_generation
+    workspace.ready_start_epoch = workspace.runtime_start_epoch
+    workspace.ready_boot_id = uuid4()
+    workspace.ready_at = now
+    workspace.runtime_last_seen_at = now
+    workspace.speculative_keep_warm_until = now - timedelta(seconds=1)
+    workspace.save(
+        update_fields=[
+            "ready_generation",
+            "ready_start_epoch",
+            "ready_boot_id",
+            "ready_at",
+            "runtime_last_seen_at",
+            "speculative_keep_warm_until",
+            "updated_at",
+        ]
+    )
+
+    receipt = request_runtime_intent(
+        workspace.id, "composing_started", uuid4(), now, now=now
+    )
+
+    workspace.refresh_from_db()
+    assert receipt.status == RuntimeIntentOutcome.ALREADY_READY
+    assert workspace.speculative_keep_warm_until == now + timedelta(minutes=10)
+
+
+@override_settings(ALLIES_RUNTIME_KEEP_WARM_SECONDS=600)
+def test_coalesced_waking_intent_persists_keep_warm_extension(workspace):
+    now = timezone.now()
+    operation_id = uuid4()
+    workspace.runtime_operation_id = operation_id
+    workspace.runtime_operation_state = RuntimeOperationState.REQUESTED
+    workspace.runtime_operation_trigger = RuntimeOperationTrigger.SPECULATIVE
+    workspace.runtime_operation_requested_at = now
+    workspace.speculative_keep_warm_until = now - timedelta(seconds=1)
+    workspace.save(
+        update_fields=[
+            "runtime_operation_id",
+            "runtime_operation_state",
+            "runtime_operation_trigger",
+            "runtime_operation_requested_at",
+            "speculative_keep_warm_until",
+            "updated_at",
+        ]
+    )
+
+    receipt = request_runtime_intent(
+        workspace.id, "composing_started", uuid4(), now, now=now
+    )
+
+    workspace.refresh_from_db()
+    assert receipt.status == RuntimeIntentOutcome.WAKING
+    assert receipt.operation_id == operation_id
+    assert workspace.speculative_keep_warm_until == now + timedelta(minutes=10)
+
+
 def test_failed_provisioning_without_binding_requires_first_provision(db):
     now = timezone.now()
     workspace = Workspace.objects.create(
