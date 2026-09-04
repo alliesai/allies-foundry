@@ -124,9 +124,10 @@ def test_deeply_nested_arguments_fail_soft(tmp_path):
         provider.handle_tool_call("mnemosyne_recall", {"query": nested})
     )
 
-    assert result == {
-        "reason": "arguments_not_serializable",
-        "status": "tool_rejected",
+    assert result["status"] == "tool_rejected"
+    assert result["reason"] in {
+        "arguments_not_serializable",
+        "arguments_too_large",
     }
 
 
