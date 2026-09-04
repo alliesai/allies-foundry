@@ -2,8 +2,8 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-import pytest
 import allies_mnemosyne.provider as provider_module
+import pytest
 from allies_mnemosyne import ALLOWED_TOOLS, AlliesMnemosyneProvider
 
 
