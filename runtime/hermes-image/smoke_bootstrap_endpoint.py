@@ -38,37 +38,42 @@ class _Request:
 async def _run() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         database = SessionDB(Path(temporary) / "state.db")
-        database.create_session(SESSION_ID, "api_server")
-        adapter = APIServerAdapter(PlatformConfig(extra={"key": API_KEY}))
-        adapter._session_db = database
-        adapter._expected_api_key = lambda: API_KEY
-        routes = {(method, path) for method, path, _handler in adapter._http_route_table()}
-        assert ("PUT", "/api/sessions/{session_id}/bootstrap") in routes
-
-        token = _api_request_profile.set(PROFILE)
         try:
-            created = await adapter._handle_session_bootstrap(_Request("Hello from Allies"))
-            duplicate = await adapter._handle_session_bootstrap(
-                _Request("Hello from Allies")
-            )
-            conflict = await adapter._handle_session_bootstrap(
-                _Request("Different greeting")
-            )
-        finally:
-            _api_request_profile.reset(token)
+            database.create_session(SESSION_ID, "api_server")
+            adapter = APIServerAdapter(PlatformConfig(extra={"key": API_KEY}))
+            adapter._session_db = database
+            adapter._expected_api_key = lambda: API_KEY
+            routes = {
+                (method, path) for method, path, _handler in adapter._http_route_table()
+            }
+            assert ("PUT", "/api/sessions/{session_id}/bootstrap") in routes
 
-        assert created.status == 201
-        assert json.loads(created.text)["status"] == "created"
-        assert duplicate.status == 200
-        assert json.loads(duplicate.text)["status"] == "duplicate"
-        assert conflict.status == 409
-        rows = database.get_messages(SESSION_ID, include_inactive=True)
-        assert len(rows) == 1
-        assert rows[0]["role"] == "assistant"
-        assert rows[0]["content"] == "Hello from Allies"
-        assert rows[0]["platform_message_id"] == MESSAGE_ID
-        database.close()
+            token = _api_request_profile.set(PROFILE)
+            try:
+                created = await adapter._handle_session_bootstrap(
+                    _Request("Hello from Allies")
+                )
+                duplicate = await adapter._handle_session_bootstrap(
+                    _Request("Hello from Allies")
+                )
+                conflict = await adapter._handle_session_bootstrap(
+                    _Request("Different greeting")
+                )
+            finally:
+                _api_request_profile.reset(token)
+
+            assert created.status == 201
+            assert json.loads(created.text)["status"] == "created"
+            assert duplicate.status == 200
+            assert json.loads(duplicate.text)["status"] == "duplicate"
+            assert conflict.status == 409
+            rows = database.get_messages(SESSION_ID, include_inactive=True)
+            assert len(rows) == 1
+            assert rows[0]["role"] == "assistant"
+            assert rows[0]["content"] == "Hello from Allies"
+            assert rows[0]["platform_message_id"] == MESSAGE_ID
+        finally:
+            database.close()
 
 
 asyncio.run(_run())
-

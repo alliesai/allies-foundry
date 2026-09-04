@@ -1,7 +1,16 @@
 diff --git a/hermes_state.py b/hermes_state.py
+index 76f4ee2c3..17efaede0 100644
 --- a/hermes_state.py
 +++ b/hermes_state.py
-@@ -1670,4 +1670,12 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
+@@ -27,6 +27,7 @@ import sqlite3
+ import sys
+ import threading
+ import time
++import uuid
+ from collections import deque
+ from contextlib import contextmanager
+ from pathlib import Path
+@@ -1683,6 +1683,14 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
      """
  
  
@@ -14,7 +23,12 @@ diff --git a/hermes_state.py b/hermes_state.py
 +
 +
  def _connect_tracked_db(path, tracking_path=None, **kwargs):
-@@ -6381,0 +6381,59 @@
+     """``sqlite3.connect`` that registers the open fd for lock-safety.
+ 
+@@ -6378,6 +6386,67 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
+             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+         )
+ 
 +    def bootstrap_assistant_message(
 +        self, session_id: str, message_id: str, text: str
 +    ) -> str:
@@ -75,14 +89,34 @@ diff --git a/hermes_state.py b/hermes_state.py
 +        return self._execute_write(
 +            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
 +        )
++
+     def append_messages_batch(
+         self,
+         session_id: str,
 diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index a756134d9..65d762015 100644
 --- a/gateway/platforms/api_server.py
 +++ b/gateway/platforms/api_server.py
-@@ -46,0 +47,1 @@
+@@ -43,6 +43,7 @@ import asyncio
+ import errno
+ import hashlib
+ import hmac
 +import ipaddress
-@@ -2001,0 +2001,1 @@
+ import itertools
+ import json
+ from contextlib import contextmanager, nullcontext
+@@ -1999,6 +2000,7 @@ class APIServerAdapter(BasePlatformAdapter):
+             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
+             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
 +            ("PUT", "/api/sessions/{session_id}/bootstrap", self._handle_session_bootstrap),
-@@ -3467,0 +3467,76 @@
+             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
+             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+@@ -3464,6 +3466,133 @@ class APIServerAdapter(BasePlatformAdapter):
+             "data": [self._message_response(m) for m in messages],
+         })
+ 
 +    async def _handle_session_bootstrap(self, request: "web.Request") -> "web.Response":
 +        """Persist one exact assistant greeting for a named local profile."""
 +        auth_err = self._check_auth(request)
@@ -209,3 +243,7 @@ diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
 +            },
 +            status=201 if result == "created" else 200,
 +        )
++
+     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
+         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
+         auth_err = self._check_auth(request)
