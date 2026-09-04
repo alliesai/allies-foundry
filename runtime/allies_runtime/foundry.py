@@ -1378,15 +1378,8 @@ class FoundryWorker:
                             )
                         )
                     except ResponseLossError:
-                        lost.set()
-                        try:
-                            return await self.foundry.stopped(
-                                claim.attempt_id,
-                                claim.lease_token,
-                                reason="fail_response_lost",
-                            )
-                        except FoundryError:
-                            return None
+                        # Leave terminal reconciliation to the durable lease expiry path.
+                        return None
                     except FoundryError:
                         return None
                 sequence += 1

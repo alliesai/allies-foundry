@@ -436,8 +436,7 @@ async def test_worker_closes_stream_and_emits_reserved_budget_failure(
     if response_losses < 2:
         assert result[0].status == "failed"
     else:
-        assert result[0].state == "released"
-        assert result[0].requeued is False
+        assert result == (None,)
     assert hermes.closed
     event_calls = [call for call in transport.calls if "/events" in call[1]]
     assert len(event_calls) == 2
@@ -448,6 +447,7 @@ async def test_worker_closes_stream_and_emits_reserved_budget_failure(
     assert fail_calls[0][3]["code"] == "event_budget_exhausted"
     assert fail_calls[0][3]["retryable"] is False
     assert not any("/complete" in call[1] for call in transport.calls)
+    assert not any("/stopped" in call[1] for call in transport.calls)
 
 
 @pytest.mark.asyncio

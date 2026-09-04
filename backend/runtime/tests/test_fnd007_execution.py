@@ -280,9 +280,7 @@ def test_projection_event_budget_reserves_sequence_100001_for_terminal_truth(
 ):
     context, _execution, claim = claimed_execution
 
-    with pytest.raises(
-        RuntimeValidationError, match=f"1 to {MAX_TERMINAL_SEQUENCE}"
-    ):
+    with pytest.raises(RuntimeValidationError, match=f"1 to {MAX_TERMINAL_SEQUENCE}"):
         complete_attempt(
             context,
             claim.attempt_id,
@@ -381,6 +379,7 @@ def test_expired_lease_recovers_after_high_nonterminal_sequence(
     claimed_execution, prior_sequence
 ):
     context, execution, claim = claimed_execution
+    make_cloud_visible(execution)
     dispatch(context, claim)
     append_runtime_event(
         context,
@@ -404,6 +403,16 @@ def test_expired_lease_recovers_after_high_nonterminal_sequence(
     )
     assert failure.sequence == prior_sequence + 1
     assert Execution.objects.get(pk=execution.id).status == ExecutionStatus.FAILED
+    assert failure.payload == {"code": "lease_expired", "retryable": False}
+    assert claim_next_execution(context, uuid4(), 1) is None
+    assert Attempt.objects.filter(execution_id=execution.id).count() == 1
+    assert (
+        ExecutionEvent.objects.filter(
+            attempt_id=claim.attempt_id, event_type="execution.failed"
+        ).count()
+        == 1
+    )
+    assert ExecutionEventDelivery.objects.filter(event=failure).count() == 1
 
 
 @pytest.mark.parametrize(
