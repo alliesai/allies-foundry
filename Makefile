@@ -19,6 +19,7 @@ HERMES_IMAGE_PYTHON_VERSION ?= 313
 # mmh3/onnxruntime wheels target manylinux_2_28.
 HERMES_IMAGE_PIP_PLATFORM ?= manylinux_2_28_x86_64
 HERMES_IMAGE_SOURCE_DATE_EPOCH ?= $(shell git show -s --format=%ct HEAD)
+HERMES_IMAGE_ATTESTATION ?= /tmp/allies-hermes-mnemosyne.oci.tar
 
 help:
 	@echo Allies Foundry commands:
@@ -90,7 +91,12 @@ hermes-image-wheelhouse:
 
 hermes-image-build: hermes-image-wheelhouse
 	docker buildx build \
-		--platform $(HERMES_IMAGE_PLATFORM) --provenance=true --sbom=true --load \
+		--platform $(HERMES_IMAGE_PLATFORM) --provenance=true --sbom=true \
+		--output type=oci,dest=$(HERMES_IMAGE_ATTESTATION) \
+		--build-arg SOURCE_DATE_EPOCH=$(HERMES_IMAGE_SOURCE_DATE_EPOCH) \
+		--tag $(HERMES_IMAGE_TAG) --file $(HERMES_IMAGE_CONTEXT)/Dockerfile $(HERMES_IMAGE_CONTEXT)
+	docker buildx build \
+		--platform $(HERMES_IMAGE_PLATFORM) --provenance=false --sbom=false --load \
 		--build-arg SOURCE_DATE_EPOCH=$(HERMES_IMAGE_SOURCE_DATE_EPOCH) \
 		--tag $(HERMES_IMAGE_TAG) --file $(HERMES_IMAGE_CONTEXT)/Dockerfile $(HERMES_IMAGE_CONTEXT)
 

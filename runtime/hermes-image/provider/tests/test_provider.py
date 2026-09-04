@@ -114,6 +114,22 @@ def test_narrow_mode_validates_allowlist_and_arguments(tmp_path):
     assert cross_bank["reason"] == "profile_override_forbidden"
 
 
+def test_deeply_nested_arguments_fail_soft(tmp_path):
+    provider = ready_provider(tmp_path)
+    nested: list[object] = []
+    for _ in range(5_000):
+        nested = [nested]
+
+    result = json.loads(
+        provider.handle_tool_call("mnemosyne_recall", {"query": nested})
+    )
+
+    assert result == {
+        "reason": "arguments_not_serializable",
+        "status": "tool_rejected",
+    }
+
+
 @pytest.mark.parametrize(
     "content",
     [
