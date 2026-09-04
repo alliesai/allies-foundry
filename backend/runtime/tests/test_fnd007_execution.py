@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from django.utils import timezone
 
+from runtime.contracts import MAX_TERMINAL_SEQUENCE
 from runtime.exceptions import (
     RuntimeIdempotencyConflictError,
     RuntimeLeaseConflictError,
@@ -274,12 +275,14 @@ def test_runtime_event_append_rejects_unknown_or_unsafe_payload(claimed_executio
         )
 
 
-def test_projection_event_budget_reserves_sequence_513_for_terminal_truth(
+def test_projection_event_budget_reserves_sequence_100001_for_terminal_truth(
     claimed_execution,
 ):
     context, _execution, claim = claimed_execution
 
-    with pytest.raises(RuntimeValidationError, match="1 to 513"):
+    with pytest.raises(
+        RuntimeValidationError, match=f"1 to {MAX_TERMINAL_SEQUENCE}"
+    ):
         complete_attempt(
             context,
             claim.attempt_id,
@@ -288,7 +291,7 @@ def test_projection_event_budget_reserves_sequence_513_for_terminal_truth(
             terminal_event={
                 "event_id": uuid4(),
                 "stream_id": claim.stream_id,
-                "sequence": 514,
+                "sequence": MAX_TERMINAL_SEQUENCE + 1,
                 "payload": {"run_id": "run-1", "status": "completed"},
             },
         )
@@ -303,14 +306,16 @@ def test_projection_event_budget_reserves_sequence_513_for_terminal_truth(
         terminal_event={
             "event_id": uuid4(),
             "stream_id": claim.stream_id,
-            "sequence": 513,
+            "sequence": MAX_TERMINAL_SEQUENCE,
             "payload": {"run_id": "run-1", "status": "completed"},
         },
     )
 
     assert receipt.status == AttemptStatus.SUCCEEDED
     assert (
-        ExecutionEvent.objects.get(attempt_id=claim.attempt_id, sequence=513).event_type
+        ExecutionEvent.objects.get(
+            attempt_id=claim.attempt_id, sequence=MAX_TERMINAL_SEQUENCE
+        ).event_type
         == "execution.completed"
     )
 
