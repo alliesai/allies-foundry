@@ -48,7 +48,7 @@ class CloudCorrelation(ContractModel):
 class FirstTurnBootstrap(ContractModel):
     kind: Literal["assistant_message"]
     message_id: UUID
-    text: StrictStr = Field(..., min_length=1, max_length=16_000)
+    text: StrictStr = Field(..., min_length=1, max_length=MAX_COMMAND_TEXT_BYTES)
 
 
 class ExecutionInput(ContractModel):
