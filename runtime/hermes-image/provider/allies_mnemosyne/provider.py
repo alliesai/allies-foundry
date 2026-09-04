@@ -223,7 +223,7 @@ def _validate_args(schema: dict[str, Any], args: Any) -> str | None:
         return "arguments_object_required"
     try:
         argument_bytes = len(_canonical_json(args).encode("utf-8"))
-    except (TypeError, ValueError):
+    except (RecursionError, TypeError, ValueError):
         return "arguments_not_serializable"
     if argument_bytes > MAX_ARGUMENT_BYTES:
         return "arguments_too_large"
