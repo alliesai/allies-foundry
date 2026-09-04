@@ -1614,7 +1614,15 @@ class FoundryWorker:
                 >= self._readiness_heartbeat_interval
             )
         ):
-            if not await self._hermes_ready():
+            try:
+                hermes_ready = await self._hermes_ready()
+            except HermesError as error:
+                raise ServiceUnavailableError(
+                    "Hermes is not ready for a runtime receipt",
+                    status=503,
+                    code="HERMES_NOT_READY",
+                ) from error
+            if not hermes_ready:
                 raise ServiceUnavailableError(
                     "Hermes is not ready for a runtime receipt",
                     status=503,

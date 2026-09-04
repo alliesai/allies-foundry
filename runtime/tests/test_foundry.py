@@ -524,6 +524,52 @@ async def test_profile_reconciliation_retries_fenced_readiness_receipt(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_profile_reconciliation_retries_hermes_health_error(monkeypatch):
+    class Reconciler:
+        async def reconcile(self):
+            return None
+
+    class ReadinessFoundry:
+        last_reconciliation_snapshot = RuntimeReconciliationSnapshot(
+            machine_generation=7,
+            runtime_start_epoch=12,
+            profiles=(),
+        )
+
+        def __init__(self):
+            self.receipts = 0
+
+        async def report_readiness(self, **_payload):
+            self.receipts += 1
+
+    class RecoveringHermes:
+        def __init__(self):
+            self.calls = 0
+
+        async def health_detailed(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise HermesError("Hermes temporarily disconnected")
+            return SimpleNamespace(status="healthy")
+
+    foundry = ReadinessFoundry()
+    hermes = RecoveringHermes()
+    worker = FoundryWorker(foundry, hermes, profile_reconciler=Reconciler())
+    delays: list[float] = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+
+    assert not await worker._reconcile_profiles_or_wait(force=True, retry_delay=1.0)
+    assert await worker._reconcile_profiles_or_wait(force=True, retry_delay=1.0)
+    assert hermes.calls == 2
+    assert foundry.receipts == 1
+    assert delays == [1.0]
+
+
+@pytest.mark.asyncio
 async def test_worker_renewal_loss_closes_stream_and_stops_before_completion():
     claim = {**CLAIM, "hermes_profile_key": "ally-a"}
     foundry, transport = client(

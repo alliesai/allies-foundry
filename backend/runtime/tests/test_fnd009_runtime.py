@@ -164,6 +164,27 @@ def test_workspace_limit_applies_while_intents_coalesce(workspace):
     assert len({receipt.operation_id for receipt in receipts[:30]}) == 1
 
 
+@override_settings(
+    ALLIES_RUNTIME_INTENT_TTL_SECONDS=120,
+    ALLIES_RUNTIME_INTENT_RETENTION_SECONDS=600,
+)
+def test_future_intent_fails_without_extending_quota_or_retention(workspace):
+    now = timezone.now()
+    receipt = request_runtime_intent(
+        workspace.id,
+        "composing_started",
+        uuid4(),
+        now + timedelta(minutes=10),
+        now=now,
+    )
+
+    intent = workspace.runtime_intents.get()
+    assert receipt.status == RuntimeIntentOutcome.FAILED
+    assert intent.received_at == now
+    assert intent.expires_at == now + timedelta(seconds=120)
+    assert intent.delete_after == now + timedelta(seconds=600)
+
+
 @override_settings(ALLIES_RUNTIME_KEEP_WARM_SECONDS=600)
 def test_ready_intent_persists_keep_warm_extension(workspace):
     now = timezone.now()

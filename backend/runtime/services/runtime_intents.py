@@ -29,6 +29,7 @@ from .runtime_readiness import is_runtime_ready
 
 WORKSPACE_INTENT_LIMIT = 30
 WORKSPACE_INTENT_PERIOD_SECONDS = 60
+MAX_RECEIVED_AT_FUTURE_SKEW_SECONDS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,10 +94,15 @@ def _request_runtime_intent_once(
     retention_seconds = getattr(
         settings, "ALLIES_RUNTIME_INTENT_RETENTION_SECONDS", 600
     )
+    future_skewed = received_at > now + timedelta(
+        seconds=MAX_RECEIVED_AT_FUTURE_SKEW_SECONDS
+    )
+    if future_skewed:
+        received_at = now
     expires_at = received_at + timedelta(seconds=ttl_seconds)
     delete_after = received_at + timedelta(seconds=retention_seconds)
 
-    if now > expires_at:
+    if future_skewed or now > expires_at:
         return _create_intent(
             workspace,
             idempotency_key,
