@@ -119,9 +119,13 @@ def delivery(binding, contract):
 
 def test_fixture_is_strict_and_fingerprints_are_reproducible(contract):
     command = ExecutionCommand.model_validate(contract["command"])
+    bootstrap_command = ExecutionCommand.model_validate(contract["bootstrap_command"])
     event = FoundryEventEnvelope.model_validate(contract["event"])
 
     assert command_fingerprint(command) == command.fingerprint
+    assert command_fingerprint(bootstrap_command) == bootstrap_command.fingerprint
+    validate_command(bootstrap_command)
+    assert "absent or null" in contract["canonicalization"]["optional_fields"]
     assert event_fingerprint(event) == event.fingerprint
     assert command.payload.text == "normalized user text"
 
