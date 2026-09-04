@@ -220,7 +220,15 @@ def _recover_expired_operations(
                         report = _increment(report, examined=1)
                         report = _merge(report, result)
                     continue
-            _mark_operation_failed(claim, now=now)
+            retry_execution = (
+                workspace.runtime_operation_state == RuntimeOperationState.STARTING
+                and machine.state in {MachineState.CREATED, MachineState.UNKNOWN}
+            )
+            _mark_operation_failed(
+                claim,
+                now=now,
+                retry_execution=retry_execution,
+            )
             report = _increment(report, examined=1, failed=1)
         except ProviderError as exc:
             _mark_operation_failed(

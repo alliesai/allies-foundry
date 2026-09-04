@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
-
 from allies_runtime import foundry as foundry_module
 from allies_runtime.errors import HermesError
 from allies_runtime.fake import FakeFoundryTransport, FakeHermesClient, FakeProfilePlan
@@ -465,6 +464,24 @@ async def test_profile_reconciliation_retry_uses_bounded_exponential_backoff(
         assert not await worker._reconcile_profiles_or_wait(retry_delay=1.0)
 
     assert delays == [1.0, 2.0, 4.0, 5.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_profile_reconciliation_retries_not_ready_receipt(monkeypatch):
+    worker = FoundryWorker(object(), object(), profile_reconciler=object())
+    delays: list[float] = []
+
+    async def fail_reconciliation(*, force=False):
+        raise NotReadyError("runtime start is still being confirmed")
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(worker, "_reconcile_profiles", fail_reconciliation)
+    monkeypatch.setattr(asyncio, "sleep", record_sleep)
+
+    assert not await worker._reconcile_profiles_or_wait(retry_delay=1.0)
+    assert delays == [1.0]
 
 
 @pytest.mark.asyncio

@@ -269,6 +269,49 @@ def test_execution_wake_retries_transitional_machine_state(workspace, state):
     assert workspace.runtime_operation_requested_at == now + timedelta(seconds=5)
 
 
+@pytest.mark.parametrize("state", [MachineState.CREATED, MachineState.UNKNOWN])
+def test_expired_execution_wake_retries_transitional_machine_state(
+    workspace, state
+):
+    profile = RuntimeProfile.objects.create(
+        workspace=workspace,
+        ally_ref=f"recovered-{state}",
+        hermes_profile_key=f"recovered-{state}",
+        lifecycle_state=RuntimeProfileLifecycleState.ACTIVE,
+        materialized_generation=workspace.machine_generation,
+    )
+    create_execution(
+        workspace.id,
+        profile.id,
+        f"recovered-{state}",
+        {"message": "hello", "cloud_conversation_ref": f"recovered-{state}"},
+    )
+    now = timezone.now()
+    workspace.refresh_from_db()
+    workspace.runtime_operation_state = RuntimeOperationState.STARTING
+    workspace.activation_claim_token = "expired-claim"
+    workspace.activation_claim_expires_at = now
+    workspace.save(
+        update_fields=[
+            "runtime_operation_state",
+            "activation_claim_token",
+            "activation_claim_expires_at",
+            "updated_at",
+        ]
+    )
+
+    report = process_runtime_wakes(
+        provider=FakePowerProvider(workspace, state=state),
+        now=now,
+    )
+
+    workspace.refresh_from_db()
+    assert report.failed == 1
+    assert workspace.runtime_operation_state == RuntimeOperationState.REQUESTED
+    assert workspace.runtime_operation_retry_count == 1
+    assert workspace.runtime_operation_requested_at == now + timedelta(seconds=5)
+
+
 def test_execution_wake_parks_destroyed_machine(workspace):
     profile = RuntimeProfile.objects.create(
         workspace=workspace,
@@ -681,6 +724,100 @@ def test_stale_boot_and_epoch_are_rejected(workspace):
     )
     with pytest.raises(RuntimeFencedError):
         accept_runtime_readiness(context, boot_id, 1, 0, now=now)
+
+
+def test_runtime_restart_replaces_idle_boot_and_claims_queued_work(workspace):
+    profile = RuntimeProfile.objects.create(
+        workspace=workspace,
+        ally_ref="restart-ally",
+        hermes_profile_key="restart-ally",
+        lifecycle_state=RuntimeProfileLifecycleState.ACTIVE,
+        materialized_generation=workspace.machine_generation,
+    )
+    issued = issue_runtime_credential(workspace.id, "runtime-secret")
+    context = authenticate_runtime_token(issued.raw_token)
+    now = timezone.now()
+    workspace.runtime_operation_id = uuid4()
+    workspace.runtime_operation_state = RuntimeOperationState.AWAITING_READINESS
+    workspace.runtime_operation_requested_at = now
+    workspace.save(
+        update_fields=[
+            "runtime_operation_id",
+            "runtime_operation_state",
+            "runtime_operation_requested_at",
+            "updated_at",
+        ]
+    )
+    accept_runtime_readiness(
+        context,
+        uuid4(),
+        workspace.machine_generation,
+        workspace.runtime_start_epoch,
+        now=now,
+    )
+    execution = create_execution(
+        workspace.id,
+        profile.id,
+        "restart-turn",
+        {"message": "hello", "cloud_conversation_ref": "restart-cloud"},
+    )
+
+    replacement_boot = uuid4()
+    receipt = accept_runtime_readiness(
+        context,
+        replacement_boot,
+        workspace.machine_generation,
+        workspace.runtime_start_epoch,
+        now=now + timedelta(seconds=1),
+    )
+
+    workspace.refresh_from_db()
+    assert receipt.status == "ready"
+    assert workspace.ready_boot_id == replacement_boot
+    claim = claim_next_execution(context, uuid4(), 1)
+    assert claim is not None
+    assert claim.execution_id == execution.id
+
+
+@override_settings(ALLIES_RUNTIME_READINESS_TIMEOUT_SECONDS=10)
+def test_late_initial_readiness_receipt_recovers_after_timeout(workspace):
+    issued = issue_runtime_credential(workspace.id, "runtime-secret")
+    context = authenticate_runtime_token(issued.raw_token)
+    now = timezone.now()
+    workspace.runtime_operation_id = uuid4()
+    workspace.runtime_operation_state = RuntimeOperationState.AWAITING_READINESS
+    workspace.runtime_operation_trigger = None
+    workspace.runtime_operation_requested_at = now - timedelta(seconds=10)
+    workspace.save(
+        update_fields=[
+            "runtime_operation_id",
+            "runtime_operation_state",
+            "runtime_operation_trigger",
+            "runtime_operation_requested_at",
+            "updated_at",
+        ]
+    )
+
+    report = process_runtime_wakes(
+        provider=FakePowerProvider(workspace, state=MachineState.STARTED),
+        now=now,
+    )
+    workspace.refresh_from_db()
+    assert report.failed == 1
+    assert workspace.runtime_operation_state == RuntimeOperationState.IDLE
+
+    boot_id = uuid4()
+    receipt = accept_runtime_readiness(
+        context,
+        boot_id,
+        workspace.machine_generation,
+        workspace.runtime_start_epoch,
+        now=now + timedelta(seconds=1),
+    )
+
+    workspace.refresh_from_db()
+    assert receipt.status == "ready"
+    assert workspace.ready_boot_id == boot_id
 
 
 def test_readiness_rejects_starting_before_provider_start_is_confirmed(workspace):

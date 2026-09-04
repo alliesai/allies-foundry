@@ -1561,7 +1561,12 @@ class FoundryWorker:
     ) -> bool:
         try:
             await self._reconcile_profiles(force=force)
-        except (ResponseLossError, RateLimitedError, ServiceUnavailableError) as error:
+        except (
+            NotReadyError,
+            ResponseLossError,
+            RateLimitedError,
+            ServiceUnavailableError,
+        ) as error:
             self._profiles_reconciled = False
             self._profile_reconciliation_retry_attempts += 1
             base_delay = max(retry_delay, 0.01)

@@ -99,15 +99,19 @@ def _accept_runtime_readiness_once(
     accepting_start = (
         workspace.runtime_operation_state == RuntimeOperationState.AWAITING_READINESS
     )
-    if workspace.ready_boot_id is not None and workspace.ready_boot_id != boot_id:
-        raise RuntimeConflictError("runtime boot was replaced")
-    if workspace.ready_boot_id is None and not accepting_start:
+    accepting_idle = workspace.runtime_operation_state == RuntimeOperationState.IDLE
+    if not accepting_start and not accepting_idle:
         raise RuntimeNotReadyError("runtime start has no provider evidence")
+    boot_replaced = (
+        workspace.ready_boot_id is not None and workspace.ready_boot_id != boot_id
+    )
+    if accepting_start and boot_replaced:
+        raise RuntimeConflictError("runtime boot was replaced")
 
     workspace.ready_generation = reconciled_generation
     workspace.ready_start_epoch = runtime_start_epoch
     workspace.ready_boot_id = boot_id
-    if workspace.ready_at is None or accepting_start:
+    if workspace.ready_at is None or accepting_start or boot_replaced:
         workspace.ready_at = observed_at
     workspace.runtime_last_seen_at = observed_at
     if accepting_start:
