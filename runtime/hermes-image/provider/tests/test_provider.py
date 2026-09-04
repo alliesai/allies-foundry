@@ -131,6 +131,17 @@ def test_deeply_nested_arguments_fail_soft(tmp_path):
     }
 
 
+def test_retention_scan_handles_deeply_nested_metadata():
+    nested: list[object] = []
+    forbidden: object = "api_key=top-secret-value"
+    for _ in range(5_000):
+        nested = [nested]
+        forbidden = [forbidden]
+
+    assert provider_module._contains_forbidden(nested) is False
+    assert provider_module._contains_forbidden(forbidden) is True
+
+
 @pytest.mark.parametrize(
     "content",
     [

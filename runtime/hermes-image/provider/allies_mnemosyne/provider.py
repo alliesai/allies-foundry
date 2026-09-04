@@ -185,20 +185,22 @@ def _profile_memory_config(hermes_home: Path) -> dict[str, Any]:
 
 
 def _contains_forbidden(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(
-            _SECRET_RE.search(value)
-            or _TRANSCRIPT_RE.search(value)
-            or _EPHEMERAL_RE.search(value)
-            or _COMMIT_RE.search(value)
-        )
-    if isinstance(value, dict):
-        return any(
-            _contains_forbidden(str(key)) or _contains_forbidden(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, (list, tuple)):
-        return any(_contains_forbidden(item) for item in value)
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if (
+                _SECRET_RE.search(current)
+                or _TRANSCRIPT_RE.search(current)
+                or _EPHEMERAL_RE.search(current)
+                or _COMMIT_RE.search(current)
+            ):
+                return True
+        elif isinstance(current, dict):
+            pending.extend(current.values())
+            pending.extend(str(key) for key in current)
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
     return False
 
 
