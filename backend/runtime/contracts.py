@@ -199,9 +199,9 @@ def validate_command(command: ExecutionCommand) -> ExecutionCommand:
     _validate_utf8_size(command.payload.text, MAX_COMMAND_TEXT_BYTES, "command text")
     bootstrap = command.payload.bootstrap
     if bootstrap is not None:
-        if command.conversation_turn_ordinal != 2:
+        if command.conversation_turn_ordinal < 2:
             raise RuntimeValidationError(
-                "bootstrap is only valid for the second conversation turn"
+                "bootstrap is invalid before the second conversation turn"
             )
         _validate_utf8_size(
             bootstrap.text, MAX_COMMAND_TEXT_BYTES, "bootstrap text"

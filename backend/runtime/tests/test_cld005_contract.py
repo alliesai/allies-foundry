@@ -149,6 +149,15 @@ def test_optional_bootstrap_is_fingerprinted_and_legacy_shape_stays_compatible(
         "8ef84387-581e-4e6f-a31d-6fbca75d95f4"
     )
 
+    retry = bootstrapped.model_copy(update={"conversation_turn_ordinal": 3})
+    retry = retry.model_copy(update={"fingerprint": command_fingerprint(retry)})
+    validate_command(retry)
+
+    invalid = bootstrapped.model_copy(update={"conversation_turn_ordinal": 1})
+    invalid = invalid.model_copy(update={"fingerprint": command_fingerprint(invalid)})
+    with pytest.raises(RuntimeValidationError, match="before the second"):
+        validate_command(invalid)
+
 
 def test_bootstrap_is_persisted_and_claimed_as_an_immutable_payload(
     binding, contract
