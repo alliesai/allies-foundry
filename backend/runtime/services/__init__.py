@@ -3,6 +3,7 @@ from .event_delivery import (
     enqueue_event_delivery,
     mark_event_delivery,
     publish_pending_event_deliveries,
+    redrive_event_deliveries,
 )
 from .events import append_event
 from .executions import (
@@ -14,6 +15,7 @@ from .leases import authorize_attempt_mutation, create_lease, create_lease_from_
 from .runtime_intents import (
     RuntimeIntentReceipt,
     cleanup_runtime_intents,
+    request_activation_recovery_wake,
     request_execution_wake_locked,
     request_runtime_intent,
 )
@@ -69,7 +71,9 @@ __all__ = [
     "process_runtime_wakes",
     "publish_pending_event_deliveries",
     "reconcile_execution_intent",
+    "redrive_event_deliveries",
     "replace_machine",
+    "request_activation_recovery_wake",
     "request_execution_wake_locked",
     "request_runtime_intent",
     "require_current_runtime_ready_locked",
