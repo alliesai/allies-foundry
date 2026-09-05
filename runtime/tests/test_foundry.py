@@ -451,6 +451,58 @@ async def test_worker_closes_stream_and_emits_reserved_budget_failure(
 
 
 @pytest.mark.asyncio
+async def test_worker_clamps_failure_after_boundary_completion_rejection(monkeypatch):
+    monkeypatch.setattr(foundry_module, "MAX_RUNTIME_EVENT_SEQUENCE", 2)
+    monkeypatch.setattr(foundry_module, "MAX_TERMINAL_SEQUENCE", 3)
+
+    class BoundaryHermes:
+        async def stream_profile_incremental(
+            self, profile_id, session_id, _message, *, session_key
+        ):
+            yield HermesEvent(
+                name="message.delta",
+                profile_id=profile_id,
+                session_id=session_id,
+                run_id="run-boundary",
+                sequence=1,
+                payload={"text": "x"},
+            )
+            yield HermesEvent(
+                name="execution.completed",
+                profile_id=profile_id,
+                session_id=session_id,
+                run_id="run-boundary",
+                sequence=2,
+                payload={"run_id": "run-boundary", "status": "completed"},
+            )
+
+    foundry, transport = client(
+        CLAIM,
+        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+        {"status": 202, "body": {"event_id": "delta", "sequence": 2}},
+        {"session_id": "session-1"},
+        ServiceUnavailableError("completion unavailable"),
+        {
+            "attempt_id": "attempt-1",
+            "status": "failed",
+            "receipt_id": "receipt-failure",
+        },
+    )
+    worker = FoundryWorker(foundry, BoundaryHermes(), renew_interval=0.1)
+
+    result = await worker.run(max_turns=1)
+
+    assert result[0].status == "failed"
+    complete_calls = [call for call in transport.calls if "/complete" in call[1]]
+    fail_calls = [call for call in transport.calls if "/fail" in call[1]]
+    assert len(complete_calls) == 1
+    assert len(fail_calls) == 1
+    assert fail_calls[0][3]["sequence"] == 3
+    assert fail_calls[0][3]["code"] == ServiceUnavailableError.code
+    assert not any("/stopped" in call[1] for call in transport.calls)
+
+
+@pytest.mark.asyncio
 async def test_worker_refills_free_slot_while_an_existing_turn_is_held(monkeypatch):
     release = asyncio.Event()
 

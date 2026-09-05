@@ -194,6 +194,7 @@ def _finish_attempt(
                 token_digest=lease_digest,
                 machine_generation=context.machine_generation,
                 stream_id=terminal_event["stream_id"],
+                allow_reserved_terminal_sequence=True,
             )
         receipt_id = uuid4()
         status = terminal_status

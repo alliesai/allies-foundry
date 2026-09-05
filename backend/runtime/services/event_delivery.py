@@ -240,7 +240,7 @@ def publish_pending_event_deliveries(limit: int = MAX_DELIVERY_BATCH) -> Deliver
     if not getattr(settings, "ALLIES_CLOUD_EVENT_DELIVERY_ENABLED", False):
         return DeliveryReport()
     claims = claim_event_deliveries(limit)
-    delivered = deferred = exhausted = 0
+    delivered = deferred = exhausted = repair_pending = recovered = 0
     for claim in claims:
         status, code = _post_to_cloud(claim.envelope_bytes)
         if status == 202:
@@ -252,6 +252,7 @@ def publish_pending_event_deliveries(limit: int = MAX_DELIVERY_BATCH) -> Deliver
             )
             if marked is not None:
                 delivered += 1
+                recovered += int(claim.repair_cycle > 0)
             else:
                 deferred += 1
         elif status in (401, 403, 404, 422) or (status == 409 and code == "conflict"):
@@ -268,6 +269,10 @@ def publish_pending_event_deliveries(limit: int = MAX_DELIVERY_BATCH) -> Deliver
             else:
                 exhausted += int(marked.state == EventDeliveryState.EXHAUSTED)
                 deferred += int(marked.state == EventDeliveryState.PENDING)
+                repair_pending += int(
+                    marked.state == EventDeliveryState.PENDING
+                    and marked.repair_cycle > 0
+                )
         else:
             marked = mark_event_delivery(
                 claim.delivery_id,
@@ -281,9 +286,12 @@ def publish_pending_event_deliveries(limit: int = MAX_DELIVERY_BATCH) -> Deliver
             else:
                 exhausted += int(marked.state == EventDeliveryState.EXHAUSTED)
                 deferred += int(marked.state == EventDeliveryState.PENDING)
-    evidence = _repair_evidence()
+                repair_pending += int(
+                    marked.state == EventDeliveryState.PENDING
+                    and marked.repair_cycle > 0
+                )
     return DeliveryReport(
-        len(claims), delivered, deferred, exhausted, evidence[0], evidence[1]
+        len(claims), delivered, deferred, exhausted, repair_pending, recovered
     )
 
 
@@ -470,17 +478,6 @@ def _rebuild_delivery_envelope(
             "event delivery envelope differs from retained event"
         )
     return encoded
-
-
-def _repair_evidence() -> tuple[int, int]:
-    return (
-        ExecutionEventDelivery.objects.filter(
-            state=EventDeliveryState.PENDING, repair_cycle__gt=0
-        ).count(),
-        ExecutionEventDelivery.objects.filter(
-            state=EventDeliveryState.DELIVERED, repair_cycle__gt=0
-        ).count(),
-    )
 
 
 def _identifier_values(

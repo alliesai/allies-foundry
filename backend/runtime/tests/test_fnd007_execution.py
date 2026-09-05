@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from django.utils import timezone
 
-from runtime.contracts import MAX_TERMINAL_SEQUENCE
+from runtime.contracts import MAX_RUNTIME_EVENT_SEQUENCE, MAX_TERMINAL_SEQUENCE
 from runtime.exceptions import (
     RuntimeIdempotencyConflictError,
     RuntimeLeaseConflictError,
@@ -273,6 +273,27 @@ def test_runtime_event_append_rejects_unknown_or_unsafe_payload(claimed_executio
             "activity.started",
             {"activity_id": "a", "kind": "tool", "args": {"secret": "x"}},
         )
+
+
+def test_runtime_events_cannot_occupy_reserved_terminal_sequence(claimed_execution):
+    context, _execution, claim = claimed_execution
+
+    with pytest.raises(
+        RuntimeValidationError,
+        match=f"1 to {MAX_RUNTIME_EVENT_SEQUENCE}",
+    ):
+        append_runtime_event(
+            context,
+            claim.attempt_id,
+            claim.lease_token,
+            uuid4(),
+            claim.stream_id,
+            MAX_TERMINAL_SEQUENCE,
+            "execution.stopped",
+            {"reason": "operator_requested"},
+        )
+
+    assert not ExecutionEvent.objects.filter(attempt_id=claim.attempt_id).exists()
 
 
 def test_projection_event_budget_reserves_sequence_100001_for_terminal_truth(

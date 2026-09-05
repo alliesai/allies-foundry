@@ -1504,7 +1504,10 @@ class FoundryWorker:
             if stream is not None:
                 await _close_stream(stream)
                 stream = None
-            sequence = max(sequence + 1, 1)
+            # Keep fallback failure inside the reserved terminal slot.  A
+            # failed completion at the boundary must not manufacture an
+            # invalid sequence or bypass lease-expiry reconciliation.
+            sequence = min(max(sequence + 1, 1), MAX_TERMINAL_SEQUENCE)
             failure_payload = {
                 "code": failure_code,
                 "retryable": False,

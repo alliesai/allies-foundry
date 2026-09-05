@@ -249,6 +249,7 @@ def _append_event_once(
     token_digest: str | None = None,
     machine_generation: int | None = None,
     stream_id: str = "",
+    allow_reserved_terminal_sequence: bool = False,
 ) -> ExecutionEvent:
     """Append an ordered event after lease/generation authorization.
 
@@ -264,7 +265,7 @@ def _append_event_once(
         raise RuntimeValidationError("event_id must be a UUID") from exc
     maximum_sequence = (
         MAX_TERMINAL_SEQUENCE
-        if event_type in _TERMINAL_EVENT_TYPES
+        if allow_reserved_terminal_sequence and event_type in _TERMINAL_EVENT_TYPES
         else MAX_RUNTIME_EVENT_SEQUENCE
     )
     if (

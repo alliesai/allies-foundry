@@ -689,6 +689,39 @@ def test_event_delivery_repairs_after_eighth_retry_with_cycle_and_delay(
     assert ExecutionEvent.objects.count() == event_count
 
 
+def test_event_delivery_repair_evidence_is_scoped_to_claimed_rows(
+    delivery, settings, monkeypatch
+):
+    _configure_delivery(settings)
+    delivery.state = event_delivery.EventDeliveryState.DELIVERED
+    delivery.repair_cycle = 1
+    delivery.delivered_at = timezone.now()
+    delivery.envelope_bytes = b""
+    delivery.byte_length = 0
+    delivery.save(
+        update_fields=[
+            "state",
+            "repair_cycle",
+            "delivered_at",
+            "envelope_bytes",
+            "byte_length",
+            "updated_at",
+        ]
+    )
+
+    monkeypatch.setattr(
+        event_delivery,
+        "_post_to_cloud",
+        lambda _body: (503, "delivery_unavailable"),
+    )
+
+    report = publish_pending_event_deliveries()
+
+    assert report.claimed == 0
+    assert report.recovered == 0
+    assert report.repair_pending == 0
+
+
 def test_event_delivery_parks_after_three_automatic_repair_cycles(delivery):
     current_now = timezone.now()
     for cycle in range(event_delivery.MAX_AUTOMATIC_REPAIR_CYCLES + 1):
