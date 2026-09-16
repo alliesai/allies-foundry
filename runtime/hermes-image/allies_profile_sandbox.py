@@ -414,12 +414,15 @@ def _readiness_probe(executable: str) -> bool:
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             timeout=8,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return False
+    if result.returncode:
+        logger.warning("Sandbox preflight rejected: %s", result.stderr[:1024].strip())
     return result.returncode == 0
 
 

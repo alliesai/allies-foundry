@@ -652,7 +652,18 @@ def main() -> None:
     assert os.geteuid() == 10000, os.geteuid()
     assert 10001 in os.getgroups(), os.getgroups()
     manager = ProfileSandboxManager(SimpleNamespace())
-    assert manager.preflight(), manager.readiness()
+    if not manager.preflight():
+        for diagnostic in (
+            "/proc/self/attr/current",
+            "/proc/sys/kernel/unprivileged_userns_clone",
+            "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+            "/proc/sys/user/max_user_namespaces",
+        ):
+            try:
+                print(f"{diagnostic}: {Path(diagnostic).read_text().strip()}", flush=True)
+            except OSError:
+                pass
+        raise AssertionError(manager.readiness())
     assert manager.readiness()["status"] == "ready"
     try:
         _check_routes(manager, fixture.target)
