@@ -25,12 +25,14 @@ from gateway.platforms.api_server import (
 from hermes_cli.plugins import discover_plugins
 from model_tools import get_tool_definitions, handle_function_call
 from run_agent import AIAgent
+from tools.registry import registry
 from tools.thread_context import propagate_context_to_thread
 from toolsets import TOOLSETS, create_custom_toolset
 
 SOCKET_PATH = Path("/opt/data/.allies-publication-bridge/socket")
 NONCE_A = "a" * 64
 NONCE_B = "b" * 64
+FILE_ID = "11111111-2222-4333-8444-555555555555"
 
 
 def _failure() -> dict[str, object]:
@@ -38,6 +40,18 @@ def _failure() -> dict[str, object]:
         "state": "failed",
         "retryable": True,
         "error_code": "publication_unavailable",
+    }
+
+
+def _invalid_paths() -> dict[str, object]:
+    return {
+        "state": "failed",
+        "retryable": True,
+        "error_code": "invalid_paths",
+        "message": (
+            "Use a workspace-relative or contained absolute file path. "
+            "Create or copy the file into the current workspace, then try again."
+        ),
     }
 
 
@@ -89,7 +103,10 @@ def _serve(
 def _published_file(name: str) -> bytes:
     return (
         json.dumps(
-            {"state": "ready", "files": [{"name": name, "open_path": "/files/id"}]},
+            {
+                "state": "ready",
+                "files": [{"name": name, "open_path": f"/files/{FILE_ID}"}],
+            },
             separators=(",", ":"),
         ).encode("utf-8")
         + b"\n"
@@ -223,6 +240,8 @@ def _test_private_capability_boundary() -> None:
 
 def main() -> None:
     discover_plugins(force=True)
+    publication_definition = registry.get_definitions({"publish_files"})[0]
+    assert publication_definition["function"]["parameters"]["required"] == ["paths"]
     ordinary = _allies_routine_enabled_toolsets(
         ["all"], routine_result=False, file_publication=False
     )
@@ -300,19 +319,27 @@ def main() -> None:
                 tool_call_id="call-path",
             )
         )
+        absolute_path = json.loads(
+            handle_function_call(
+                "publish_files",
+                {"paths": ["/opt/data/german_greeting.html"]},
+                tool_call_id="call-absolute-path",
+            )
+        )
     finally:
         reset_current_allies_file_publication_context(token)
     assert unavailable == _failure()
     assert oversized == _failure()
-    assert malformed == _failure()
-    assert invalid_path == _failure()
+    assert malformed == _invalid_paths()
+    assert invalid_path == _invalid_paths()
+    assert absolute_path == _failure()
 
     requests: list[dict[str, object]] = []
     server, errors = _serve(
         [_published_file("a.csv"), _published_file("b.csv")], requests
     )
     call_a = _call(NONCE_A, "call-a", "a.csv")
-    call_b = _call(NONCE_B, "call-b", "b.csv")
+    call_b = _call(NONCE_B, "call-b", "/opt/data/b.csv")
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = [
             future.result()
@@ -323,10 +350,18 @@ def main() -> None:
     assert {json.loads(result)["state"] for result in results} == {"ready"}
     assert {request["context"] for request in requests} == {NONCE_A, NONCE_B}
     assert {request["tool_call_id"] for request in requests} == {"call-a", "call-b"}
-    assert {tuple(request["paths"]) for request in requests} == {("a.csv",), ("b.csv",)}
+    assert {tuple(request["paths"]) for request in requests} == {
+        ("a.csv",),
+        ("/opt/data/b.csv",),
+    }
     for result in results:
         assert NONCE_A not in result and NONCE_B not in result
         assert '"paths"' not in result
+        assert '"open_path"' not in result
+        assert (
+            f"[a.csv](/files/{FILE_ID})" in result
+            or f"[b.csv](/files/{FILE_ID})" in result
+        )
 
     unicode_name = "名" * 255
     requests = []
@@ -344,8 +379,55 @@ def main() -> None:
     assert not server.is_alive() and not errors
     assert unicode_ready == {
         "state": "ready",
-        "files": [{"name": unicode_name, "open_path": "/files/id"}],
+        "files": [
+            {
+                "name": unicode_name,
+                "chat_reference": f"[{unicode_name}](/files/{FILE_ID})",
+            }
+        ],
     }
+
+    requests = []
+    server, errors = _serve([_published_file("German [verbs]\nnotes.md")], requests)
+    token = set_current_allies_file_publication_context(NONCE_A)
+    try:
+        escaped_label = json.loads(
+            handle_function_call(
+                "publish_files", {"paths": ["out.md"]}, tool_call_id="call-label"
+            )
+        )
+    finally:
+        reset_current_allies_file_publication_context(token)
+    server.join(timeout=5)
+    assert not server.is_alive() and not errors
+    assert escaped_label["files"][0]["chat_reference"] == (
+        f"[German \\[verbs\\] notes.md](/files/{FILE_ID})"
+    )
+
+    requests = []
+    server, errors = _serve(
+        [
+            (
+                b'{"state":"ready","files":[{"name":"out.csv",'
+                b'"open_path":"/files/not-a-uuid"}]}\n'
+            )
+        ],
+        requests,
+    )
+    token = set_current_allies_file_publication_context(NONCE_A)
+    try:
+        malformed_reference = json.loads(
+            handle_function_call(
+                "publish_files",
+                {"paths": ["out.csv"]},
+                tool_call_id="call-malformed-reference",
+            )
+        )
+    finally:
+        reset_current_allies_file_publication_context(token)
+    server.join(timeout=5)
+    assert not server.is_alive() and not errors
+    assert malformed_reference == _failure()
 
     requests = []
     server, errors = _serve([b"x" * (64 * 1024 + 1) + b"\n"], requests)
@@ -377,6 +459,38 @@ def main() -> None:
     server.join(timeout=5)
     assert not server.is_alive() and not errors and bridge_failed == _failure()
     assert "sensitive/path.csv" not in json.dumps(bridge_failed)
+
+    for code in ("invalid_paths", "file_not_found", "file_unreadable", "file_too_large"):
+        requests = []
+        server, errors = _serve(
+            [
+                json.dumps(
+                    {
+                        "state": "failed",
+                        "retryable": True,
+                        "error_code": code,
+                        "message": "private/path.csv",
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            ],
+            requests,
+        )
+        token = set_current_allies_file_publication_context(NONCE_A)
+        try:
+            local_failure = json.loads(
+                handle_function_call(
+                    "publish_files", {"paths": ["out.csv"]}, tool_call_id="call-local"
+                )
+            )
+        finally:
+            reset_current_allies_file_publication_context(token)
+        server.join(timeout=5)
+        assert not server.is_alive() and not errors
+        assert local_failure["error_code"] == code
+        assert "private/path.csv" not in json.dumps(local_failure)
+        assert "current workspace" in local_failure["message"]
 
     requests = []
     server, errors = _serve([_published_file(NONCE_A)], requests)
