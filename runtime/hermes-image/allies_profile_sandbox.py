@@ -194,6 +194,25 @@ def is_profile_sandbox_child() -> bool:
     return os.environ.get("ALLIES_PROFILE_SANDBOX_CHILD") == "1"
 
 
+def child_profile_key() -> str:
+    if not is_profile_sandbox_child():
+        raise ProfileSandboxUnavailable("child_profile_unavailable")
+    profile_key = os.environ.get("ALLIES_PROFILE_SANDBOX_PROFILE", "")
+    if not PROFILE_KEY_RE.fullmatch(profile_key):
+        raise ProfileSandboxUnavailable("child_profile_unavailable")
+    return profile_key
+
+
+def profile_scope_matches(
+    route_profile: str | None, scoped_profile: str | None
+) -> bool:
+    if not scoped_profile or scoped_profile == "default":
+        return False
+    if is_profile_sandbox_child():
+        return not route_profile and child_profile_key() == scoped_profile
+    return route_profile == scoped_profile
+
+
 def _route_regex(template: str) -> re.Pattern[str]:
     parts = []
     for part in template.split("/"):
@@ -406,11 +425,7 @@ def child_workspace_path() -> str:
     invariant.
     """
 
-    if not is_profile_sandbox_child():
-        raise ProfileSandboxUnavailable("child_workspace_unavailable")
-    profile_key = os.environ.get("ALLIES_PROFILE_SANDBOX_PROFILE", "")
-    if not PROFILE_KEY_RE.fullmatch(profile_key):
-        raise ProfileSandboxUnavailable("child_profile_unavailable")
+    profile_key = child_profile_key()
     expected = f"/opt/data/profiles/{profile_key}/workspace"
     workspace = os.environ.get("ALLIES_PROFILE_WORKSPACE", expected)
     if workspace != expected or not _safe_directory(Path(workspace)):
@@ -1235,9 +1250,11 @@ __all__ = [
     "ProfileSandboxManager",
     "ProfileSandboxProcess",
     "ProfileSandboxUnavailable",
+    "child_profile_key",
     "child_workspace_context",
     "child_workspace_path",
     "enforce_child_workspace",
     "is_profile_sandbox_child",
+    "profile_scope_matches",
     "route_owner",
 ]
