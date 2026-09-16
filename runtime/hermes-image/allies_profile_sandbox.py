@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from aiohttp import ClientSession, ClientTimeout, UnixConnector, web
+    from aiohttp import ClientError, ClientSession, ClientTimeout, UnixConnector, web
 except ImportError:  # pragma: no cover - aiohttp is in the Hermes image.
+    ClientError = OSError
     ClientSession = ClientTimeout = UnixConnector = web = None
 
 
@@ -44,78 +45,129 @@ PROFILE_IDLE_REAP_SECONDS = 300.0
 
 PROFILE_MANAGED_FILES = (".env", "config.yaml", "SOUL.md", ".allies-profile.json")
 PROFILE_WRITE_DIRECTORIES = (
-    "workspace", "memories", "sessions", "skills", "skins", "logs", "plans",
-    "cron", "home", "cache", "mnemosyne",
+    "workspace",
+    "memories",
+    "sessions",
+    "skills",
+    "skins",
+    "logs",
+    "plans",
+    "cron",
+    "home",
+    "cache",
+    "mnemosyne",
 )
 
-PROFILE_CHILD_ROUTES = frozenset({
-    ("GET", "/api/sessions"),
-    ("POST", "/api/sessions"),
-    ("GET", "/api/sessions/{session_id}"),
-    ("PATCH", "/api/sessions/{session_id}"),
-    ("DELETE", "/api/sessions/{session_id}"),
-    ("GET", "/api/sessions/{session_id}/messages"),
-    ("POST", "/api/sessions/{session_id}/fork"),
-    ("PUT", "/api/sessions/{session_id}/bootstrap"),
-    ("POST", "/api/sessions/{session_id}/chat"),
-    ("POST", "/api/sessions/{session_id}/chat/stream"),
-    ("POST", "/api/sessions/{session_id}/approval"),
-    ("GET", "/api/sessions/{session_id}/approval/{hermes_approval_id}"),
-    ("POST", "/api/sessions/{session_id}/model"),
-    ("POST", "/v1/chat/completions"),
-    ("POST", "/v1/responses"),
-    ("GET", "/v1/responses/{response_id}"),
-    ("DELETE", "/v1/responses/{response_id}"),
-    ("GET", "/api/jobs"),
-    ("POST", "/api/jobs"),
-    ("GET", "/api/jobs/{job_id}"),
-    ("PATCH", "/api/jobs/{job_id}"),
-    ("DELETE", "/api/jobs/{job_id}"),
-    ("POST", "/api/jobs/{job_id}/pause"),
-    ("POST", "/api/jobs/{job_id}/resume"),
-    ("POST", "/api/jobs/{job_id}/run"),
-    ("POST", "/api/cron/fire"),
-    ("POST", "/v1/runs"),
-    ("GET", "/v1/runs/{run_id}"),
-    ("GET", "/v1/runs/{run_id}/events"),
-    ("POST", "/v1/runs/{run_id}/approval"),
-    ("POST", "/v1/runs/{run_id}/stop"),
-})
-PROFILE_PARENT_ROUTES = frozenset({
-    ("GET", "/health"),
-    ("GET", "/health/detailed"),
-    ("GET", "/v1/health"),
-    ("GET", "/v1/models"),
-    ("GET", "/api/model/options"),
-    ("GET", "/v1/capabilities"),
-    ("GET", "/v1/skills"),
-    ("GET", "/v1/toolsets"),
-    ("POST", "/v1/profiles/{profile_key}/quiesce"),
-})
-PROFILE_DENIED_ROUTES = frozenset({
-    ("POST", "/api/platforms/{platform}/events"),
-})
-ALL_PROFILE_ROUTES = PROFILE_CHILD_ROUTES | PROFILE_PARENT_ROUTES | PROFILE_DENIED_ROUTES
+PROFILE_CHILD_ROUTES = frozenset(
+    {
+        ("GET", "/api/sessions"),
+        ("POST", "/api/sessions"),
+        ("GET", "/api/sessions/{session_id}"),
+        ("PATCH", "/api/sessions/{session_id}"),
+        ("DELETE", "/api/sessions/{session_id}"),
+        ("GET", "/api/sessions/{session_id}/messages"),
+        ("POST", "/api/sessions/{session_id}/fork"),
+        ("PUT", "/api/sessions/{session_id}/bootstrap"),
+        ("POST", "/api/sessions/{session_id}/chat"),
+        ("POST", "/api/sessions/{session_id}/chat/stream"),
+        ("POST", "/api/sessions/{session_id}/approval"),
+        ("GET", "/api/sessions/{session_id}/approval/{hermes_approval_id}"),
+        ("POST", "/api/sessions/{session_id}/model"),
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/responses"),
+        ("GET", "/v1/responses/{response_id}"),
+        ("DELETE", "/v1/responses/{response_id}"),
+        ("GET", "/api/jobs"),
+        ("POST", "/api/jobs"),
+        ("GET", "/api/jobs/{job_id}"),
+        ("PATCH", "/api/jobs/{job_id}"),
+        ("DELETE", "/api/jobs/{job_id}"),
+        ("POST", "/api/jobs/{job_id}/pause"),
+        ("POST", "/api/jobs/{job_id}/resume"),
+        ("POST", "/api/jobs/{job_id}/run"),
+        ("POST", "/api/cron/fire"),
+        ("POST", "/v1/runs"),
+        ("GET", "/v1/runs/{run_id}"),
+        ("GET", "/v1/runs/{run_id}/events"),
+        ("POST", "/v1/runs/{run_id}/approval"),
+        ("POST", "/v1/runs/{run_id}/stop"),
+    }
+)
+PROFILE_PARENT_ROUTES = frozenset(
+    {
+        ("GET", "/health"),
+        ("GET", "/health/detailed"),
+        ("GET", "/v1/health"),
+        ("GET", "/v1/models"),
+        ("GET", "/api/model/options"),
+        ("GET", "/v1/capabilities"),
+        ("GET", "/v1/skills"),
+        ("GET", "/v1/toolsets"),
+        ("POST", "/v1/profiles/{profile_key}/quiesce"),
+    }
+)
+PROFILE_DENIED_ROUTES = frozenset(
+    {
+        ("POST", "/api/platforms/{platform}/events"),
+    }
+)
+ALL_PROFILE_ROUTES = (
+    PROFILE_CHILD_ROUTES | PROFILE_PARENT_ROUTES | PROFILE_DENIED_ROUTES
+)
 _QUIESCE_ROUTE = ("POST", "/v1/profiles/{profile_key}/quiesce")
 
-_HOP_BY_HOP_HEADERS = frozenset({
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
-    "trailer", "transfer-encoding", "upgrade",
-})
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 _FORWARD_HEADER_PREFIXES = ("x-hermes-", "x-allies-")
-_FORWARD_HEADERS = frozenset({
-    "accept", "accept-encoding", "authorization", "cache-control", "content-type",
-    "if-match", "if-none-match", "idempotency-key", "last-event-id", "origin",
-    "user-agent",
-})
-_CONTROL_ENV_NAMES = frozenset({
-    "ALLIES_PROFILE_SANDBOX_CHILD", "ALLIES_PROFILE_SANDBOX_LISTENER_FD",
-    "ALLIES_PROFILE_SANDBOX_READY_FD", "ALLIES_PROFILE_SANDBOX_MARKER",
-    "ALLIES_PROFILE_SANDBOX_PROFILE", "API_SERVER_CORS_ORIGINS", "API_SERVER_ENABLED",
-    "API_SERVER_HOST", "API_SERVER_PORT", "HOME", "HERMES_HOME", "HERMES_PROFILE",
-    "ALLIES_PROFILE_WORKSPACE", "ALLIES_PROFILE_PUBLICATION_BASE", "PATH", "PWD",
-    "PYTHONPATH", "TMPDIR", "TERMINAL_CWD", "XDG_CACHE_HOME",
-})
+_FORWARD_HEADERS = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "cache-control",
+        "content-type",
+        "if-match",
+        "if-none-match",
+        "idempotency-key",
+        "last-event-id",
+        "origin",
+        "user-agent",
+    }
+)
+_CONTROL_ENV_NAMES = frozenset(
+    {
+        "ALLIES_PROFILE_SANDBOX_CHILD",
+        "ALLIES_PROFILE_SANDBOX_LISTENER_FD",
+        "ALLIES_PROFILE_SANDBOX_READY_FD",
+        "ALLIES_PROFILE_SANDBOX_MARKER",
+        "ALLIES_PROFILE_SANDBOX_PROFILE",
+        "API_SERVER_CORS_ORIGINS",
+        "API_SERVER_ENABLED",
+        "API_SERVER_HOST",
+        "API_SERVER_PORT",
+        "HOME",
+        "HERMES_HOME",
+        "HERMES_PROFILE",
+        "ALLIES_PROFILE_WORKSPACE",
+        "ALLIES_PROFILE_PUBLICATION_BASE",
+        "PATH",
+        "PWD",
+        "PYTHONPATH",
+        "TMPDIR",
+        "TERMINAL_CWD",
+        "XDG_CACHE_HOME",
+    }
+)
 
 
 class ProfileSandboxUnavailable(RuntimeError):
@@ -145,7 +197,9 @@ def is_profile_sandbox_child() -> bool:
 def _route_regex(template: str) -> re.Pattern[str]:
     parts = []
     for part in template.split("/"):
-        parts.append("[^/]+" if part.startswith("{") and part.endswith("}") else re.escape(part))
+        parts.append(
+            "[^/]+" if part.startswith("{") and part.endswith("}") else re.escape(part)
+        )
     return re.compile("^" + "/".join(parts) + "$")
 
 
@@ -163,7 +217,7 @@ def route_owner(method: str, path: str) -> tuple[str, str, bool]:
     prefix = re.match(r"^/p/[^/]+(?=/|$)", path)
     if prefix:
         prefixed = True
-        path = path[prefix.end():] or "/"
+        path = path[prefix.end() :] or "/"
     for route_method, template, pattern in _ROUTE_PATTERNS:
         if route_method == method and pattern.fullmatch(path):
             if (method, template) in PROFILE_CHILD_ROUTES:
@@ -204,21 +258,23 @@ def _safe_profile_home(profile_key: str) -> Path:
 
 def _safe_regular(path: Path) -> bool:
     try:
-        return not path.is_symlink() and stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)
+        return not path.is_symlink() and stat.S_ISREG(
+            path.stat(follow_symlinks=False).st_mode
+        )
     except OSError:
         return False
 
 
 def _safe_directory(path: Path) -> bool:
     try:
-        return not path.is_symlink() and stat.S_ISDIR(path.stat(follow_symlinks=False).st_mode)
+        return not path.is_symlink() and stat.S_ISDIR(
+            path.stat(follow_symlinks=False).st_mode
+        )
     except OSError:
         return False
 
 
-def _validate_profile_hardlinks(
-    home: Path, *, deadline: float | None = None
-) -> None:
+def _validate_profile_hardlinks(home: Path, *, deadline: float | None = None) -> None:
     """Reject regular-file aliases that leave the selected profile.
 
     The profile bind mount hides sibling names, but it cannot revoke an
@@ -249,15 +305,18 @@ def _validate_profile_hardlinks(
         try:
             for entry in entries:
                 visited += 1
-                if (
-                    visited > MAX_PROFILE_SCAN_ENTRIES
-                    or (deadline is not None and time.monotonic() > deadline)
+                if visited > MAX_PROFILE_SCAN_ENTRIES or (
+                    deadline is not None and time.monotonic() > deadline
                 ):
-                    raise ProfileSandboxUnavailable("profile_link_scan_budget_exhausted")
+                    raise ProfileSandboxUnavailable(
+                        "profile_link_scan_budget_exhausted"
+                    )
                 try:
                     info = entry.stat(follow_symlinks=False)
                 except OSError:
-                    raise ProfileSandboxUnavailable("profile_link_scan_failed") from None
+                    raise ProfileSandboxUnavailable(
+                        "profile_link_scan_failed"
+                    ) from None
                 mode = info.st_mode
                 if stat.S_ISLNK(mode):
                     continue
@@ -286,20 +345,27 @@ def _profile_secrets(home: Path) -> dict[str, str]:
     except (ImportError, OSError, TypeError, UnicodeError, ValueError):
         return {}
     return {
-        str(key): value for key, value in values.items()
+        str(key): value
+        for key, value in values.items()
         if ENV_KEY_RE.fullmatch(str(key) or "") and isinstance(value, str)
     }
 
 
-def _base_environment(home: Path, profile_key: str, marker: str, listener_fd: int, ready_fd: int) -> dict[str, str]:
+def _base_environment(
+    home: Path, profile_key: str, marker: str, listener_fd: int, ready_fd: int
+) -> dict[str, str]:
     """Build a child environment without inheriting the parent's secrets."""
 
     env: dict[str, str] = {
-        "PATH": os.environ.get("PATH", "/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin"),
+        "PATH": os.environ.get(
+            "PATH", "/opt/hermes/bin:/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+        ),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
         "TZ": os.environ.get("TZ", "UTC"),
-        "SSL_CERT_FILE": os.environ.get("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt"),
+        "SSL_CERT_FILE": os.environ.get(
+            "SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt"
+        ),
         "PYTHONUNBUFFERED": "1",
         "HERMES_HOME": f"/opt/data/profiles/{profile_key}",
         "HERMES_PROFILE": profile_key,
@@ -399,13 +465,36 @@ def child_workspace_context(existing: str | None = None) -> str | None:
 
 
 def _readiness_probe(executable: str) -> bool:
-    if os.name != "posix" or not hasattr(os, "geteuid") or not hasattr(socket, "AF_UNIX"):
+    if (
+        os.name != "posix"
+        or not hasattr(os, "geteuid")
+        or not hasattr(socket, "AF_UNIX")
+    ):
         return False
     command = [
-        executable, "--unshare-user", "--unshare-pid", "--die-with-parent", "--new-session",
-        "--cap-drop", "ALL", "--ro-bind", "/", "/", "--tmpfs", "/opt/data",
-        "--tmpfs", "/run", "--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--",
-        "/bin/sh", "-ceu",
+        executable,
+        "--unshare-user",
+        "--unshare-pid",
+        "--die-with-parent",
+        "--new-session",
+        "--cap-drop",
+        "ALL",
+        "--ro-bind",
+        "/",
+        "/",
+        "--tmpfs",
+        "/opt/data",
+        "--tmpfs",
+        "/run",
+        "--tmpfs",
+        "/tmp",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--",
+        "/bin/sh",
+        "-ceu",
         "test -d /proc && touch /tmp/.allies-profile-sandbox-probe && test ! -e /opt/data/.allies-profile-tombstones && test ! -e /run/.allies-profile-sandbox-host",
     ]
     try:
@@ -570,7 +659,9 @@ class ProfileSandboxManager:
                 try:
                     path.mkdir(mode=0o700)
                 except OSError:
-                    raise ProfileSandboxUnavailable("profile_state_unavailable") from None
+                    raise ProfileSandboxUnavailable(
+                        "profile_state_unavailable"
+                    ) from None
             if not _safe_directory(path):
                 raise ProfileSandboxUnavailable("unsafe_profile_state")
         data_dir = home / "mnemosyne" / "data"
@@ -589,7 +680,9 @@ class ProfileSandboxManager:
         if workspace_resolved.parent != home or not _safe_directory(workspace):
             raise ProfileSandboxUnavailable("unsafe_workspace")
         try:
-            with tempfile.NamedTemporaryFile(prefix=".allies-sandbox-", dir=home, delete=True):
+            with tempfile.NamedTemporaryFile(
+                prefix=".allies-sandbox-", dir=home, delete=True
+            ):
                 pass
         except OSError:
             raise ProfileSandboxUnavailable("profile_state_unwritable") from None
@@ -597,7 +690,9 @@ class ProfileSandboxManager:
 
     @staticmethod
     def _publication_bridge() -> Path | None:
-        raw = os.environ.get("ALLIES_PUBLICATION_SOCKET", "/opt/data/.allies-publication-bridge/socket")
+        raw = os.environ.get(
+            "ALLIES_PUBLICATION_SOCKET", "/opt/data/.allies-publication-bridge/socket"
+        )
         if not raw.startswith("/") or ".." in Path(raw).parts:
             return None
         return Path(raw)
@@ -612,31 +707,76 @@ class ProfileSandboxManager:
             entries = {entry.name for entry in bridge.parent.iterdir()}
         except OSError:
             raise ProfileSandboxUnavailable("publication_bridge_unavailable") from None
-        if not stat.S_ISSOCK(mode) or not stat.S_ISDIR(parent_mode) or bridge.parent.is_symlink() or entries != {bridge.name}:
+        if (
+            not stat.S_ISSOCK(mode)
+            or not stat.S_ISDIR(parent_mode)
+            or bridge.parent.is_symlink()
+            or entries != {bridge.name}
+        ):
             raise ProfileSandboxUnavailable("publication_bridge_unavailable")
         return bridge
 
-    def _command(self, home: Path, profile_key: str, listener_fd: int, ready_fd: int, marker: str, bridge: Path) -> tuple[list[str], dict[str, str]]:
+    def _command(
+        self,
+        home: Path,
+        profile_key: str,
+        listener_fd: int,
+        ready_fd: int,
+        marker: str,
+        bridge: Path,
+    ) -> tuple[list[str], dict[str, str]]:
         guest_home = f"/opt/data/profiles/{profile_key}"
         command = [
             self._executable or SANDBOX_EXECUTABLE,
-            "--unshare-user", "--unshare-pid", "--die-with-parent", "--new-session",
-            "--cap-drop", "ALL", "--ro-bind", "/", "/",
-            "--tmpfs", "/opt/data", "--dir", "/opt/data/profiles",
-            "--bind", str(home), guest_home,
+            "--unshare-user",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--new-session",
+            "--cap-drop",
+            "ALL",
+            "--ro-bind",
+            "/",
+            "/",
+            "--tmpfs",
+            "/opt/data",
+            "--dir",
+            "/opt/data/profiles",
+            "--bind",
+            str(home),
+            guest_home,
         ]
         for filename in PROFILE_MANAGED_FILES:
-            command.extend(["--ro-bind", str(home / filename), f"{guest_home}/{filename}"])
-        command.extend([
-            "--tmpfs", "/run", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp",
-            "--proc", "/proc", "--dev", "/dev",
-            # Socket connections need no writable mount or host permission change.
-            "--ro-bind", str(bridge.parent), "/opt/data/.allies-publication-bridge",
-            "--remount-ro", "/opt/data",
-            "--chdir", f"{guest_home}/workspace", "--",
-            "/opt/hermes/.venv/bin/python", "/opt/hermes/allies_profile_sandbox_launcher.py",
-        ])
-        return command, _base_environment(home, profile_key, marker, listener_fd, ready_fd)
+            command.extend(
+                ["--ro-bind", str(home / filename), f"{guest_home}/{filename}"]
+            )
+        command.extend(
+            [
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/var/tmp",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                # Socket connections need no writable mount or host permission change.
+                "--ro-bind",
+                str(bridge.parent),
+                "/opt/data/.allies-publication-bridge",
+                "--remount-ro",
+                "/opt/data",
+                "--chdir",
+                f"{guest_home}/workspace",
+                "--",
+                "/opt/hermes/.venv/bin/python",
+                "/opt/hermes/allies_profile_sandbox_launcher.py",
+            ]
+        )
+        return command, _base_environment(
+            home, profile_key, marker, listener_fd, ready_fd
+        )
 
     async def ensure(self, profile_key: str) -> ProfileSandboxProcess:
         if self.child_mode:
@@ -656,7 +796,9 @@ class ProfileSandboxManager:
                     return existing
                 if not await self._child_is_idle(existing):
                     raise ProfileSandboxUnavailable("profile_worker_busy")
-                if not await asyncio.to_thread(_terminate_process, existing.process, SANDBOX_STOP_SECONDS):
+                if not await asyncio.to_thread(
+                    _terminate_process, existing.process, SANDBOX_STOP_SECONDS
+                ):
                     raise ProfileSandboxUnavailable("profile_worker_stop_failed")
                 self._processes.pop(profile_key, None)
                 await self._discard(existing)
@@ -678,7 +820,9 @@ class ProfileSandboxManager:
                 await self._reap_idle_locked()
             if len(self._processes) >= MAX_ACTIVE_PROFILE_PROCESSES:
                 raise ProfileSandboxUnavailable("profile_sandbox_capacity")
-            temp_dir = Path(tempfile.mkdtemp(prefix="allies-profile-sandbox-", dir="/tmp"))
+            temp_dir = Path(
+                tempfile.mkdtemp(prefix="allies-profile-sandbox-", dir="/tmp")
+            )
             listener_path = temp_dir / "listener.sock"
             listener: socket.socket | None = None
             ready_read: int | None = None
@@ -694,7 +838,9 @@ class ProfileSandboxManager:
                 ready_read, ready_write = os.pipe()
                 os.set_inheritable(listener.fileno(), True)
                 os.set_inheritable(ready_write, True)
-                command, env = self._command(home, profile_key, listener.fileno(), ready_write, marker, bridge)
+                command, env = self._command(
+                    home, profile_key, listener.fileno(), ready_write, marker, bridge
+                )
                 # Spawn and register atomically so cancellation cannot lose ownership.
                 process = subprocess.Popen(  # noqa: ASYNC220
                     command,
@@ -708,8 +854,15 @@ class ProfileSandboxManager:
                     start_new_session=True,
                 )
                 state = ProfileSandboxProcess(
-                    profile_key, home, workspace, listener_path, temp_dir, marker,
-                    process, time.monotonic(), managed_signature,
+                    profile_key,
+                    home,
+                    workspace,
+                    listener_path,
+                    temp_dir,
+                    marker,
+                    process,
+                    time.monotonic(),
+                    managed_signature,
                 )
                 self._processes[profile_key] = state
                 os.close(ready_write)
@@ -796,18 +949,21 @@ class ProfileSandboxManager:
                 "X-Allies-Profile-Forwarded": state.marker,
                 "X-Allies-Profile-Internal-Status": state.marker,
             }
-            async with ClientSession(
-                connector=connector, timeout=timeout, auto_decompress=False
-            ) as session, session.get(
-                "http://profile-worker/health/detailed", headers=headers
-            ) as response:
+            async with (
+                ClientSession(
+                    connector=connector, timeout=timeout, auto_decompress=False
+                ) as session,
+                session.get(
+                    "http://profile-worker/health/detailed", headers=headers
+                ) as response,
+            ):
                 if response.status != 200:
                     return False
                 body = await response.content.read(MAX_HEALTH_RESPONSE_BYTES + 1)
                 if len(body) > MAX_HEALTH_RESPONSE_BYTES:
                     return False
                 payload = json.loads(body)
-        except (TimeoutError, OSError, RuntimeError, ValueError):
+        except (ClientError, TimeoutError, OSError, RuntimeError, ValueError):
             return False
         if not isinstance(payload, dict):
             return False
@@ -816,12 +972,14 @@ class ProfileSandboxManager:
             sandbox = readiness.get("profile_sandbox", {})
             checks = readiness.get("checks", {})
             queues = checks.get("background_queues", {})
-            return all((
-                int(sandbox.get("active_agent_work", 1)) == 0,
-                int(queues.get("active_api_runs", 0)) == 0,
-                int(queues.get("process_completions", 0)) == 0,
-                int(queues.get("active_delegations", 0)) == 0,
-            ))
+            return all(
+                (
+                    int(sandbox.get("active_agent_work", 1)) == 0,
+                    int(queues.get("active_api_runs", 0)) == 0,
+                    int(queues.get("process_completions", 0)) == 0,
+                    int(queues.get("active_delegations", 0)) == 0,
+                )
+            )
         except (AttributeError, TypeError, ValueError):
             return False
 
@@ -842,13 +1000,14 @@ class ProfileSandboxManager:
         if len(self._processes) < MAX_ACTIVE_PROFILE_PROCESSES:
             return
         now = time.monotonic()
-        candidates = sorted(
-            self._processes.values(), key=lambda state: state.last_used
-        )
+        candidates = sorted(self._processes.values(), key=lambda state: state.last_used)
         for state in candidates:
             if len(self._processes) < MAX_ACTIVE_PROFILE_PROCESSES:
                 return
-            if state.active_requests or now - state.last_used < self._idle_reap_seconds():
+            if (
+                state.active_requests
+                or now - state.last_used < self._idle_reap_seconds()
+            ):
                 continue
             if state.process.poll() is not None:
                 self._processes.pop(state.profile_key, None)
@@ -867,10 +1026,14 @@ class ProfileSandboxManager:
                 info = path.stat(follow_symlinks=False)
             except OSError:
                 raise ProfileSandboxUnavailable("profile_control_unavailable") from None
-            values.append((filename, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
+            values.append(
+                (filename, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            )
         return tuple(values)
 
-    async def stop_profile(self, profile_key: str, *, timeout: float = SANDBOX_STOP_SECONDS) -> bool:
+    async def stop_profile(
+        self, profile_key: str, *, timeout: float = SANDBOX_STOP_SECONDS
+    ) -> bool:
         async with self._launch_lock:
             state = self._processes.get(profile_key)
             if state is None:
@@ -888,7 +1051,12 @@ class ProfileSandboxManager:
     def _deny(code: str = "profile_sandbox_required"):
         return web.json_response({"error": {"code": code}}, status=404)
 
-    async def dispatch(self, profile: str | None, request: Any, handler: Callable[[Any], Awaitable[Any]]):
+    async def dispatch(
+        self,
+        profile: str | None,
+        request: Any,
+        handler: Callable[[Any], Awaitable[Any]],
+    ):
         owner, template, prefixed = route_owner(request.method, request.path)
         if owner == "parent":
             if template == _QUIESCE_ROUTE[1] and prefixed:
@@ -901,7 +1069,9 @@ class ProfileSandboxManager:
             return auth_error
         return await self.proxy(profile, request)
 
-    async def handle_child_request(self, request: Any, handler: Callable[[Any], Awaitable[Any]]):
+    async def handle_child_request(
+        self, request: Any, handler: Callable[[Any], Awaitable[Any]]
+    ):
         if request.path.startswith("/p/"):
             return self._deny("sandbox_child_prefix_forbidden")
         marker = os.environ.get("ALLIES_PROFILE_SANDBOX_MARKER", "")
@@ -927,9 +1097,8 @@ class ProfileSandboxManager:
             if lower in _HOP_BY_HOP_HEADERS:
                 continue
             if (
-                (lower in _FORWARD_HEADERS or lower.startswith(_FORWARD_HEADER_PREFIXES))
-                and lower != "x-allies-profile-forwarded"
-            ):
+                lower in _FORWARD_HEADERS or lower.startswith(_FORWARD_HEADER_PREFIXES)
+            ) and lower != "x-allies-profile-forwarded":
                 headers[name] = value
         headers["X-Allies-Profile-Forwarded"] = marker
         return headers
@@ -941,91 +1110,134 @@ class ProfileSandboxManager:
             lower = name.lower()
             if lower in _HOP_BY_HOP_HEADERS or lower == "content-length":
                 continue
-            if (
-                lower
-                in {
-                    "cache-control",
-                    "content-encoding",
-                    "content-type",
-                    "etag",
-                    "last-modified",
-                    "location",
-                    "retry-after",
-                    "vary",
-                }
-                or lower.startswith("x-")
-            ):
+            if lower in {
+                "cache-control",
+                "content-encoding",
+                "content-type",
+                "etag",
+                "last-modified",
+                "location",
+                "retry-after",
+                "vary",
+            } or lower.startswith("x-"):
                 headers[name] = value
         if streaming:
             headers.setdefault("Cache-Control", "no-cache")
         return headers
 
+    @staticmethod
+    def _abort_stream(request: Any) -> None:
+        transport = getattr(request, "transport", None)
+        if transport is not None:
+            transport.close()
+
     async def proxy(self, profile_key: str, request: Any):
+        stream_started = False
+        stream_response = None
         try:
             state = await self.ensure(profile_key)
             self._mark_request_started(state)
             body = await request.read()
             if len(body) > MAX_FORWARD_BODY_BYTES:
-                return web.json_response({"error": {"code": "request_too_large"}}, status=413)
+                return web.json_response(
+                    {"error": {"code": "request_too_large"}}, status=413
+                )
             path = request.path
             prefix = f"/p/{profile_key}"
             if path == prefix:
                 path = "/"
             elif path.startswith(prefix + "/"):
-                path = path[len(prefix):]
+                path = path[len(prefix) :]
             if request.query_string:
                 path = f"{path}?{request.query_string}"
             connector = UnixConnector(path=str(state.listener_path), force_close=True)
             timeout = ClientTimeout(total=None, sock_connect=5, sock_read=None)
-            async with ClientSession(
-                connector=connector, timeout=timeout, auto_decompress=False
-            ) as session, session.request(
+            async with (
+                ClientSession(
+                    connector=connector, timeout=timeout, auto_decompress=False
+                ) as session,
+                session.request(
                     request.method,
                     f"http://profile-worker{path}",
                     headers=self._forward_headers(request, state.marker),
                     data=body if body else None,
-            ) as response:
-                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
-                    streaming = content_type == "text/event-stream" or path.endswith(("/stream", "/events"))
-                    headers = self._response_headers(response, streaming=streaming)
-                    if streaming:
-                        output = web.StreamResponse(status=response.status, headers=headers)
-                        await output.prepare(request)
-                        try:
-                            async for chunk in response.content.iter_chunked(MAX_FORWARD_CHUNK_BYTES):
-                                await output.write(chunk)
-                        finally:
-                            with contextlib.suppress(Exception):
-                                await output.write_eof()
-                        return output
-                    payload_parts = []
-                    payload_size = 0
-                    while True:
-                        chunk = await response.content.read(
-                            min(MAX_FORWARD_CHUNK_BYTES, MAX_FORWARD_RESPONSE_BYTES + 1 - payload_size)
+                ) as response,
+            ):
+                content_type = (
+                    response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                )
+                streaming = content_type == "text/event-stream" or path.endswith(
+                    ("/stream", "/events")
+                )
+                headers = self._response_headers(response, streaming=streaming)
+                if streaming:
+                    stream_response = web.StreamResponse(
+                        status=response.status, headers=headers
+                    )
+                    await stream_response.prepare(request)
+                    stream_started = True
+                    async for chunk in response.content.iter_chunked(
+                        MAX_FORWARD_CHUNK_BYTES
+                    ):
+                        await stream_response.write(chunk)
+                    await stream_response.write_eof()
+                    return stream_response
+                payload_parts = []
+                payload_size = 0
+                while True:
+                    chunk = await response.content.read(
+                        min(
+                            MAX_FORWARD_CHUNK_BYTES,
+                            MAX_FORWARD_RESPONSE_BYTES + 1 - payload_size,
                         )
-                        if not chunk:
-                            break
-                        payload_parts.append(chunk)
-                        payload_size += len(chunk)
-                        if payload_size > MAX_FORWARD_RESPONSE_BYTES:
-                            break
-                    payload = b"".join(payload_parts)
-                    if len(payload) > MAX_FORWARD_RESPONSE_BYTES:
-                        return web.json_response({"error": {"code": "profile_response_too_large"}}, status=502)
-                    return web.Response(status=response.status, body=payload, headers=headers)
+                    )
+                    if not chunk:
+                        break
+                    payload_parts.append(chunk)
+                    payload_size += len(chunk)
+                    if payload_size > MAX_FORWARD_RESPONSE_BYTES:
+                        break
+                payload = b"".join(payload_parts)
+                if len(payload) > MAX_FORWARD_RESPONSE_BYTES:
+                    return web.json_response(
+                        {"error": {"code": "profile_response_too_large"}}, status=502
+                    )
+                return web.Response(
+                    status=response.status, body=payload, headers=headers
+                )
         except asyncio.CancelledError:
+            if stream_started:
+                self._abort_stream(request)
             raise
         except ProfileSandboxUnavailable:
-            return web.json_response({"error": {"code": "profile_sandbox_unavailable"}}, status=503, headers={"Retry-After": "1"})
-        except (OSError, RuntimeError, ValueError):
+            return web.json_response(
+                {"error": {"code": "profile_sandbox_unavailable"}},
+                status=503,
+                headers={"Retry-After": "1"},
+            )
+        except (ClientError, OSError, RuntimeError, ValueError):
+            if stream_started:
+                self._abort_stream(request)
+                return stream_response
             logger.warning("Profile sandbox request failed safely", exc_info=False)
-            return web.json_response({"error": {"code": "profile_sandbox_unavailable"}}, status=503, headers={"Retry-After": "1"})
+            return web.json_response(
+                {"error": {"code": "profile_sandbox_unavailable"}},
+                status=503,
+                headers={"Retry-After": "1"},
+            )
 
 
 __all__ = [
-    "ALL_PROFILE_ROUTES", "PROFILE_CHILD_ROUTES", "PROFILE_DENIED_ROUTES", "PROFILE_PARENT_ROUTES",
-    "ProfileSandboxManager", "ProfileSandboxProcess",
-    "ProfileSandboxUnavailable", "child_workspace_context", "child_workspace_path",
-    "enforce_child_workspace", "is_profile_sandbox_child", "route_owner",
+    "ALL_PROFILE_ROUTES",
+    "PROFILE_CHILD_ROUTES",
+    "PROFILE_DENIED_ROUTES",
+    "PROFILE_PARENT_ROUTES",
+    "ProfileSandboxManager",
+    "ProfileSandboxProcess",
+    "ProfileSandboxUnavailable",
+    "child_workspace_context",
+    "child_workspace_path",
+    "enforce_child_workspace",
+    "is_profile_sandbox_child",
+    "route_owner",
 ]

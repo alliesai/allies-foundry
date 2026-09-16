@@ -62,8 +62,9 @@ exercise the deployed UID, own-state writes, shared reads, denied writes and
 cross-profile access, publication socket access, concurrent workers and descendant
 shutdown in the built image. Do not promote an image that cannot pass those checks.
 
-The disposable Docker namespace smoke permits nested namespace syscalls through
-its outer seccomp policy; it adds no capabilities or privileged mode. This tests
+The disposable Docker namespace smoke permits nested namespace syscalls and a
+fresh procfs mount through its outer seccomp/system-path policy; it adds no
+capabilities or privileged mode. This tests
 the inner profile boundary, not compatibility with Docker's default seccomp
 profile. Deployment hosts must permit the required namespaces or runtime
 preflight refuses execution. This test setting does not change deployment policy.
