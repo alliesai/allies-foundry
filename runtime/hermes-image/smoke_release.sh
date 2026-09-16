@@ -16,7 +16,8 @@ for smoke in memory_routing reasoning_override bootstrap_endpoint activity_strea
         --volume "$PWD/runtime/hermes-image/smoke_${smoke}.py:/tmp/smoke.py:ro" \
         "$hermes" /tmp/smoke.py
 done
-docker run --rm --user 0:0 --group-add 10001 --entrypoint /opt/hermes/.venv/bin/python \
+# Permit nested namespaces in this disposable fixture; bwrap enforces the tested boundary.
+docker run --rm --security-opt seccomp=unconfined --user 0:0 --group-add 10001 --entrypoint /opt/hermes/.venv/bin/python \
     --env PYTHONPATH=/opt/hermes \
     --volume "$PWD/runtime/hermes-image/smoke_workspace_boundary.py:/tmp/smoke.py:ro" \
     "$hermes" /tmp/smoke.py
