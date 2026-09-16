@@ -564,7 +564,8 @@ def _run_http_lifecycle(fixture: Fixture) -> None:
                 ) as response:
                     assert response.status == 404
             with patch("allies_profile_sandbox.MAX_ACTIVE_PROFILE_PROCESSES", 1):
-                target_state.last_used = sibling_state.last_used = 0
+                expired = time.monotonic() - manager._idle_reap_seconds() - 1
+                target_state.last_used = sibling_state.last_used = expired
                 target_state.active_requests = sibling_state.active_requests = 1
                 await manager._reap_idle_locked()
                 assert manager.profile_process_count() == 2
