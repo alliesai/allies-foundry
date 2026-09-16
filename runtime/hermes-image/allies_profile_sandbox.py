@@ -207,10 +207,25 @@ def profile_scope_matches(
     route_profile: str | None, scoped_profile: str | None
 ) -> bool:
     if not scoped_profile or scoped_profile == "default":
+        logger.warning(
+            "event=profile_scope_rejected child=%s has_scope=%s default_scope=%s has_route=%s",
+            is_profile_sandbox_child(),
+            bool(scoped_profile),
+            scoped_profile == "default",
+            bool(route_profile),
+        )
         return False
     if is_profile_sandbox_child():
-        return not route_profile and child_profile_key() == scoped_profile
-    return route_profile == scoped_profile
+        matched = not route_profile and child_profile_key() == scoped_profile
+    else:
+        matched = route_profile == scoped_profile
+    if not matched:
+        logger.warning(
+            "event=profile_scope_rejected child=%s has_scope=true default_scope=false has_route=%s",
+            is_profile_sandbox_child(),
+            bool(route_profile),
+        )
+    return matched
 
 
 def _route_regex(template: str) -> re.Pattern[str]:
