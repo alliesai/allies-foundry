@@ -755,6 +755,7 @@ class _IncrementalHTTPStream:
         session_id: str,
         *,
         stream_timeout: float | None = None,
+        stream_idle_timeout: float | None = None,
         routine_result: bool = False,
     ):
         if stream_timeout is not None and (
@@ -763,6 +764,10 @@ class _IncrementalHTTPStream:
             raise ValueError("Hermes stream timeout must be positive")
         if type(routine_result) is not bool:
             raise ValueError("Hermes routine-result mode must be boolean")
+        if stream_idle_timeout is not None and (
+            isinstance(stream_idle_timeout, bool) or stream_idle_timeout <= 0
+        ):
+            raise ValueError("Hermes stream idle timeout must be positive")
         self.response = response
         self.profile_id = profile_id
         self.session_id = session_id
@@ -770,6 +775,8 @@ class _IncrementalHTTPStream:
         self.deadline = (
             time.monotonic() + stream_timeout if stream_timeout is not None else None
         )
+        self.idle_timeout = stream_idle_timeout
+        self.last_progress = time.monotonic()
         self.current_name = "message"
         self.data_lines: list[str] = []
         self.total_bytes = 0
@@ -805,6 +812,20 @@ class _IncrementalHTTPStream:
                 if remaining <= 0:
                     await self.aclose()
                     raise HermesTimeout("Hermes stream timed out")
+            # Idle fires only when no event was yielded recently. Keepalives
+            # and silence do not refresh it; yielded events do below.
+            if self.idle_timeout is not None:
+                idle_remaining = (
+                    self.last_progress + self.idle_timeout - time.monotonic()
+                )
+                if idle_remaining <= 0:
+                    await self.aclose()
+                    raise HermesTimeout("Hermes stream timed out")
+                remaining = (
+                    idle_remaining
+                    if remaining is None
+                    else min(remaining, idle_remaining)
+                )
             try:
                 if callable(self._readline):
                     read = asyncio.to_thread(self._readline, MAX_EVENT_BYTES + 1)
@@ -832,6 +853,7 @@ class _IncrementalHTTPStream:
                 if self.data_lines:
                     event = self._finish_event()
                     if event is not None:
+                        self.last_progress = time.monotonic()
                         return event
                 if self.done:
                     raise StopAsyncIteration
@@ -853,6 +875,7 @@ class _IncrementalHTTPStream:
                 event = self._finish_event()
                 self.event_bytes = 0
                 if event is not None:
+                    self.last_progress = time.monotonic()
                     return event
                 if self.done:
                     raise StopAsyncIteration
@@ -2326,6 +2349,7 @@ class HermesClient:
                         profile_id,
                         session_id,
                         stream_timeout=self.settings.stream_timeout,
+                        stream_idle_timeout=self.settings.stream_idle_timeout,
                         routine_result=routine_result,
                     )
                 ),

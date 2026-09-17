@@ -1669,7 +1669,88 @@ async def test_incremental_stream_rejects_invalid_or_expired_overall_deadlines()
     assert response.closed is True
 
 
-def test_incremental_stream_rejects_invalid_tool_progress():
+def test_incremental_stream_rejects_invalid_idle_timeouts():
+    with pytest.raises(ValueError, match="stream idle timeout must be positive"):
+        _IncrementalHTTPStream(object(), "ally-a", "s1", stream_idle_timeout=0)
+    with pytest.raises(ValueError, match="stream idle timeout must be positive"):
+        _IncrementalHTTPStream(object(), "ally-a", "s1", stream_idle_timeout=True)
+
+
+@pytest.mark.asyncio
+async def test_incremental_stream_refreshes_idle_clock_on_yielded_events():
+    rows = iter(
+        [
+            b"event: run.started\n",
+            b'data: {"session_id":"s1","run_id":"r1"}\n',
+            b"\n",
+            b"event: assistant.delta\n",
+            b'data: {"session_id":"s1","run_id":"r1","delta":"one"}\n',
+            b"\n",
+            b"event: assistant.delta\n",
+            b'data: {"session_id":"s1","run_id":"r1","delta":"two"}\n',
+            b"\n",
+        ]
+    )
+
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def readline(self, _limit):
+            try:
+                return next(rows)
+            except StopIteration:
+                time.sleep(0.2)
+                return b": keepalive\n"
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    stream = _IncrementalHTTPStream(response, "ally-a", "s1", stream_idle_timeout=0.05)
+
+    assert (await stream.__anext__()).name == "message.delta"
+    assert (await stream.__anext__()).name == "message.delta"
+    with pytest.raises(HermesTimeout, match="stream timed out"):
+        await stream.__anext__()
+
+    assert response.closed is True
+
+
+@pytest.mark.asyncio
+async def test_incremental_stream_absolute_deadline_ignores_yielded_events():
+    class Response:
+        def __init__(self):
+            self.closed = False
+            self.index = 0
+
+        def readline(self, _limit):
+            self.index += 1
+            if self.index <= 3:
+                return [
+                    b"event: run.started\n",
+                    b'data: {"session_id":"s1","run_id":"r1"}\n',
+                    b"\n",
+                ][self.index - 1]
+            if self.index % 3 == 0:
+                return b"\n"
+            if self.index % 3 == 1:
+                return b"event: assistant.delta\n"
+            return b'data: {"session_id":"s1","run_id":"r1","delta":"x"}\n'
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    stream = _IncrementalHTTPStream(
+        response, "ally-a", "s1", stream_timeout=0.05, stream_idle_timeout=3600
+    )
+
+    with pytest.raises(HermesTimeout, match="stream timed out"):
+        async for _event in stream:
+            pass
+
+    assert response.closed is True
     stream = _IncrementalHTTPStream(object(), "ally-a", "s1")
     stream._normalize_event("run.started", {"session_id": "s1", "run_id": "r1"})
 
