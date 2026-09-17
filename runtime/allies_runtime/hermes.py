@@ -812,8 +812,9 @@ class _IncrementalHTTPStream:
                 if remaining <= 0:
                     await self.aclose()
                     raise HermesTimeout("Hermes stream timed out")
-            # Idle fires only when no event was yielded recently. Keepalives
-            # and silence do not refresh it; yielded events do below.
+            # Idle fires only when no protocol event was accepted recently.
+            # Keepalives and silence do not refresh it; accepted events do
+            # in _finish_event below, whether or not they are yielded.
             if self.idle_timeout is not None:
                 idle_remaining = (
                     self.last_progress + self.idle_timeout - time.monotonic()
@@ -853,7 +854,6 @@ class _IncrementalHTTPStream:
                 if self.data_lines:
                     event = self._finish_event()
                     if event is not None:
-                        self.last_progress = time.monotonic()
                         return event
                 if self.done:
                     raise StopAsyncIteration
@@ -875,7 +875,6 @@ class _IncrementalHTTPStream:
                 event = self._finish_event()
                 self.event_bytes = 0
                 if event is not None:
-                    self.last_progress = time.monotonic()
                     return event
                 if self.done:
                     raise StopAsyncIteration
@@ -916,7 +915,11 @@ class _IncrementalHTTPStream:
         if not isinstance(payload, dict):
             raise HermesMalformedResponse("Hermes stream event was not an object")
         self.event_count += 1
-        return self._normalize_event(name, payload)
+        event = self._normalize_event(name, payload)
+        # Any accepted protocol event proves the run is alive, including
+        # non-yielded ones such as run.started and tool.progress heartbeats.
+        self.last_progress = time.monotonic()
+        return event
 
     def _normalize_event(
         self, name: str, payload: Mapping[str, Any]

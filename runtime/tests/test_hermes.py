@@ -1718,6 +1718,54 @@ async def test_incremental_stream_refreshes_idle_clock_on_yielded_events():
 
 
 @pytest.mark.asyncio
+async def test_incremental_stream_tool_progress_heartbeats_refresh_idle_clock():
+    script = iter(
+        [
+            b"event: run.started\n",
+            b'data: {"session_id":"s1","run_id":"r1"}\n',
+            b"\n",
+            b"event: tool.progress\n",
+            b'data: {"session_id":"s1","run_id":"r1","tool_name":"calendar"}\n',
+            b"\n",
+            ("sleep", 0.04),
+            b"event: tool.progress\n",
+            b'data: {"session_id":"s1","run_id":"r1","tool_name":"calendar"}\n',
+            b"\n",
+            ("sleep", 0.04),
+            b"event: assistant.delta\n",
+            b'data: {"session_id":"s1","run_id":"r1","delta":"done"}\n',
+            b"\n",
+            ("sleep", 0.2),
+        ]
+    )
+
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def readline(self, _limit):
+            item = next(script)
+            if isinstance(item, tuple):
+                time.sleep(item[1])
+                return b": keepalive\n"
+            return item
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    stream = _IncrementalHTTPStream(response, "ally-a", "s1", stream_idle_timeout=0.05)
+
+    # Total silence-free elapsed time exceeds the idle window, but the
+    # tool.progress heartbeats in between keep the stream alive.
+    assert (await stream.__anext__()).name == "message.delta"
+    with pytest.raises(HermesTimeout, match="stream timed out"):
+        await stream.__anext__()
+
+    assert response.closed is True
+
+
+@pytest.mark.asyncio
 async def test_incremental_stream_absolute_deadline_ignores_yielded_events():
     class Response:
         def __init__(self):
