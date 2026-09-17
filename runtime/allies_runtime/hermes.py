@@ -789,6 +789,7 @@ class _IncrementalHTTPStream:
         self._legacy_activity_counts: dict[str, int] = {}
         self._seen_activity_calls: set[str] = set()
         self._pending_approval_id: str | None = None
+        self._approval_idle_until: float | None = None
         self._seen_approval_ids: set[str] = set()
         self._stream_timeout = stream_timeout
         self.saw_assistant_delta = False
@@ -814,11 +815,17 @@ class _IncrementalHTTPStream:
                     raise HermesTimeout("Hermes stream timed out")
             # Idle fires only when no protocol event was accepted recently.
             # Keepalives and silence do not refresh it; accepted events do
-            # in _finish_event below, whether or not they are yielded.
+            # in _finish_event below. A pending approval holds the clock
+            # across the quiet deliberation window instead.
             if self.idle_timeout is not None:
                 idle_remaining = (
                     self.last_progress + self.idle_timeout - time.monotonic()
                 )
+                if self._approval_idle_until is not None:
+                    idle_remaining = max(
+                        idle_remaining,
+                        self._approval_idle_until - time.monotonic(),
+                    )
                 if idle_remaining <= 0:
                     await self.aclose()
                     raise HermesTimeout("Hermes stream timed out")
@@ -1020,15 +1027,22 @@ class _IncrementalHTTPStream:
                 )
                 expires_at = _approval_expiry(payload.get("expires_at"))
                 self._pending_approval_id = approval_id
+                remaining = (
+                    datetime.fromisoformat(expires_at) - datetime.now(UTC)
+                ).total_seconds()
                 if self._stream_timeout is not None:
-                    remaining = (
-                        datetime.fromisoformat(expires_at) - datetime.now(UTC)
-                    ).total_seconds()
                     # Let the worker wait until consent expires, then allow
                     # one ordinary stream-timeout window for Hermes to emit
                     # the terminal ``approval.responded`` receipt.
                     self.deadline = (
                         time.monotonic() + max(remaining, 0.0) + self._stream_timeout
+                    )
+                if self.idle_timeout is not None:
+                    # Deliberation is quiet by nature: hold the idle clock
+                    # across the consent window, plus one idle window for
+                    # the receipt.
+                    self._approval_idle_until = (
+                        time.monotonic() + max(remaining, 0.0) + self.idle_timeout
                     )
                 return self._event(
                     "approval.request",
@@ -1058,6 +1072,7 @@ class _IncrementalHTTPStream:
                     "Hermes approval response outcome was invalid"
                 )
             self._pending_approval_id = None
+            self._approval_idle_until = None
             self._seen_approval_ids.add(approval_id)
             if self._stream_timeout is not None:
                 self.deadline = time.monotonic() + self._stream_timeout

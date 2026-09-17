@@ -1766,6 +1766,58 @@ async def test_incremental_stream_tool_progress_heartbeats_refresh_idle_clock():
 
 
 @pytest.mark.asyncio
+async def test_incremental_stream_approval_wait_holds_idle_clock():
+    expires_at = (datetime.now(UTC) + timedelta(seconds=240)).isoformat()
+    script = iter(
+        [
+            b"event: run.started\n",
+            b'data: {"session_id":"s1","run_id":"r1"}\n',
+            b"\n",
+            b"event: approval.request\n",
+            (
+                f'data: {{"session_id":"s1","run_id":"r1",'
+                f'"hermes_approval_id":"approval-1",'
+                f'"action_kind":"plugin_tool","action_label":"Connect",'
+                f'"action_preview":"Connect Nabu","expires_at":"{expires_at}"}}\n'
+            ).encode(),
+            b"\n",
+            ("sleep", 0.09),
+            b"event: approval.responded\n",
+            b'data: {"session_id":"s1","run_id":"r1","hermes_approval_id":"approval-1","outcome":"approved"}\n',
+            b"\n",
+            ("sleep", 0.2),
+        ]
+    )
+
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def readline(self, _limit):
+            item = next(script)
+            if isinstance(item, tuple):
+                time.sleep(item[1])
+                return b": keepalive\n"
+            return item
+
+        def close(self):
+            self.closed = True
+
+    response = Response()
+    stream = _IncrementalHTTPStream(response, "ally-a", "s1", stream_idle_timeout=0.05)
+
+    # The 90ms deliberation silence exceeds the idle window, but the
+    # pending approval holds the clock until the receipt arrives.
+    assert (await stream.__anext__()).name == "approval.request"
+    assert (await stream.__anext__()).name == "approval.responded"
+    # Once answered, the hold is released and ordinary idle resumes.
+    with pytest.raises(HermesTimeout, match="stream timed out"):
+        await stream.__anext__()
+
+    assert response.closed is True
+
+
+@pytest.mark.asyncio
 async def test_incremental_stream_absolute_deadline_ignores_yielded_events():
     class Response:
         def __init__(self):
