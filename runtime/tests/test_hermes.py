@@ -1718,7 +1718,10 @@ async def test_incremental_stream_refreshes_idle_clock_on_yielded_events():
 
 
 @pytest.mark.asyncio
-async def test_incremental_stream_tool_progress_heartbeats_refresh_idle_clock():
+async def test_incremental_stream_tool_progress_heartbeats_refresh_idle_clock(
+    monkeypatch,
+):
+    clock = SimpleNamespace(now=1000.0)
     script = iter(
         [
             b"event: run.started\n",
@@ -1727,15 +1730,15 @@ async def test_incremental_stream_tool_progress_heartbeats_refresh_idle_clock():
             b"event: tool.progress\n",
             b'data: {"session_id":"s1","run_id":"r1","tool_name":"calendar"}\n',
             b"\n",
-            ("sleep", 0.04),
+            ("advance", 0.04),
             b"event: tool.progress\n",
             b'data: {"session_id":"s1","run_id":"r1","tool_name":"calendar"}\n',
             b"\n",
-            ("sleep", 0.04),
+            ("advance", 0.04),
             b"event: assistant.delta\n",
             b'data: {"session_id":"s1","run_id":"r1","delta":"done"}\n',
             b"\n",
-            ("sleep", 0.2),
+            ("advance", 0.2),
         ]
     )
 
@@ -1746,18 +1749,69 @@ async def test_incremental_stream_tool_progress_heartbeats_refresh_idle_clock():
         def readline(self, _limit):
             item = next(script)
             if isinstance(item, tuple):
-                time.sleep(item[1])
+                clock.now += item[1]
                 return b": keepalive\n"
             return item
 
         def close(self):
             self.closed = True
 
+    monkeypatch.setattr(
+        hermes_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
     response = Response()
     stream = _IncrementalHTTPStream(response, "ally-a", "s1", stream_idle_timeout=0.05)
 
-    # Total silence-free elapsed time exceeds the idle window, but the
-    # tool.progress heartbeats in between keep the stream alive.
+    # Fake elapsed time since the last refresh exceeds the idle window, but
+    # the tool.progress heartbeats in between keep the stream alive.
+    assert (await stream.__anext__()).name == "message.delta"
+    with pytest.raises(HermesTimeout, match="stream timed out"):
+        await stream.__anext__()
+
+    assert response.closed is True
+
+
+@pytest.mark.asyncio
+async def test_incremental_stream_survives_long_pre_token_silence_within_idle(
+    monkeypatch,
+):
+    clock = SimpleNamespace(now=1000.0)
+    script = iter(
+        [
+            b"event: run.started\n",
+            b'data: {"session_id":"s1","run_id":"r1"}\n',
+            b"\n",
+            ("advance", 60.0),
+            ("advance", 60.0),
+            ("advance", 60.0),
+            b"event: assistant.delta\n",
+            b'data: {"session_id":"s1","run_id":"r1","delta":"late"}\n',
+            b"\n",
+            ("advance", 400.0),
+        ]
+    )
+
+    class Response:
+        def __init__(self):
+            self.closed = False
+
+        def readline(self, _limit):
+            item = next(script)
+            if isinstance(item, tuple):
+                clock.now += item[1]
+                return b": keepalive\n"
+            return item
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        hermes_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    response = Response()
+    stream = _IncrementalHTTPStream(response, "ally-a", "s1", stream_idle_timeout=300.0)
+
+    # 180s of pre-token silence stays within the 300s idle window.
     assert (await stream.__anext__()).name == "message.delta"
     with pytest.raises(HermesTimeout, match="stream timed out"):
         await stream.__anext__()
