@@ -1902,7 +1902,7 @@ class ProfileStore:
             updated_config = _config_with_catalog(config_bytes)
             if legacy_memory_upgrade:
                 updated_config = _replace_legacy_memory_config(updated_config, seed)
-            if legacy_compression_upgrade:
+            if legacy_memory_upgrade or legacy_compression_upgrade:
                 updated_config = _replace_legacy_compression_config(
                     updated_config, seed
                 )

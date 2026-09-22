@@ -755,6 +755,51 @@ def test_replace_legacy_compression_config_edge_cases():
         _replace_legacy_compression_config(b"compression:\n  threshold_tokens: 1\n", seed)
 
 
+def test_legacy_memory_upgrade_also_adds_compression_section(tmp_path):
+    store = make_store(tmp_path)
+    legacy_seed = replace(
+        make_seed(),
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
+    assert store.materialize(legacy_seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, legacy_seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = legacy_seed.legacy_memory_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, legacy_seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del config["compression"]
+    config["memory"] = {
+        "provider": "allies_mnemosyne",
+        "mode": "context_only",
+        "policy_version": "allies-mnemosyne-v1",
+        "tools": [],
+        "profile_isolation": True,
+        "sync_roles": [],
+        "mnemosyne": {
+            "profile_isolation": True,
+            "shared_surface_read": False,
+            "storage": "mnemosyne",
+        },
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    receipt = store.materialize(make_seed())
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == make_seed().fingerprint
+    final = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert final["memory"]["mode"] == "narrow_tools"
+    assert final["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+
+
 def test_legacy_memory_upgrade_retries_after_manifest_write_failure(tmp_path, monkeypatch):
     store = make_store(tmp_path)
     legacy_seed = replace(
