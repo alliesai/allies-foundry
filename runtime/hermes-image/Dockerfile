@@ -1,9 +1,9 @@
 # The upstream image owns Hermes, /init, s6 supervision, and the /opt/data
 # volume contract.  This image only adds the Allies provider and its locked
 # local-memory dependencies.
-FROM nousresearch/hermes-agent:latest@sha256:b6f18532e2c082ef6686c659fc222427e41fde3eed08aa058411f0ea5ab705ca
+FROM nousresearch/hermes-agent:v2026.9.24@sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7
 
-ARG HERMES_SOURCE_SHA=36cb5ae5530a75def7df3195e49b7a4aa2add482
+ARG HERMES_SOURCE_SHA=f24a1d7f926c88911fe21ff0d73ba02638066801
 ARG ALLIES_WRAPPER_VERSION=0.1.0
 ARG SOURCE_DATE_EPOCH=0
 ARG TARGETARCH
@@ -205,7 +205,7 @@ LABEL org.opencontainers.image.title="Allies Hermes with Mnemosyne" \
       org.opencontainers.image.version="${ALLIES_WRAPPER_VERSION}" \
       org.opencontainers.image.source="https://github.com/NousResearch/hermes-agent" \
       org.opencontainers.image.revision="${HERMES_SOURCE_SHA}" \
-      org.opencontainers.image.base.digest="sha256:b6f18532e2c082ef6686c659fc222427e41fde3eed08aa058411f0ea5ab705ca" \
+      org.opencontainers.image.base.digest="sha256:fca358f12efd65bfaaca05884166f15c0e2788375ca30d77061ac1ebc96452b7" \
       io.allies.hermes.source-sha="${HERMES_SOURCE_SHA}" \
       io.allies.mnemosyne.policy-version="allies-mnemosyne-v1" \
       io.allies.build.source-date-epoch="${SOURCE_DATE_EPOCH}"
