@@ -800,6 +800,41 @@ def test_legacy_model_default_is_upgraded_without_replacing_profile_state(tmp_pa
     }
 
 
+def test_memory_era_volume_upgrades_compression_and_model_together(tmp_path):
+    store, seed = make_store(tmp_path), _openrouter_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = seed.legacy_compression_model_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del config["compression"]
+    config["model"] = {
+        "provider": "openai-api",
+        "default": "gpt-5.6-luna",
+        "base_url": "https://api.openai.com/v1",
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    marker = profile_path(store, seed) / "sessions" / "preserved"
+    marker.write_text("keep", encoding="utf-8")
+
+    receipt = store.materialize(seed)
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    assert marker.read_text(encoding="utf-8") == "keep"
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == seed.fingerprint
+    final = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert final["model"]["default"] == "openai/gpt-6-luna"
+    assert final["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+
+
 def test_legacy_memory_and_model_defaults_upgrade_together(tmp_path):
     store = make_store(tmp_path)
     legacy_seed = replace(

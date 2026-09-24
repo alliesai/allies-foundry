@@ -618,6 +618,20 @@ class ProfileSeed:
         return _fingerprint_digest(payload)
 
     @property
+    def legacy_compression_model_fingerprint(self) -> str:
+        """Return the fingerprint of a volume upgraded past memory defaults
+        but asleep since before the compression threshold."""
+
+        payload = self._fingerprint_payload()
+        del payload["compression"]
+        payload["model"] = {
+            "provider": self.provider,
+            "default": LEGACY_MODEL_DEFAULT,
+            "base_url": LEGACY_MODEL_BASE_URL,
+        }
+        return _fingerprint_digest(payload)
+
+    @property
     def model_provider_name(self) -> str:
         return self.provider
 
@@ -1841,6 +1855,7 @@ class ProfileStore:
         legacy_model_upgrade = manifest.get("seed_fingerprint") in {
             seed.legacy_model_fingerprint,
             seed.legacy_memory_model_fingerprint,
+            seed.legacy_compression_model_fingerprint,
         }
         if (
             manifest.get("seed_fingerprint") != seed.fingerprint
@@ -1964,7 +1979,7 @@ class ProfileStore:
             updated_config = _config_with_catalog(config_bytes)
             if legacy_memory_upgrade:
                 updated_config = _replace_legacy_memory_config(updated_config, seed)
-            if legacy_memory_upgrade or legacy_compression_upgrade:
+            if legacy_memory_upgrade or legacy_compression_upgrade or legacy_model_upgrade:
                 updated_config = _replace_legacy_compression_config(
                     updated_config, seed
                 )
