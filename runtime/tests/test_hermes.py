@@ -29,6 +29,7 @@ from allies_runtime.hermes import (
     UnixSocketCredentialResolver,
     _IncrementalHTTPStream,
     stable_session_identifiers,
+    validate_model_override,
 )
 from allies_runtime.hermes import (
     test_credential_for_reference as derive_test_credential,
@@ -2368,6 +2369,45 @@ async def test_streams_reject_invalid_reasoning_before_request(
             await result
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_stream_forwards_model_override_and_validates_bounds(monkeypatch):
+    lines = [
+        b"event: run.started\n",
+        b'data: {"session_id":"s1","run_id":"r1","seq":1}\n',
+        b"\n",
+        b"event: run.completed\n",
+        b'data: {"session_id":"s1","run_id":"r1","seq":2}\n',
+        b"\n",
+        b"data: [DONE]\n\n",
+    ]
+    response = FakeResponse(lines=lines)
+    client, calls = _client(monkeypatch, response)
+    await client.stream_profile(
+        "ally-a",
+        "s1",
+        "hello",
+        provider="opencode-zen",
+        model="gpt-5.2",
+        model_options={"reasoning": "high"},
+    )
+    assert json.loads(calls[0][3]) == {
+        "message": "hello",
+        "provider": "opencode-zen",
+        "model": "gpt-5.2",
+        "model_options": {"reasoning": "high"},
+    }
+
+    assert validate_model_override(None, "", {}) == {}
+    with pytest.raises(ValueError):
+        validate_model_override("p" * 257, None, None)
+    with pytest.raises(ValueError):
+        validate_model_override(None, None, {f"k{i}": i for i in range(9)})
+    with pytest.raises(ValueError):
+        validate_model_override(None, None, {"Bad-Key": "x"})
+    with pytest.raises(ValueError):
+        validate_model_override(None, None, {"reasoning": ["high"]})
 
 
 @pytest.mark.asyncio

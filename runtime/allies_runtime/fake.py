@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from .errors import (
     HermesAuthenticationError,
@@ -64,6 +65,7 @@ class FakeHermesClient:
         self.plans = dict(plans or {})
         self.health_status = health_status
         self.calls: list[tuple[str, str, str]] = []
+        self.overrides: list[dict[str, Any]] = []
         self.session_keys: list[str] = []
         self.ensured_sessions: list[tuple[str, str]] = []
         self._run_numbers: dict[str, int] = {}
@@ -96,11 +98,21 @@ class FakeHermesClient:
         *,
         session_key: str | None = None,
         reasoning_effort: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        model_options: Mapping[str, Any] | None = None,
     ) -> HermesStreamResult:
         plan = self.plans.get(profile_id, FakeProfilePlan())
         self.calls.append((profile_id, session_id, message))
         if session_key is not None:
             self.session_keys.append(session_key)
+        self.overrides.append(
+            {
+                "provider": provider,
+                "model": model,
+                "model_options": dict(model_options or {}),
+            }
+        )
         await asyncio.sleep(plan.delay)
         if plan.failure == "auth":
             raise HermesAuthenticationError("Hermes authentication was rejected")
@@ -146,6 +158,9 @@ class FakeHermesClient:
         *,
         session_key: str | None = None,
         reasoning_effort: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        model_options: Mapping[str, Any] | None = None,
     ) -> CancellableHermesStream:
         """Yield fixture events incrementally and record cancellation."""
 
@@ -153,6 +168,13 @@ class FakeHermesClient:
         self.calls.append((profile_id, session_id, message))
         if session_key is not None:
             self.session_keys.append(session_key)
+        self.overrides.append(
+            {
+                "provider": provider,
+                "model": model,
+                "model_options": dict(model_options or {}),
+            }
+        )
         if plan.failure == "auth":
             raise HermesAuthenticationError("Hermes authentication was rejected")
         if plan.failure == "malformed":

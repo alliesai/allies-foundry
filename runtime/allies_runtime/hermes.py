@@ -218,12 +218,28 @@ def _stream_request_body(
     reasoning_effort: str | None,
     file_context: Mapping[str, Any] | None = None,
     publication_context: str | None = None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    model_options: Mapping[str, Any] | None = None,
 ) -> bytes:
-    request_body = {"message": message}
+    request_body: dict[str, Any] = {"message": message}
+    if provider is not None:
+        request_body["provider"] = provider
+    if model is not None:
+        request_body["model"] = model
     if reasoning_effort is not None:
         request_body["model_options"] = {
             "reasoning": {"enabled": True, "effort": reasoning_effort}
         }
+    if model_options:
+        base = request_body.get("model_options")
+        if isinstance(base, dict):
+            merged = dict(base)
+            merged.update(model_options)
+            request_body["model_options"] = merged
+        else:
+            request_body["model_options"] = dict(model_options)
     if file_context is not None:
         request_body["allies_file_context"] = validate_hermes_file_context(file_context)
     if publication_context is not None:
@@ -362,6 +378,38 @@ def _approval_material(value: Any, *, label: bool) -> str:
     elif len(value.encode("utf-8")) > MAX_APPROVAL_PREVIEW_BYTES:
         raise HermesMalformedResponse("Hermes approval preview was invalid")
     return value
+MAX_OVERRIDE_OPTIONS = 8
+_OVERRIDE_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def validate_model_override(
+    provider: str | None, model: str | None, options: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Validate one per-turn Hermes model selection override."""
+    override: dict[str, Any] = {}
+    if provider:
+        if not isinstance(provider, str) or len(provider.encode("utf-8")) > 256:
+            raise ValueError("Hermes override provider must be bounded text")
+        override["provider"] = provider
+    if model:
+        if not isinstance(model, str) or len(model.encode("utf-8")) > 256:
+            raise ValueError("Hermes override model must be bounded text")
+        override["model"] = model
+    if options:
+        if not isinstance(options, Mapping) or len(options) > MAX_OVERRIDE_OPTIONS:
+            raise ValueError("Hermes override options must be a bounded object")
+        cleaned: dict[str, Any] = {}
+        for key, value in options.items():
+            if not isinstance(key, str) or _OVERRIDE_KEY.fullmatch(key) is None:
+                raise ValueError("Hermes override option names are invalid")
+            if isinstance(value, str):
+                if len(value.encode("utf-8")) > 512:
+                    raise ValueError("Hermes override option values are invalid")
+            elif not isinstance(value, (bool, int, float)) or value is None:
+                raise ValueError("Hermes override option values are invalid")
+            cleaned[key] = value
+        override["model_options"] = cleaned
+    return override
 
 
 def _bootstrap_fields(
@@ -1987,6 +2035,9 @@ class HermesClient:
         routine_result: bool = False,
         file_context: Mapping[str, Any] | None = None,
         routine_tool_token: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        model_options: Mapping[str, Any] | None = None,
     ) -> HermesStreamResult:
         """Run one profile-scoped SSE turn with bounded response handling."""
 
@@ -1994,6 +2045,7 @@ class HermesClient:
         session_id = _session_path(session_id)
         message = _stream_message_with_file_context(message, file_context)
         reasoning_effort = validate_reasoning_effort(reasoning_effort)
+        override = validate_model_override(provider, model, model_options)
         try:
             token = await asyncio.wait_for(
                 self._profile_credential(profile_id), self.settings.stream_timeout
@@ -2001,7 +2053,14 @@ class HermesClient:
         except TimeoutError as exc:
             raise HermesTimeout("Hermes credential resolution timed out") from exc
         path = f"/p/{profile_id}/api/sessions/{session_id}/chat/stream"
-        body = _stream_request_body(message, reasoning_effort, file_context)
+        body = _stream_request_body(
+            message,
+            reasoning_effort,
+            file_context,
+            provider=override.get("provider"),
+            model=override.get("model"),
+            model_options=override.get("model_options"),
+        )
 
         def read_stream() -> HermesStreamResult:
             response = None
@@ -2237,6 +2296,9 @@ class HermesClient:
         routine_result: bool = False,
         file_context: Mapping[str, Any] | None = None,
         routine_tool_token: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        model_options: Mapping[str, Any] | None = None,
     ) -> HermesStreamResult:
         reasoning_effort = validate_reasoning_effort(reasoning_effort)
         started_at = time.monotonic()
@@ -2260,6 +2322,9 @@ class HermesClient:
                 routine_result=routine_result,
                 file_context=file_context,
                 routine_tool_token=routine_tool_token,
+                provider=provider,
+                model=model,
+                model_options=model_options,
             )
         except BaseException as error:
             emit_runtime_event(
@@ -2300,6 +2365,9 @@ class HermesClient:
         file_context: Mapping[str, Any] | None = None,
         publication_context: str | None = None,
         routine_tool_token: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        model_options: Mapping[str, Any] | None = None,
     ) -> _ObservedHermesStream:
         """Open an SSE response and yield events without buffering the body."""
 
@@ -2308,6 +2376,7 @@ class HermesClient:
         session_id = _session_path(session_id)
         message = _stream_message_with_file_context(message, file_context)
         reasoning_effort = validate_reasoning_effort(reasoning_effort)
+        override = validate_model_override(provider, model, model_options)
         emit_runtime_event(
             build_event(
                 "provider.operation.started",
@@ -2349,7 +2418,13 @@ class HermesClient:
             )
             path = f"/p/{profile_id}/api/sessions/{session_id}/chat/stream"
             body = _stream_request_body(
-                message, reasoning_effort, file_context, publication_context
+                message,
+                reasoning_effort,
+                file_context,
+                publication_context,
+                provider=override.get("provider"),
+                model=override.get("model"),
+                model_options=override.get("model_options"),
             )
             response = await asyncio.wait_for(
                 asyncio.to_thread(
