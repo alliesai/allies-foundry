@@ -65,3 +65,19 @@ def test_unrelated_personality_change_still_conflicts(tmp_path):
     )
     receipt = store.materialize(make_seed(personality=other))
     assert receipt.status is ProfileProvisionStatus.CONFLICT
+
+
+def test_missing_manifest_fingerprint_is_not_a_soul_upgrade(tmp_path):
+    store = make_store(tmp_path)
+    seed = make_seed(personality="custom soul")
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    profile = profile_path(store, seed)
+    manifest_path = profile / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["seed_fingerprint"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    receipt = store.materialize(make_seed(personality="another custom soul"))
+
+    assert receipt.status is ProfileProvisionStatus.CONFLICT
+    assert (profile / "SOUL.md").read_text(encoding="utf-8") == "custom soul"

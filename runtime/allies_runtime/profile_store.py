@@ -1823,8 +1823,10 @@ class ProfileStore:
         legacy_compression_upgrade = (
             manifest.get("seed_fingerprint") == seed.legacy_compression_fingerprint
         )
+        legacy_soul_fingerprint = seed.legacy_soul_fingerprint
         legacy_soul_upgrade = (
-            manifest.get("seed_fingerprint") == seed.legacy_soul_fingerprint
+            legacy_soul_fingerprint is not None
+            and manifest.get("seed_fingerprint") == legacy_soul_fingerprint
         )
         if (
             manifest.get("seed_fingerprint") != seed.fingerprint
