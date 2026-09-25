@@ -44,10 +44,16 @@ accounting, Cloud changes.
    from the seed, so no template change expected beyond what the seed
    carries — verify during implementation), legacy upgrade path for
    pre-switch manifests.
-4. `runtime/hermes-image/Dockerfile`: base bump to `v2026.9.24`
-   (`sha256:fca358f1…`) + `HERMES_SOURCE_SHA=f24a1d7…` so the gpt-6
-   catalog (1.05M window, thresholds) ships. Patches are fail-closed at
-   build; image CI is the verifier.
+4. Base image: KEEP the pinned base (`latest@b6f185…`, source
+   `36cb5ae`). A bump to `v2026.9.24` was attempted and reverted:
+   upstream split the god-files into satellite modules, so 10 of 11
+   source-pinned patches no longer apply — rebasing them is a port, not
+   a rebase, and belongs in separate maintenance. The switch does not
+   need the new base: the old base already supports
+   `compression.threshold_tokens`, unknown models degrade to the 256K
+   fallback window (the absolute 100K cap governs regardless), and the
+   model string passes through verbatim to OpenRouter. Patches are
+   fail-closed at build; image CI is the verifier.
 5. Tests: defaults, strict-shape, fingerprint parity backend↔runtime,
    migration probe (forward + reverse + idempotency), legacy upgrade.
 6. Rollout (runbook in PR body): rotate `PROFILE_PROVISIONING_API_KEY`
