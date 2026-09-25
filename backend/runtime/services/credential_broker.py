@@ -39,14 +39,17 @@ def resolve_brokered_credential(context: RuntimeContext, reference: object) -> s
 
 
 def _bound_in_workspace(workspace: Workspace, reference: str) -> bool:
-    overrides = RuntimeProfile.objects.filter(workspace=workspace).values_list(
-        "model_override", flat=True
+    rows = RuntimeProfile.objects.filter(workspace=workspace).values_list(
+        "model_override", "seed_payload"
     )[:MAX_WORKSPACE_PROFILES]
-    for override in overrides:
+    for override, seed in rows:
         binding = override.get("binding") if isinstance(override, dict) else None
-        refs = binding.get("key_refs") if isinstance(binding, dict) else None
-        if isinstance(refs, dict) and reference in refs.values():
-            return True
+        for refs in (
+            binding.get("key_refs") if isinstance(binding, dict) else None,
+            seed.get("credential_refs") if isinstance(seed, dict) else None,
+        ):
+            if isinstance(refs, dict) and reference in refs.values():
+                return True
     return False
 
 

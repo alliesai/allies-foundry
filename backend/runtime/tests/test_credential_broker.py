@@ -39,7 +39,7 @@ def _workspace(tenant_ref):
     )
 
 
-def _profile(workspace):
+def _profile(workspace, credential_refs=None):
     receipt = ensure_runtime_profile(
         workspace.id,
         uuid4(),
@@ -49,7 +49,8 @@ def _profile(workspace):
             provider="openai",
             model="gpt-test",
             first_chat_instruction="i",
-            credential_refs={"OPENAI_API_KEY": "file:///run/secrets/openai"},
+            credential_refs=credential_refs
+            or {"OPENAI_API_KEY": "file:///run/secrets/openai"},
         ),
     )
     return RuntimeProfile.objects.get(pk=receipt.profile_id)
@@ -207,3 +208,10 @@ def test_binding_endpoint_accepts_key_refs_atomically(db, settings):
     body = response.json()
     assert body["generation"] == 1
     assert body["binding"]["key_refs"] == {"OPENCODE_ZEN_API_KEY": REF}
+
+
+def test_seed_held_broker_ref_resolves(db, cloud):
+    workspace = _workspace("tenant-a")
+    _profile(workspace, {"OPENCODE_ZEN_API_KEY": REF})
+
+    assert _post(workspace).status_code == 200

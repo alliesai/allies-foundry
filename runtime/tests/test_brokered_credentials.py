@@ -106,3 +106,25 @@ def test_blocking_resolution_returns_on_timeout(monkeypatch):
     with pytest.raises(TimeoutError):
         client.resolve_credential_blocking(REF)
     assert time.monotonic() - started < 1
+
+
+def test_timeouts_reuse_a_bounded_worker_pool(monkeypatch):
+    import threading
+
+    from allies_runtime import foundry as foundry_module
+
+    class Hanging:
+        async def request(self, method, path, *, headers, body=None):
+            await asyncio.sleep(0.3)
+            return {"status": 200, "body": {"value": "late"}}
+
+    monkeypatch.setattr(foundry_module, "BROKERED_CREDENTIAL_TIMEOUT_SECONDS", 0.01)
+    client = FoundryClient(runtime_token="runtime-token", transport=Hanging())
+    for _ in range(5):
+        with pytest.raises(TimeoutError):
+            client.resolve_credential_blocking(REF)
+
+    workers = [
+        t for t in threading.enumerate() if t.name.startswith("allies-credential")
+    ]
+    assert len(workers) <= 2

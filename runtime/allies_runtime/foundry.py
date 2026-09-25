@@ -766,6 +766,10 @@ def _error_for(status: int, payload: Mapping[str, Any] | None) -> FoundryError:
 
 BROKERED_CREDENTIAL_SCHEME = "allies-key://"
 BROKERED_CREDENTIAL_TIMEOUT_SECONDS = 15.0
+# Shared and small so a hung broker call can never multiply threads per key.
+_BROKER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="allies-credential"
+)
 
 
 class FoundryClient:
@@ -1580,13 +1584,9 @@ class FoundryClient:
     def resolve_credential_blocking(self, reference: str) -> str:
         """Resolve from sync profile-store code, whatever thread it runs on."""
 
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            return pool.submit(asyncio.run, self.resolve_credential(reference)).result(
-                timeout=BROKERED_CREDENTIAL_TIMEOUT_SECONDS
-            )
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+        return _BROKER_EXECUTOR.submit(
+            asyncio.run, self.resolve_credential(reference)
+        ).result(timeout=BROKERED_CREDENTIAL_TIMEOUT_SECONDS)
 
     async def stopped(
         self, attempt_id: str | UUID, lease_token: str, *, reason: str
