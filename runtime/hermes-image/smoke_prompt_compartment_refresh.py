@@ -79,6 +79,8 @@ os.remove(SOUL)
 os.mkdir(SOUL)
 try:
     assert allies_stored_prompt_versions_current(agent, tail(fresh)) is True
+    assert allies_prompt_version_marker(agent) == ""
+    assert allies_stored_prompt_versions_current(agent, tail("")) is True
 finally:
     os.rmdir(SOUL)
 with open(SOUL, "w", encoding="utf-8") as handle:
@@ -159,7 +161,7 @@ try:
     degraded.model = "zzz"
     _restore_or_build_system_prompt(degraded, None, [{"role": "user"}])
     assert len(builds) == 3
-    assert "Allies-Prompt-Soul: absent" in persisted()
+    assert "Allies-Prompt-Soul:" not in persisted()
 finally:
     os.rmdir(SOUL)
 with open(SOUL, "w", encoding="utf-8") as handle:
@@ -168,7 +170,7 @@ recovered = live_agent(db)
 recovered.model = "zzz"
 _restore_or_build_system_prompt(recovered, None, [{"role": "user"}])
 assert len(builds) == 4
-assert "Allies-Prompt-Soul: absent" not in persisted()
+assert "Allies-Prompt-Soul:" in persisted()
 assert persisted() == recovered._cached_system_prompt
 
 print("PROMPT-COMPARTMENT-REFRESH-OK")
