@@ -148,7 +148,9 @@ def test_binding_key_install_remove_merges_refs(ready_workspace):
 def test_binding_rejects_values_and_unknown_fields(ready_workspace):
     profile = _profile(ready_workspace)
     with pytest.raises(RuntimeValidationError):
-        set_model_binding(profile.id, {"provider": "x" * 129})
+        set_model_binding(profile.id, {"provider": "x" * 81})
+    with pytest.raises(RuntimeValidationError):
+        set_model_binding(profile.id, {"model": "m", "reasoning": "medium"})
     with pytest.raises(RuntimeValidationError):
         set_model_binding(profile.id, {"model": "m", "unknown": 1})
     with pytest.raises(RuntimeValidationError):

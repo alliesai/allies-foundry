@@ -227,13 +227,20 @@ def _stream_request_body(
             "reasoning": {"enabled": True, "effort": reasoning_effort}
         }
     if model_options:
+        override_options = dict(model_options)
+        flat_reasoning = override_options.pop("reasoning", None)
+        if flat_reasoning is not None and not isinstance(flat_reasoning, dict):
+            effort = validate_reasoning_effort(flat_reasoning)
+            override_options["reasoning"] = {"enabled": True, "effort": effort}
+        elif isinstance(flat_reasoning, dict):
+            override_options["reasoning"] = flat_reasoning
         base = request_body.get("model_options")
         if isinstance(base, dict):
             merged = dict(base)
-            merged.update(model_options)
+            merged.update(override_options)
             request_body["model_options"] = merged
-        else:
-            request_body["model_options"] = dict(model_options)
+        elif override_options:
+            request_body["model_options"] = override_options
     if file_context is not None:
         request_body["allies_file_context"] = validate_hermes_file_context(file_context)
     if publication_context is not None:

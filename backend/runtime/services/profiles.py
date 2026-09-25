@@ -1010,13 +1010,19 @@ def normalize_model_binding(raw: Any) -> dict[str, Any]:
     binding: dict[str, Any] = {}
     provider = raw.get("provider")
     if provider is not None:
-        binding["provider"] = _seed_text(provider, "binding provider", 128)
+        # Bound matches the Hermes session-lock provider limit (80 chars);
+        # longer values would fail closed mid-turn instead of at set time.
+        binding["provider"] = _seed_text(provider, "binding provider", 80)
     model = raw.get("model")
     if model is not None:
         binding["model"] = _seed_text(model, "binding model", 255)
     reasoning = raw.get("reasoning")
     if reasoning is not None:
-        binding["reasoning"] = _seed_text(reasoning, "binding reasoning", 32)
+        # Matches the Hermes managed reasoning set; anything else would
+        # fail the turn at request-build time instead of at set time.
+        if reasoning not in ("high", "xhigh"):
+            raise RuntimeValidationError("binding reasoning must be high or xhigh")
+        binding["reasoning"] = reasoning
     key_refs = raw.get("key_refs", {})
     binding["key_refs"] = _normalize_ref_entries(key_refs, "binding key_refs")
     unknown = set(raw) - {"provider", "model", "reasoning", "key_refs"}

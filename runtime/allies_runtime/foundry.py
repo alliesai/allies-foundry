@@ -1838,6 +1838,10 @@ class FoundryWorker:
         if binding_applier is not None and not callable(binding_applier):
             raise ValueError("binding applier must be callable")
         self.binding_applier = binding_applier
+        # Sessions this process already pinned: Hermes locks are ephemeral
+        # but the binding outlives restarts, so re-lock once per session
+        # per process instead of only on a fresh key apply.
+        self._session_model_locks: dict[str, tuple[str, str]] = {}
         if not isinstance(activity_wait_enabled, bool):
             raise TypeError("activity wait enabled must be a boolean")
         if (
@@ -2370,7 +2374,9 @@ class FoundryWorker:
                         claim.lease_token,
                         reason="binding_repair_required",
                     )
-                if applied == "APPLIED":
+            if claim.binding_generation and (claim.provider or claim.model):
+                pinned = self._session_model_locks.get(session_id)
+                if pinned != (claim.provider, claim.model):
                     lock_session = getattr(self.hermes, "lock_session_model", None)
                     if not callable(lock_session):
                         raise HermesError("Hermes session model lock was unavailable")
@@ -2383,12 +2389,18 @@ class FoundryWorker:
                         )
                         if inspect.isawaitable(locked):
                             await locked
-                    except HermesError:
+                    except (HermesError, ValueError):
                         return await self.foundry.stopped(
                             claim.attempt_id,
                             claim.lease_token,
                             reason="binding_repair_required",
                         )
+                    if len(self._session_model_locks) > 1024:
+                        self._session_model_locks.clear()
+                    self._session_model_locks[session_id] = (
+                        claim.provider,
+                        claim.model,
+                    )
             stream = await _stream_events(
                 self.hermes,
                 claim.hermes_profile_key,

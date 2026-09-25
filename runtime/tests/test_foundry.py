@@ -3242,3 +3242,135 @@ async def test_worker_stops_when_session_lock_fails():
             "model": "gpt-5.2",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_worker_locks_on_current_generation_after_restart():
+    def applier(*args):
+        return SimpleNamespace(status=SimpleNamespace(value="CURRENT"))
+
+    claim = {
+        **CLAIM,
+        "hermes_profile_key": "ally-a",
+        "provider": "opencode-zen",
+        "model": "gpt-5.2",
+        "binding_generation": 2,
+        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    }
+    hermes = FakeHermesClient()
+    foundry, _ = client(
+        claim,
+        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+        {"status": 202, "body": {"event_id": "renew", "sequence": 2}},
+        {"session_id": "session-1"},
+        {"attempt_id": "attempt-1", "status": "succeeded", "receipt_id": "receipt"},
+    )
+    worker = FoundryWorker(
+        foundry, hermes, renew_interval=0.1, binding_applier=applier
+    )
+    assert (await worker.run(max_turns=1))[0].status == "succeeded"
+    assert hermes.locks == [
+        {
+            "profile_id": "ally-a",
+            "session_id": "session-1",
+            "provider": "opencode-zen",
+            "model": "gpt-5.2",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_skips_relock_for_same_session_and_selection():
+    applied = []
+
+    def applier(profile_key, generation, key_refs):
+        applied.append((profile_key, generation, dict(key_refs)))
+        return SimpleNamespace(status=SimpleNamespace(value="CURRENT"))
+
+    def turn_fixtures():
+        return [
+            {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+            {"status": 202, "body": {"event_id": "renew", "sequence": 2}},
+            {"session_id": "session-1"},
+            {
+                "attempt_id": "attempt-1",
+                "status": "succeeded",
+                "receipt_id": "receipt",
+            },
+        ]
+
+    claim = {
+        **CLAIM,
+        "hermes_profile_key": "ally-a",
+        "provider": "opencode-zen",
+        "model": "gpt-5.2",
+        "binding_generation": 2,
+        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    }
+    hermes = FakeHermesClient()
+    foundry, transport = client(claim, *turn_fixtures())
+    worker = FoundryWorker(
+        foundry, hermes, renew_interval=0.1, binding_applier=applier
+    )
+    assert (await worker.run(max_turns=1))[0].status == "succeeded"
+    assert len(hermes.locks) == 1
+    transport.responses.extend([claim, *turn_fixtures()])
+    assert (await worker.run(max_turns=1))[0].status == "succeeded"
+    assert len(applied) == 2
+    assert len(hermes.locks) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_stops_when_lock_rejects_overlong_provider():
+    def applier(*args):
+        return SimpleNamespace(status=SimpleNamespace(value="APPLIED"))
+
+    claim = {
+        **CLAIM,
+        "hermes_profile_key": "ally-a",
+        "provider": "p" * 100,
+        "model": "gpt-5.2",
+        "binding_generation": 2,
+        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    }
+    foundry, _ = client(
+        claim,
+        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+        {"attempt_id": "attempt-1", "state": "released", "requeued": True},
+    )
+    worker = FoundryWorker(
+        foundry, FakeHermesClient(), renew_interval=0.1, binding_applier=applier
+    )
+    assert (await worker.run(max_turns=1))[0].state == "released"
+
+
+@pytest.mark.asyncio
+async def test_worker_lock_memo_resets_past_cap():
+    def applier(*args):
+        return SimpleNamespace(status=SimpleNamespace(value="CURRENT"))
+
+    claim = {
+        **CLAIM,
+        "hermes_profile_key": "ally-a",
+        "provider": "opencode-zen",
+        "model": "gpt-5.2",
+        "binding_generation": 2,
+        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    }
+    hermes = FakeHermesClient()
+    foundry, _ = client(
+        claim,
+        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+        {"status": 202, "body": {"event_id": "renew", "sequence": 2}},
+        {"session_id": "session-1"},
+        {"attempt_id": "attempt-1", "status": "succeeded", "receipt_id": "receipt"},
+    )
+    worker = FoundryWorker(
+        foundry, hermes, renew_interval=0.1, binding_applier=applier
+    )
+    worker._session_model_locks.update(
+        {f"old-session-{i}": ("p", "m") for i in range(1025)}
+    )
+    assert (await worker.run(max_turns=1))[0].status == "succeeded"
+    assert hermes.locks != []
+    assert len(worker._session_model_locks) == 1

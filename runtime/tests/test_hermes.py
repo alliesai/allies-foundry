@@ -2389,7 +2389,7 @@ async def test_stream_forwards_model_options_and_validates_bounds(monkeypatch):
     )
     assert json.loads(calls[0][3]) == {
         "message": "hello",
-        "model_options": {"reasoning": "high"},
+        "model_options": {"reasoning": {"enabled": True, "effort": "high"}},
     }
 
     assert validate_model_options(None) == {}

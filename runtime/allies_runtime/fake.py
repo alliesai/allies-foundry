@@ -100,6 +100,18 @@ class FakeHermesClient:
         provider: str | None = None,
         model: str | None = None,
     ) -> dict[str, Any]:
+        # Mirrors HermesClient.lock_session_model bounds so tests exercise
+        # the same fail-closed paths as production.
+        if provider is not None and (
+            not isinstance(provider, str) or len(provider.encode("utf-8")) > 80
+        ):
+            raise ValueError("Hermes lock provider must be bounded text")
+        if model is not None and (
+            not isinstance(model, str) or len(model.encode("utf-8")) > 256
+        ):
+            raise ValueError("Hermes lock model must be bounded text")
+        if not provider and not model:
+            raise ValueError("Hermes session model lock needs a provider or model")
         self.locks.append(
             {"profile_id": profile_id, "session_id": session_id,
              "provider": provider, "model": model}
