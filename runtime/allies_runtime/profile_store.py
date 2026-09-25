@@ -44,6 +44,9 @@ DEFAULT_MEMORY_POLICY_VERSION = "allies-mnemosyne-v1"
 # Absolute compaction trigger; sessions compact at the lower of the
 # ratio-based threshold and this count. See backend DEFAULT_COMPRESSION_THRESHOLD_TOKENS.
 DEFAULT_COMPRESSION_THRESHOLD_TOKENS = 100_000
+# Previous default model route, kept for the legacy upgrade path only.
+LEGACY_MODEL_DEFAULT = "gpt-5.6-luna"
+LEGACY_MODEL_BASE_URL = "https://api.openai.com/v1"
 MEMORY_MODES = frozenset({"context_only", "narrow_tools"})
 MEMORY_TOOLS = frozenset(
     {
@@ -585,6 +588,50 @@ class ProfileSeed:
         return _fingerprint_digest(payload)
 
     @property
+    def legacy_model_fingerprint(self) -> str:
+        """Return the fingerprint from before the default model switch."""
+
+        payload = self._fingerprint_payload()
+        payload["model"] = {
+            "provider": self.provider,
+            "default": LEGACY_MODEL_DEFAULT,
+            "base_url": LEGACY_MODEL_BASE_URL,
+        }
+        return _fingerprint_digest(payload)
+
+    @property
+    def legacy_memory_model_fingerprint(self) -> str:
+        """Return the fingerprint predating both memory and model defaults."""
+
+        swapped = replace(
+            self,
+            memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+            memory_tool_allowlist=(),
+        )
+        payload = swapped._fingerprint_payload()
+        del payload["compression"]
+        payload["model"] = {
+            "provider": self.provider,
+            "default": LEGACY_MODEL_DEFAULT,
+            "base_url": LEGACY_MODEL_BASE_URL,
+        }
+        return _fingerprint_digest(payload)
+
+    @property
+    def legacy_compression_model_fingerprint(self) -> str:
+        """Return the fingerprint of a volume upgraded past memory defaults
+        but asleep since before the compression threshold."""
+
+        payload = self._fingerprint_payload()
+        del payload["compression"]
+        payload["model"] = {
+            "provider": self.provider,
+            "default": LEGACY_MODEL_DEFAULT,
+            "base_url": LEGACY_MODEL_BASE_URL,
+        }
+        return _fingerprint_digest(payload)
+
+    @property
     def model_provider_name(self) -> str:
         return self.provider
 
@@ -784,6 +831,29 @@ def _replace_legacy_compression_config(content: bytes, seed: ProfileSeed) -> byt
     return yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode("utf-8")
 
 
+def _replace_legacy_model_config(content: bytes, seed: ProfileSeed) -> bytes:
+    content = _config_with_catalog(content)
+    import yaml
+
+    config = yaml.safe_load(content)
+    desired = {
+        "provider": seed.provider,
+        "default": seed.model,
+        "base_url": seed.base_url,
+    }
+    current = config.get("model")
+    if current == desired:
+        return content
+    if not isinstance(current, dict) or current != {
+        "provider": seed.provider,
+        "default": LEGACY_MODEL_DEFAULT,
+        "base_url": LEGACY_MODEL_BASE_URL,
+    }:
+        raise ValueError("legacy model config does not match")
+    config["model"] = desired
+    return yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+
 def _is_legacy_managed_memory_manifest(seed: ProfileSeed, manifest: Mapping[str, Any]) -> bool:
     return (
         seed.memory_mode == DEFAULT_MEMORY_MODE
@@ -791,6 +861,7 @@ def _is_legacy_managed_memory_manifest(seed: ProfileSeed, manifest: Mapping[str,
         and manifest.get("seed_fingerprint")
         in {
             seed.legacy_memory_fingerprint,
+            seed.legacy_memory_model_fingerprint,
             _fingerprint_digest(
                 replace(
                     seed,
@@ -1781,10 +1852,16 @@ class ProfileStore:
         legacy_compression_upgrade = (
             manifest.get("seed_fingerprint") == seed.legacy_compression_fingerprint
         )
+        legacy_model_upgrade = manifest.get("seed_fingerprint") in {
+            seed.legacy_model_fingerprint,
+            seed.legacy_memory_model_fingerprint,
+            seed.legacy_compression_model_fingerprint,
+        }
         if (
             manifest.get("seed_fingerprint") != seed.fingerprint
             and not legacy_memory_upgrade
             and not legacy_compression_upgrade
+            and not legacy_model_upgrade
         ):
             code = (
                 "instruction_version_conflict"
@@ -1902,10 +1979,12 @@ class ProfileStore:
             updated_config = _config_with_catalog(config_bytes)
             if legacy_memory_upgrade:
                 updated_config = _replace_legacy_memory_config(updated_config, seed)
-            if legacy_memory_upgrade or legacy_compression_upgrade:
+            if legacy_memory_upgrade or legacy_compression_upgrade or legacy_model_upgrade:
                 updated_config = _replace_legacy_compression_config(
                     updated_config, seed
                 )
+            if legacy_model_upgrade:
+                updated_config = _replace_legacy_model_config(updated_config, seed)
             if updated_config != config_bytes:
                 current_stat = config_path.stat(follow_symlinks=False)
                 if any(
@@ -1931,7 +2010,7 @@ class ProfileStore:
                 ProfileProvisionStatus.REPAIR_REQUIRED,
                 repair_code="skills_config_requires_repair",
             )
-        if legacy_memory_upgrade or legacy_compression_upgrade:
+        if legacy_memory_upgrade or legacy_compression_upgrade or legacy_model_upgrade:
             upgraded = dict(manifest)
             upgraded.update(
                 {
@@ -1950,7 +2029,11 @@ class ProfileStore:
                     ProfileProvisionStatus.REPAIR_REQUIRED,
                     repair_code="legacy_memory_upgrade_failed"
                     if legacy_memory_upgrade
-                    else "legacy_compression_upgrade_failed",
+                    else (
+                        "legacy_compression_upgrade_failed"
+                        if legacy_compression_upgrade
+                        else "legacy_model_upgrade_failed"
+                    ),
                 )
         try:
             self._clean_owned_first_chat_block(seed, profile / "SOUL.md")

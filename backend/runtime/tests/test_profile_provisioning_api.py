@@ -238,9 +238,10 @@ def test_fixture_request_creates_pending_profile_without_private_receipt_fields(
     assert receipt["request_fingerprint"] == contract["request"]["request_fingerprint"]
     assert receipt["status"] == "pending"
     # The historical receipt fixture predates the managed memory-tool
-    # default and the compression threshold default.
+    # default, the compression threshold default, and the OpenRouter
+    # gpt-6-luna default route.
     assert receipt["evidence_digest"] == (
-        "c318990e966cc9252928f8310150782c3f5e979a553be57bb75f9ed89d34a8f6"
+        "ef326396b5d74e2bbdc5c42787028ac20223333c5075fba7ed80bb63e6cd1b88"
     )
     assert re.fullmatch(r"[0-9a-f]{64}", receipt["evidence_digest"])
     assert "profile_id" not in receipt
