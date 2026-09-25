@@ -83,9 +83,10 @@ def test_composition_routes_only_broker_refs_to_foundry(tmp_path):
     resolve = composition.profile_store.credential_resolver
 
     assert resolve(REF) == "tenant-secret"
+    assert resolve(REF.upper()) == "tenant-secret"
     assert resolve("file:///run/secrets/openai") == "local-secret"
     assert seen == ["file:///run/secrets/openai"]
-    assert len(transport.calls) == 1
+    assert len(transport.calls) == 2
     observability.configure_runtime_observability()
 
 

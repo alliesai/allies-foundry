@@ -61,7 +61,7 @@ def compose_runtime(
     correlation_id = str(boot_id or uuid4())
 
     def resolve_profile_credential(reference: str) -> str:
-        if reference.startswith(BROKERED_CREDENTIAL_SCHEME):
+        if reference.lower().startswith(BROKERED_CREDENTIAL_SCHEME):
             return foundry.resolve_credential_blocking(reference)
         return credential_resolver(CredentialReference(reference))
 

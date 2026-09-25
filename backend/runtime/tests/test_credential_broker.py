@@ -215,3 +215,11 @@ def test_seed_held_broker_ref_resolves(db, cloud):
     _profile(workspace, {"OPENCODE_ZEN_API_KEY": REF})
 
     assert _post(workspace).status_code == 200
+
+
+def test_uppercase_ref_accepted_by_binding_also_resolves(db, cloud):
+    workspace = _workspace("tenant-a")
+    upper = REF.replace("allies-key", "ALLIES-KEY").upper()
+    install_provider_key(_profile(workspace).id, "OPENCODE_ZEN_API_KEY", upper)
+
+    assert _post(workspace, upper).status_code == 200
