@@ -3374,3 +3374,27 @@ async def test_worker_lock_memo_resets_past_cap():
     assert (await worker.run(max_turns=1))[0].status == "succeeded"
     assert hermes.locks != []
     assert len(worker._session_model_locks) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_stops_when_binding_apply_raises():
+    from allies_runtime.profile_store import ProfileStoreError
+
+    def applier(*args):
+        raise ProfileStoreError("credential resolver is unavailable")
+
+    claim = {
+        **CLAIM,
+        "hermes_profile_key": "ally-a",
+        "binding_generation": 2,
+        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    }
+    foundry, _ = client(
+        claim,
+        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+        {"attempt_id": "attempt-1", "state": "released", "requeued": True},
+    )
+    worker = FoundryWorker(
+        foundry, FakeHermesClient(), renew_interval=0.1, binding_applier=applier
+    )
+    assert (await worker.run(max_turns=1))[0].state == "released"

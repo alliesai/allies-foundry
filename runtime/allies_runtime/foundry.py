@@ -2361,12 +2361,19 @@ class FoundryWorker:
                     await ensured
 
             if claim.binding_generation and self.binding_applier is not None:
-                receipt = await asyncio.to_thread(
-                    self.binding_applier,
-                    claim.hermes_profile_key,
-                    claim.binding_generation,
-                    claim.binding_key_refs,
-                )
+                try:
+                    receipt = await asyncio.to_thread(
+                        self.binding_applier,
+                        claim.hermes_profile_key,
+                        claim.binding_generation,
+                        claim.binding_key_refs,
+                    )
+                except ProfileStoreError:
+                    return await self.foundry.stopped(
+                        claim.attempt_id,
+                        claim.lease_token,
+                        reason="binding_repair_required",
+                    )
                 applied = str(getattr(getattr(receipt, "status", ""), "value", ""))
                 if applied not in ("APPLIED", "CURRENT"):
                     return await self.foundry.stopped(

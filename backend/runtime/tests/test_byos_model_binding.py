@@ -163,6 +163,27 @@ def test_binding_rejects_values_and_unknown_fields(ready_workspace):
         set_model_binding(uuid4(), {"model": "m"})
 
 
+def test_install_rejects_key_refs_beyond_bound_with_seed(ready_workspace):
+    seed_refs = {f"SEED_KEY_{i:02d}": f"vault://tenant/seed-{i}" for i in range(32)}
+    receipt = ensure_runtime_profile(
+        ready_workspace.id,
+        uuid4(),
+        "ally-full",
+        ProfileSeed(
+            personality="p",
+            provider="openai",
+            model="gpt-test",
+            first_chat_instruction="i",
+            credential_refs=seed_refs,
+        ),
+    )
+    profile = RuntimeProfile.objects.get(pk=receipt.profile_id)
+    with pytest.raises(RuntimeValidationError):
+        install_provider_key(profile.id, "OPENCODE_ZEN_API_KEY", "vault://tenant/zen")
+    profile.refresh_from_db()
+    assert (profile.model_override or {}).get("generation", 0) == 0
+
+
 def test_claim_carries_effective_selection(ready_workspace):
     profile = RuntimeProfile.objects.create(
         workspace=ready_workspace,

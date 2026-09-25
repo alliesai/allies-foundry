@@ -81,6 +81,7 @@ DEFAULT_MEMORY_TOOL_ALLOWLIST = tuple(sorted(MEMORY_TOOLS))
 DEFAULT_COMPRESSION_THRESHOLD_TOKENS = 100_000
 CLEANUP_GRACE_SECONDS = 60
 MAX_PROFILE_SEED_BYTES = 128 * 1024
+MAX_BINDING_KEY_REFS = 32
 _OPAQUE_REFERENCE = re.compile(
     r"^[a-z][a-z0-9+.-]{1,31}://[^\s]{1,191}$", re.IGNORECASE
 )
@@ -1103,6 +1104,20 @@ def install_provider_key(
         )
         merged = dict(current.get("key_refs", {}))
         merged.update(_normalize_ref_entries({env_name: reference}, "binding key_refs"))
+        # The runtime applies seed refs merged with binding refs, so the
+        # bound applies to the union — otherwise install could persist a
+        # generation apply_binding rejects and every later turn misses repair.
+        seed_refs = (
+            profile.seed_payload.get("credential_refs")
+            if isinstance(profile.seed_payload, dict)
+            else {}
+        )
+        if not isinstance(seed_refs, dict):
+            seed_refs = {}
+        if len(set(seed_refs) | set(merged)) > MAX_BINDING_KEY_REFS:
+            raise RuntimeValidationError(
+                "binding key_refs exceed the bounded size with seed references"
+            )
         return _store_binding(profile, {**current, "key_refs": merged})
 
 
