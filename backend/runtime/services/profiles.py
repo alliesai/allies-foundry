@@ -1058,7 +1058,22 @@ def _store_binding(
 def set_model_binding(profile_id: UUID | str, binding: Any) -> ModelBindingReceipt:
     with transaction.atomic():
         profile = _binding_profile(profile_id)
-        return _store_binding(profile, normalize_model_binding(binding))
+        normalized = normalize_model_binding(binding)
+        if isinstance(binding, Mapping) and "key_refs" not in binding:
+            stored = (
+                profile.model_override
+                if isinstance(profile.model_override, dict)
+                else {}
+            )
+            current = (
+                stored.get("binding")
+                if isinstance(stored.get("binding"), dict)
+                else {}
+            )
+            installed = current.get("key_refs")
+            if isinstance(installed, dict) and installed:
+                normalized["key_refs"] = dict(installed)
+        return _store_binding(profile, normalized)
 
 
 def clear_model_binding(profile_id: UUID | str) -> ModelBindingReceipt:
@@ -1101,7 +1116,12 @@ def remove_provider_key(profile_id: UUID | str, env_name: Any) -> ModelBindingRe
 
 
 def effective_model_selection(profile: RuntimeProfile) -> dict[str, Any]:
-    """Resolve binding-over-seed model selection for one claim or turn."""
+    """Resolve binding-over-seed model selection for one claim or turn.
+
+    Key refs merge seed-first so a live ``.env`` rewrite never drops the
+    deployment (org) keys: binding entries win on collision, and clearing
+    the binding restores exactly the seed set.
+    """
     seed = profile.seed_payload if isinstance(profile.seed_payload, dict) else {}
     stored = profile.model_override if isinstance(profile.model_override, dict) else {}
     binding = stored.get("binding") if isinstance(stored.get("binding"), dict) else {}
@@ -1110,14 +1130,16 @@ def effective_model_selection(profile: RuntimeProfile) -> dict[str, Any]:
     options: dict[str, Any] = {}
     if binding.get("reasoning"):
         options["reasoning"] = binding["reasoning"]
-    key_refs = binding.get("key_refs")
-    if not isinstance(key_refs, dict):
-        key_refs = {}
+    seed_refs = seed.get("credential_refs")
+    merged: dict[str, str] = dict(seed_refs) if isinstance(seed_refs, dict) else {}
+    binding_refs = binding.get("key_refs")
+    if isinstance(binding_refs, dict):
+        merged.update(binding_refs)
     return {
         "provider": provider,
         "model": model,
         "options": options,
-        "key_refs": dict(key_refs),
+        "key_refs": merged,
     }
 
 

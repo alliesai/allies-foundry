@@ -1741,8 +1741,6 @@ async def _stream_events(
     message: str,
     *,
     session_key: str,
-    provider: str = "",
-    model: str = "",
     model_options: Mapping[str, Any] | None = None,
     reasoning_effort: str | None = None,
     routine_result: bool = False,
@@ -1751,10 +1749,6 @@ async def _stream_events(
     routine_tool_token: str | None = None,
 ) -> Any:
     stream_kwargs: dict[str, Any] = {"session_key": session_key}
-    if provider:
-        stream_kwargs["provider"] = provider
-    if model:
-        stream_kwargs["model"] = model
     if model_options:
         stream_kwargs["model_options"] = model_options
     if reasoning_effort is not None:
@@ -2376,6 +2370,25 @@ class FoundryWorker:
                         claim.lease_token,
                         reason="binding_repair_required",
                     )
+                if applied == "APPLIED":
+                    lock_session = getattr(self.hermes, "lock_session_model", None)
+                    if not callable(lock_session):
+                        raise HermesError("Hermes session model lock was unavailable")
+                    try:
+                        locked = lock_session(
+                            claim.hermes_profile_key,
+                            session_id,
+                            provider=claim.provider or None,
+                            model=claim.model or None,
+                        )
+                        if inspect.isawaitable(locked):
+                            await locked
+                    except HermesError:
+                        return await self.foundry.stopped(
+                            claim.attempt_id,
+                            claim.lease_token,
+                            reason="binding_repair_required",
+                        )
             stream = await _stream_events(
                 self.hermes,
                 claim.hermes_profile_key,
@@ -2387,8 +2400,6 @@ class FoundryWorker:
                 file_context=file_context,
                 publication_context=publication_context,
                 routine_tool_token=claim.routine_tool_token,
-                provider=claim.provider,
-                model=claim.model,
                 model_options=claim.model_options,
             )
             stream_ref[0] = stream

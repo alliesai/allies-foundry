@@ -2968,65 +2968,6 @@ async def test_worker_uses_non_incremental_hermes_fallback_and_handles_cancelled
 
 
 @pytest.mark.asyncio
-async def test_worker_applies_binding_and_forwards_override():
-    applied = []
-
-    def applier(profile_key, generation, key_refs):
-        applied.append((profile_key, generation, dict(key_refs)))
-        return SimpleNamespace(status=SimpleNamespace(value="APPLIED"))
-
-    claim = {
-        **CLAIM,
-        "hermes_profile_key": "ally-a",
-        "provider": "opencode-zen",
-        "model": "gpt-5.2",
-        "model_options": {"reasoning": "high"},
-        "binding_generation": 2,
-        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
-    }
-    hermes = FakeHermesClient()
-    foundry, _ = client(
-        claim,
-        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
-        {"status": 202, "body": {"event_id": "renew", "sequence": 2}},
-        {"session_id": "session-1"},
-        {"attempt_id": "attempt-1", "status": "succeeded", "receipt_id": "receipt"},
-    )
-    worker = FoundryWorker(foundry, hermes, renew_interval=0.1, binding_applier=applier)
-    assert (await worker.run(max_turns=1))[0].status == "succeeded"
-    assert applied == [("ally-a", 2, {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"})]
-    assert hermes.overrides == [
-        {
-            "provider": "opencode-zen",
-            "model": "gpt-5.2",
-            "model_options": {"reasoning": "high"},
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_worker_stops_when_binding_needs_repair():
-    def applier(*args):
-        return SimpleNamespace(status=SimpleNamespace(value="REPAIR_REQUIRED"))
-
-    claim = {
-        **CLAIM,
-        "hermes_profile_key": "ally-a",
-        "binding_generation": 3,
-        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
-    }
-    foundry, _ = client(
-        claim,
-        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
-        {"attempt_id": "attempt-1", "state": "released", "requeued": True},
-    )
-    worker = FoundryWorker(
-        foundry, FakeHermesClient(), renew_interval=0.1, binding_applier=applier
-    )
-    assert (await worker.run(max_turns=1))[0].state == "released"
-
-
-@pytest.mark.asyncio
 async def test_worker_identity_and_fenced_event_paths_stop_or_fail_safely():
     claim = {**CLAIM, "hermes_profile_key": "ally-a"}
     foundry, _ = client(
@@ -3200,3 +3141,104 @@ async def test_worker_hermes_health_compatibility_and_degraded_gateway(
 ):
     worker = FoundryWorker(object(), hermes)
     assert await worker._hermes_ready() is expected
+
+
+@pytest.mark.asyncio
+async def test_worker_applies_binding_locks_session_and_forwards_options():
+    applied = []
+
+    def applier(profile_key, generation, key_refs):
+        applied.append((profile_key, generation, dict(key_refs)))
+        return SimpleNamespace(status=SimpleNamespace(value="APPLIED"))
+
+    claim = {
+        **CLAIM,
+        "hermes_profile_key": "ally-a",
+        "provider": "opencode-zen",
+        "model": "gpt-5.2",
+        "model_options": {"reasoning": "high"},
+        "binding_generation": 2,
+        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    }
+    hermes = FakeHermesClient()
+    foundry, _ = client(
+        claim,
+        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+        {"status": 202, "body": {"event_id": "renew", "sequence": 2}},
+        {"session_id": "session-1"},
+        {"attempt_id": "attempt-1", "status": "succeeded", "receipt_id": "receipt"},
+    )
+    worker = FoundryWorker(foundry, hermes, renew_interval=0.1, binding_applier=applier)
+    assert (await worker.run(max_turns=1))[0].status == "succeeded"
+    assert applied == [("ally-a", 2, {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"})]
+    assert hermes.locks == [
+        {
+            "profile_id": "ally-a",
+            "session_id": "session-1",
+            "provider": "opencode-zen",
+            "model": "gpt-5.2",
+        }
+    ]
+    assert hermes.overrides == [
+        {"reasoning_effort": None, "model_options": {"reasoning": "high"}}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_stops_when_binding_needs_repair():
+    def applier(*args):
+        return SimpleNamespace(status=SimpleNamespace(value="REPAIR_REQUIRED"))
+
+    claim = {
+        **CLAIM,
+        "hermes_profile_key": "ally-a",
+        "binding_generation": 3,
+        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    }
+    foundry, _ = client(
+        claim,
+        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+        {"attempt_id": "attempt-1", "state": "released", "requeued": True},
+    )
+    worker = FoundryWorker(
+        foundry, FakeHermesClient(), renew_interval=0.1, binding_applier=applier
+    )
+    assert (await worker.run(max_turns=1))[0].state == "released"
+
+
+@pytest.mark.asyncio
+async def test_worker_stops_when_session_lock_fails():
+    applied = []
+
+    def applier(profile_key, generation, key_refs):
+        applied.append((profile_key, generation, dict(key_refs)))
+        return SimpleNamespace(status=SimpleNamespace(value="APPLIED"))
+
+    claim = {
+        **CLAIM,
+        "hermes_profile_key": "ally-a",
+        "provider": "opencode-zen",
+        "model": "gpt-5.2",
+        "binding_generation": 2,
+        "binding_key_refs": {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    }
+    hermes = FakeHermesClient()
+    hermes.lock_failure = HermesError("Hermes provider credentials were rejected")
+    foundry, _ = client(
+        claim,
+        {"status": 202, "body": {"event_id": "dispatch", "sequence": 1}},
+        {"attempt_id": "attempt-1", "state": "released", "requeued": True},
+    )
+    worker = FoundryWorker(
+        foundry, hermes, renew_interval=0.1, binding_applier=applier
+    )
+    assert (await worker.run(max_turns=1))[0].state == "released"
+    assert applied == [("ally-a", 2, {"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"})]
+    assert hermes.locks == [
+        {
+            "profile_id": "ally-a",
+            "session_id": "session-1",
+            "provider": "opencode-zen",
+            "model": "gpt-5.2",
+        }
+    ]

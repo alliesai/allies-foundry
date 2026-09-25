@@ -179,9 +179,6 @@ class RecordingHermes:
         session_key,
         reasoning_effort=None,
         routine_result=False,
-        provider=None,
-        model=None,
-        model_options=None,
     ):
         if self.order is not None:
             self.order.append("hermes.stream")
@@ -901,15 +898,7 @@ async def test_worker_rejects_malformed_or_post_terminal_adapter_events(events):
 
     class Adapter(RecordingHermes):
         async def stream_profile_incremental(
-            self,
-            profile_key,
-            session_id,
-            message,
-            *,
-            session_key,
-            provider=None,
-            model=None,
-            model_options=None,
+            self, profile_key, session_id, message, *, session_key
         ):
             return CancellableHermesStream(rows())
 

@@ -71,7 +71,7 @@ def test_binding_set_clear_bumps_generation_and_resolves_selection(
         "provider": "openai",
         "model": "gpt-test",
         "options": {},
-        "key_refs": {},
+        "key_refs": {"OPENAI_API_KEY": "vault://tenant/openai"},
     }
 
     first = set_model_binding(
@@ -84,7 +84,7 @@ def test_binding_set_clear_bumps_generation_and_resolves_selection(
         "provider": "opencode-zen",
         "model": "gpt-5.2",
         "options": {"reasoning": "high"},
-        "key_refs": {},
+        "key_refs": {"OPENAI_API_KEY": "vault://tenant/openai"},
     }
 
     partial = set_model_binding(profile.id, {"model": "glm-5"})
@@ -100,8 +100,27 @@ def test_binding_set_clear_bumps_generation_and_resolves_selection(
         "provider": "openai",
         "model": "gpt-test",
         "options": {},
-        "key_refs": {},
+        "key_refs": {"OPENAI_API_KEY": "vault://tenant/openai"},
     }
+
+
+def test_disconnect_restores_seed_keys_without_reprovision(ready_workspace):
+    profile = _profile(ready_workspace)
+    install_provider_key(profile.id, "OPENCODE_ZEN_API_KEY", "vault://tenant/zen")
+    set_model_binding(profile.id, {"provider": "opencode-zen", "model": "gpt-5.2"})
+    profile.refresh_from_db()
+    assert effective_model_selection(profile)["key_refs"] == {
+        "OPENAI_API_KEY": "vault://tenant/openai",
+        "OPENCODE_ZEN_API_KEY": "vault://tenant/zen",
+    }
+
+    cleared = clear_model_binding(profile.id)
+    assert cleared.generation == 3
+    profile.refresh_from_db()
+    selection = effective_model_selection(profile)
+    assert selection["provider"] == "openai"
+    assert selection["model"] == "gpt-test"
+    assert selection["key_refs"] == {"OPENAI_API_KEY": "vault://tenant/openai"}
 
 
 def test_binding_key_install_remove_merges_refs(ready_workspace):

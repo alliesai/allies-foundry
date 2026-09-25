@@ -32,13 +32,16 @@ deployment (org) default — Hermes picks up the switch next turn.
 
 ## Disconnect (revert to org default)
 
-Order matters — clear the selection first so no turn ever points at a
-removed key:
+`DELETE /api/v1/internal/profiles/{id}/model-binding` clears the whole
+binding in one step: the next claim falls back to the seed provider/model,
+and the key set restores to exactly the seed refs (a live-apply rewrites
+`.env` back to the org keys — nothing stale survives). No separate
+remove-key call needed for a full revert.
 
-1. `DELETE /api/v1/internal/profiles/{id}/model-binding` reverts turns to the
-   org default immediately.
-2. `DELETE /api/v1/internal/profiles/{id}/provider-keys/{env}` removes the key
-   from the volume (full rewrite, no stale merge).
+`DELETE .../provider-keys/{env}` remains for dropping one installed key
+while keeping the rest of the binding (e.g. rotating out a single
+compromised key). Setting a new selection never wipes installed keys;
+only clear does.
 
 ## Rotation
 

@@ -66,6 +66,8 @@ class FakeHermesClient:
         self.health_status = health_status
         self.calls: list[tuple[str, str, str]] = []
         self.overrides: list[dict[str, Any]] = []
+        self.locks: list[dict[str, Any]] = []
+        self.lock_failure: Any | None = None
         self.session_keys: list[str] = []
         self.ensured_sessions: list[tuple[str, str]] = []
         self._run_numbers: dict[str, int] = {}
@@ -90,6 +92,25 @@ class FakeHermesClient:
     ) -> None:
         self.ensured_sessions.append((profile_id, session_id))
 
+    async def lock_session_model(
+        self,
+        profile_id: str,
+        session_id: str,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        self.locks.append(
+            {"profile_id": profile_id, "session_id": session_id,
+             "provider": provider, "model": model}
+        )
+        if self.lock_failure is not None:
+            raise self.lock_failure
+        return {
+            "object": "hermes.session.model_lock",
+            "session_id": session_id,
+        }
+
     async def stream_profile(
         self,
         profile_id: str,
@@ -98,8 +119,6 @@ class FakeHermesClient:
         *,
         session_key: str | None = None,
         reasoning_effort: str | None = None,
-        provider: str | None = None,
-        model: str | None = None,
         model_options: Mapping[str, Any] | None = None,
     ) -> HermesStreamResult:
         plan = self.plans.get(profile_id, FakeProfilePlan())
@@ -108,8 +127,7 @@ class FakeHermesClient:
             self.session_keys.append(session_key)
         self.overrides.append(
             {
-                "provider": provider,
-                "model": model,
+                "reasoning_effort": reasoning_effort,
                 "model_options": dict(model_options or {}),
             }
         )
@@ -158,8 +176,6 @@ class FakeHermesClient:
         *,
         session_key: str | None = None,
         reasoning_effort: str | None = None,
-        provider: str | None = None,
-        model: str | None = None,
         model_options: Mapping[str, Any] | None = None,
     ) -> CancellableHermesStream:
         """Yield fixture events incrementally and record cancellation."""
@@ -170,8 +186,7 @@ class FakeHermesClient:
             self.session_keys.append(session_key)
         self.overrides.append(
             {
-                "provider": provider,
-                "model": model,
+                "reasoning_effort": reasoning_effort,
                 "model_options": dict(model_options or {}),
             }
         )
