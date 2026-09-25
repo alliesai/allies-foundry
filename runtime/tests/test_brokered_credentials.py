@@ -87,3 +87,22 @@ def test_composition_routes_only_broker_refs_to_foundry(tmp_path):
     assert seen == ["file:///run/secrets/openai"]
     assert len(transport.calls) == 1
     observability.configure_runtime_observability()
+
+
+def test_blocking_resolution_returns_on_timeout(monkeypatch):
+    import time
+
+    from allies_runtime import foundry as foundry_module
+
+    class Hanging:
+        async def request(self, method, path, *, headers, body=None):
+            await asyncio.sleep(2)
+            return {"status": 200, "body": {"value": "late"}}
+
+    monkeypatch.setattr(foundry_module, "BROKERED_CREDENTIAL_TIMEOUT_SECONDS", 0.1)
+    client = FoundryClient(runtime_token="runtime-token", transport=Hanging())
+    started = time.monotonic()
+
+    with pytest.raises(TimeoutError):
+        client.resolve_credential_blocking(REF)
+    assert time.monotonic() - started < 1

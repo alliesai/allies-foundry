@@ -1580,10 +1580,13 @@ class FoundryClient:
     def resolve_credential_blocking(self, reference: str) -> str:
         """Resolve from sync profile-store code, whatever thread it runs on."""
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
             return pool.submit(asyncio.run, self.resolve_credential(reference)).result(
                 timeout=BROKERED_CREDENTIAL_TIMEOUT_SECONDS
             )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     async def stopped(
         self, attempt_id: str | UUID, lease_token: str, *, reason: str

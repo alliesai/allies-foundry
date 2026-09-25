@@ -24,7 +24,6 @@ from runtime.models import RuntimeProfile, Workspace
 from .event_delivery import _NoRedirect, _validated_cloud_url
 from .runtime_auth import RuntimeContext
 
-BROKER_SCHEME = "allies-key://"
 MAX_BROKER_RESPONSE_BYTES = 4 * 1024
 MAX_WORKSPACE_PROFILES = 500
 _REFERENCE = re.compile(r"allies-key://[a-z0-9-]{1,32}/[0-9a-f-]{36}")
