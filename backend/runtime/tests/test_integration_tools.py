@@ -120,6 +120,7 @@ def test_inactive_attempt_never_reaches_cloud(tool_claim, monkeypatch):  # noqa:
     "body",
     [
         {"call_id": "not-a-uuid", "integration": "gmail", "arguments": {}},
+        {"call_id": 123, "integration": "gmail", "arguments": {}},
         {"call_id": str(uuid4()), "integration": "Gmail!", "arguments": {}},
         {"call_id": str(uuid4()), "integration": "gmail", "arguments": []},
         {"call_id": str(uuid4()), "arguments": {}},
@@ -147,3 +148,14 @@ def test_endpoint_rejects_bad_capability():
         HTTP_AUTHORIZATION="Bearer forged",
     )
     assert response.status_code in {401, 403}
+
+
+@pytest.mark.django_db
+def test_routine_endpoint_rejects_non_string_call_id():
+    response = Client().post(
+        "/api/v1/runtime/routines/tool",
+        data=json.dumps({"call_id": 123, "arguments": {}}),
+        content_type="application/json",
+        HTTP_AUTHORIZATION="Bearer token",
+    )
+    assert response.status_code == 422

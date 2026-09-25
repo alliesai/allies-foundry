@@ -153,6 +153,7 @@ def register(api: NinjaExtraAPI) -> None:
                     not isinstance(body, dict)
                     or set(body) != {"call_id", "arguments"}
                     or not isinstance(body["arguments"], dict)
+                    or not isinstance(body["call_id"], str)
                 ):
                     raise ValueError("invalid fields")
                 call_id = UUID(body["call_id"])
@@ -176,6 +177,7 @@ def register(api: NinjaExtraAPI) -> None:
                     not isinstance(body, dict)
                     or set(body) != {"call_id", "integration", "arguments"}
                     or not isinstance(body["arguments"], dict)
+                    or not isinstance(body["call_id"], str)
                     or not isinstance(body["integration"], str)
                     or not _INTEGRATION_SLUG.fullmatch(body["integration"])
                 ):
