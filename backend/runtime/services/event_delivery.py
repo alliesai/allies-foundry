@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from time import monotonic
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -37,6 +39,15 @@ MAX_DELIVERY_BACKOFF_SECONDS = 300
 MAX_RESPONSE_BYTES = 8 * 1024
 REPAIR_DELAY_SECONDS = 300
 MAX_AUTOMATIC_REPAIR_CYCLES = 3
+SLOW_DELIVERY_POST_MS = 3000
+# Cloud answers 409 sequence_gap while an earlier event of the attempt is
+# still in flight; retry soon without spending one of the bounded attempts.
+SEQUENCE_GAP_RETRY_SECONDS = 15
+# Past this age a persistent gap falls back to normal retry accounting so a
+# permanently missing predecessor still exhausts and surfaces for redrive.
+SEQUENCE_GAP_PATIENCE_SECONDS = 30 * 60
+
+logger = logging.getLogger(__name__)
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -195,6 +206,7 @@ def mark_event_delivery(
         if success:
             row.state = EventDeliveryState.DELIVERED
             row.delivered_at = observed_at
+            row.sequence_gap_since = None
             row.lease_expires_at = None
             row.safe_error_code = ""
         else:
@@ -229,6 +241,7 @@ def mark_event_delivery(
                 "lease_expires_at",
                 "safe_error_code",
                 "next_attempt_at",
+                "sequence_gap_since",
                 "updated_at",
             ]
         )
@@ -254,8 +267,13 @@ def publish_pending_event_deliveries(limit: int = MAX_DELIVERY_BATCH) -> Deliver
             if marked is not None:
                 delivered += 1
                 recovered += int(claim.repair_cycle > 0)
+                _wake_attempt_successors(marked)
             else:
                 deferred += 1
+        elif (
+            status == 409 and code == "sequence_gap" and _defer_for_sequence_gap(claim)
+        ):
+            deferred += 1
         elif status in (401, 403, 404, 422) or (status == 409 and code == "conflict"):
             marked = mark_event_delivery(
                 claim.delivery_id,
@@ -294,6 +312,71 @@ def publish_pending_event_deliveries(limit: int = MAX_DELIVERY_BATCH) -> Deliver
     return DeliveryReport(
         len(claims), delivered, deferred, exhausted, repair_pending, recovered
     )
+
+
+def _defer_for_sequence_gap(
+    claim: EventDeliveryClaim, now: datetime | None = None
+) -> bool:
+    """Wait for the missing predecessor without consuming a delivery attempt.
+
+    Patience runs from the first gap Cloud reported for this delivery, so a
+    backlog row is deferred like a fresh one.  Returns False once the gap has
+    outlived its patience, so the caller records an ordinary retryable failure.
+    """
+
+    observed_at = now or timezone.now()
+    with transaction.atomic():
+        row = (
+            ExecutionEventDelivery.objects.select_for_update()
+            .filter(
+                pk=claim.delivery_id,
+                state=EventDeliveryState.DELIVERING,
+                delivery_attempts=claim.attempt,
+                repair_cycle=claim.repair_cycle,
+            )
+            .first()
+        )
+        if row is None:
+            return False
+        gap_since = row.sequence_gap_since or observed_at
+        if observed_at - gap_since > timedelta(seconds=SEQUENCE_GAP_PATIENCE_SECONDS):
+            return False
+        row.state = EventDeliveryState.PENDING
+        row.delivery_attempts = claim.attempt - 1
+        row.lease_expires_at = None
+        row.next_attempt_at = observed_at + timedelta(
+            seconds=SEQUENCE_GAP_RETRY_SECONDS
+        )
+        row.safe_error_code = "sequence_gap"
+        row.sequence_gap_since = gap_since
+        row.save(
+            update_fields=[
+                "state",
+                "delivery_attempts",
+                "lease_expires_at",
+                "next_attempt_at",
+                "safe_error_code",
+                "sequence_gap_since",
+                "updated_at",
+            ]
+        )
+    return True
+
+
+def _wake_attempt_successors(
+    row: ExecutionEventDelivery, now: datetime | None = None
+) -> None:
+    """Release later events of the attempt that backed off behind this one."""
+
+    observed_at = now or timezone.now()
+    event = row.event
+    ExecutionEventDelivery.objects.filter(
+        event__attempt_id=event.attempt_id,
+        event__sequence__gt=event.sequence,
+        state=EventDeliveryState.PENDING,
+        safe_error_code="sequence_gap",
+        next_attempt_at__gt=observed_at,
+    ).update(next_attempt_at=observed_at, updated_at=observed_at)
 
 
 def redrive_event_deliveries(
@@ -364,6 +447,7 @@ def redrive_event_deliveries(
                 row.next_attempt_at = observed_at
                 row.delivered_at = None
                 row.safe_error_code = "manual_redrive"
+                row.sequence_gap_since = None
                 row.save(
                     update_fields=[
                         "repair_cycle",
@@ -375,6 +459,7 @@ def redrive_event_deliveries(
                         "next_attempt_at",
                         "delivered_at",
                         "safe_error_code",
+                        "sequence_gap_since",
                         "updated_at",
                     ]
                 )
@@ -523,20 +608,30 @@ def _post_to_cloud(envelope_bytes: bytes) -> tuple[int, str]:
         method="POST",
     )
     try:
-        with build_opener(_NoRedirect).open(request, timeout=5) as response:
-            status = int(response.status)
-            body = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(body) > MAX_RESPONSE_BYTES:
-                return 503, "delivery_response_too_large"
-            if status == 202:
-                try:
-                    receipt = EventDeliveryReceipt.model_validate_json(body)
-                except (TypeError, ValueError):
-                    return 503, "delivery_receipt_invalid"
-                if receipt.event_id != expected_event_id:
-                    return 503, "delivery_receipt_mismatch"
-                return status, ""
-            return status, _safe_response_code(body)
+        started = monotonic()
+        try:
+            with build_opener(_NoRedirect).open(request, timeout=5) as response:
+                status = int(response.status)
+                body = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    return 503, "delivery_response_too_large"
+                if status == 202:
+                    try:
+                        receipt = EventDeliveryReceipt.model_validate_json(body)
+                    except (TypeError, ValueError):
+                        return 503, "delivery_receipt_invalid"
+                    if receipt.event_id != expected_event_id:
+                        return 503, "delivery_receipt_mismatch"
+                    return status, ""
+                return status, _safe_response_code(body)
+        finally:
+            elapsed_ms = int((monotonic() - started) * 1000)
+            if elapsed_ms >= SLOW_DELIVERY_POST_MS and expected_event_id is not None:
+                logger.warning(
+                    "event_delivery_post_slow event_id=%s duration_ms=%d",
+                    expected_event_id,
+                    elapsed_ms,
+                )
     except HTTPError as exc:
         try:
             body = exc.read(MAX_RESPONSE_BYTES + 1)

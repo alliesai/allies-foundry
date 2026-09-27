@@ -238,10 +238,10 @@ def test_fixture_request_creates_pending_profile_without_private_receipt_fields(
     assert receipt["request_fingerprint"] == contract["request"]["request_fingerprint"]
     assert receipt["status"] == "pending"
     # The historical receipt fixture predates the managed memory-tool
-    # default, the compression threshold default, and the OpenRouter
-    # gpt-6-luna default route.
+    # default, the compression threshold default, the platform-layer soul,
+    # and the OpenRouter gpt-6-luna default route.
     assert receipt["evidence_digest"] == (
-        "ef326396b5d74e2bbdc5c42787028ac20223333c5075fba7ed80bb63e6cd1b88"
+        "3b7851974976b9e2d0ca6d8c498eedaddd468b7be32cec556935ea641f62f7ad"
     )
     assert re.fullmatch(r"[0-9a-f]{64}", receipt["evidence_digest"])
     assert "profile_id" not in receipt
@@ -256,11 +256,10 @@ def test_fixture_request_creates_pending_profile_without_private_receipt_fields(
     assert contract["request"]["name"] in soul
     assert contract["request"]["job"] in soul
     assert contract["request"]["personality"] in soul
-    assert "Hermes is your private runtime" in soul
     assert "## Your personality" in soul
     assert "This personality is not decoration" in soul
-    assert "Respond to the moment you are actually in" in soul
-    assert "Be recognizable" in soul
+    assert "Be recognisable" in soul
+    assert "Hermes" not in soul
     instruction = profile.seed_payload["first_chat_instruction"]
     assert "start of a working relationship" in instruction
     assert "Do not repeat profile fields" in instruction

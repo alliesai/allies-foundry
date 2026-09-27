@@ -375,10 +375,12 @@ class ReadyWorkspaceBundle(models.Model):
             ),
             models.CheckConstraint(
                 condition=(
-                    ~Q(state__in=[
-                        ReadyWorkspaceBundleState.PARKING,
-                        ReadyWorkspaceBundleState.SLEEPING,
-                    ])
+                    ~Q(
+                        state__in=[
+                            ReadyWorkspaceBundleState.PARKING,
+                            ReadyWorkspaceBundleState.SLEEPING,
+                        ]
+                    )
                     | (
                         Q(blank_volume_ref__isnull=False)
                         & Q(ready_at__isnull=False)
@@ -575,6 +577,11 @@ class RuntimeProfile(models.Model):
     # resolved provider values.
     seed_payload = models.JSONField(default=dict, blank=True)
     seed_fingerprint = models.CharField(max_length=64, default="", blank=True)
+    # Mutable model selection, deliberately outside the immutable seed payload:
+    # null/empty means the deployment default; otherwise
+    # {provider, model, reasoning?, key_refs?} plus a monotonic generation the
+    # runtime uses to apply each change exactly once to the live volume.
+    model_override = models.JSONField(default=dict, blank=True)
     materialized_generation = models.PositiveIntegerField(default=0)
     materialization_operation_id = models.UUIDField(null=True, blank=True)
     materialization_request_digest = models.CharField(
@@ -1541,6 +1548,8 @@ class ExecutionEventDelivery(models.Model):
     next_attempt_at = models.DateTimeField()
     safe_error_code = models.CharField(max_length=64, default="", blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
+    # First time Cloud reported this delivery waiting on a missing predecessor.
+    sequence_gap_since = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

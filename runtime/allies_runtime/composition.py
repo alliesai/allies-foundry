@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
 
 from .config import CredentialReference, RuntimeSettings
 from .foundry import (
+    BROKERED_CREDENTIAL_SCHEME,
     DEFAULT_PROFILE_RECONCILE_INTERVAL,
     FoundryClient,
     FoundryWorker,
@@ -60,6 +61,8 @@ def compose_runtime(
     correlation_id = str(boot_id or uuid4())
 
     def resolve_profile_credential(reference: str) -> str:
+        if reference.lower().startswith(BROKERED_CREDENTIAL_SCHEME):
+            return foundry.resolve_credential_blocking(reference)
         return credential_resolver(CredentialReference(reference))
 
     profile_store = ProfileStore(
@@ -87,6 +90,14 @@ def compose_runtime(
         if settings.file_publication_enabled
         else None
     )
+
+    def apply_profile_binding(
+        profile_key: str, generation: int, key_refs: Mapping[str, str]
+    ):
+        return profile_store.apply_binding(
+            profile_key, generation=generation, key_refs=key_refs
+        )
+
     worker = FoundryWorker(
         foundry,
         hermes_client,
@@ -99,6 +110,7 @@ def compose_runtime(
         file_input_enabled=settings.file_input_enabled,
         publication_bridge=publication_bridge,
         boot_id=correlation_id,
+        binding_applier=apply_profile_binding,
     )
     profile_reconciler.worker = worker
     return RuntimeComposition(

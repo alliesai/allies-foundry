@@ -151,6 +151,15 @@ RUN cd /opt/hermes \
     && git apply --whitespace=nowarn /tmp/allies-file-publication-protocol.patch \
     && rm -f /tmp/allies-file-publication-protocol.patch
 
+# The Allies web client renders Markdown. This source-pinned overlay replaces
+# the api_server plain-text hint so Allies use Markdown where it aids scanning.
+COPY patches/api-server-markdown-hint.patch /tmp/allies-api-server-markdown-hint.patch
+RUN cd /opt/hermes \
+    && sed -i 's/\r$//' /tmp/allies-api-server-markdown-hint.patch \
+    && git apply --check --whitespace=nowarn /tmp/allies-api-server-markdown-hint.patch \
+    && git apply --whitespace=nowarn /tmp/allies-api-server-markdown-hint.patch \
+    && rm -f /tmp/allies-api-server-markdown-hint.patch
+
 COPY smoke_routine_result_tool.py /tmp/allies-smoke-routine-result-tool.py
 COPY smoke_incoming_file_context.py /tmp/allies-smoke-incoming-file-context.py
 COPY smoke_file_publication_tool.py /tmp/allies-smoke-file-publication-tool.py
@@ -161,8 +170,17 @@ RUN /opt/hermes/.venv/bin/python /tmp/allies-smoke-routine-result-tool.py \
 RUN PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python /tmp/allies-smoke-file-publication-tool.py \
     && rm -f /tmp/allies-smoke-file-publication-tool.py
 
+COPY smoke_api_server_markdown_hint.py /tmp/allies-smoke-api-server-markdown-hint.py
+RUN /opt/hermes/.venv/bin/python /tmp/allies-smoke-api-server-markdown-hint.py \
+    && rm -f /tmp/allies-smoke-api-server-markdown-hint.py
+
 COPY plugins/routines/ /opt/hermes/plugins/routines/
 COPY allies_routines.py /opt/hermes/tools/allies_routines.py
+COPY plugins/gmail/ /opt/hermes/plugins/gmail/
+COPY allies_gmail.py /opt/hermes/tools/allies_gmail.py
+COPY plugins/safe-inputs/ /opt/hermes/plugins/safe-inputs/
+COPY allies_safe_inputs.py /opt/hermes/tools/allies_safe_inputs.py
+COPY allies_browser_provider.py /opt/hermes/plugins/browser/browser_use/provider.py
 COPY patches/routine-management-tool.patch /tmp/allies-routine-management-tool.patch
 RUN cd /opt/hermes \
     && sed -i 's/\r$//' /tmp/allies-routine-management-tool.patch \
@@ -185,6 +203,40 @@ RUN cd /opt/hermes \
 COPY smoke_profile_quiescence.py /tmp/allies-smoke-profile-quiescence.py
 RUN PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python /tmp/allies-smoke-profile-quiescence.py \
     && rm -f /tmp/allies-smoke-profile-quiescence.py
+
+# Prompt-compartment refresh gate: replace the frozen session prompt when a
+# prompt layer version changes. A rejected hunk must fail the image build.
+COPY patches/prompt-compartment-refresh.patch /tmp/allies-prompt-compartment-refresh.patch
+RUN cd /opt/hermes \
+    && sed -i 's/\r$//' /tmp/allies-prompt-compartment-refresh.patch \
+    && git apply --check --whitespace=nowarn /tmp/allies-prompt-compartment-refresh.patch \
+    && git apply --whitespace=nowarn /tmp/allies-prompt-compartment-refresh.patch \
+    && rm -f /tmp/allies-prompt-compartment-refresh.patch
+
+# Allies platform layer: rules every Ally follows, placed after the soul. Its
+# content feeds the platform version marker, so edits reach live sessions.
+COPY PLATFORM.md /opt/hermes/allies/PLATFORM.md
+COPY patches/platform-layer.patch /tmp/allies-platform-layer.patch
+RUN cd /opt/hermes \
+    && sed -i 's/\r$//' /tmp/allies-platform-layer.patch \
+    && git apply --check --whitespace=nowarn /tmp/allies-platform-layer.patch \
+    && git apply --whitespace=nowarn /tmp/allies-platform-layer.patch \
+    && rm -f /tmp/allies-platform-layer.patch
+
+# Version stamp for the refresh gate: source SHA plus the full overlay patch
+# set, so any Hermes code or config change retires live session prompts once.
+COPY patches/ /tmp/allies-prompt-version-patches/
+RUN printf '%s:' "${HERMES_SOURCE_SHA}" > /opt/hermes/.allies-prompt-config-version \
+    && sha256sum /tmp/allies-prompt-version-patches/*.patch | sha256sum | cut -d' ' -f1 | tr -d '\n' >> /opt/hermes/.allies-prompt-config-version \
+    && rm -rf /tmp/allies-prompt-version-patches
+
+COPY smoke_prompt_compartment_refresh.py /tmp/allies-smoke-prompt-compartment-refresh.py
+RUN PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python /tmp/allies-smoke-prompt-compartment-refresh.py \
+    && rm -f /tmp/allies-smoke-prompt-compartment-refresh.py
+
+COPY smoke_platform_layer.py /tmp/allies-smoke-platform-layer.py
+RUN PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python /tmp/allies-smoke-platform-layer.py \
+    && rm -f /tmp/allies-smoke-platform-layer.py
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends bubblewrap=0.12.0-1~deb13u1 \

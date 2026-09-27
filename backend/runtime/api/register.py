@@ -1,4 +1,5 @@
 import json
+import re
 import secrets
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -43,6 +44,7 @@ from runtime.services.approvals import (
 )
 from runtime.services.attempts import complete_attempt, fail_attempt
 from runtime.services.claims import claim_next_execution
+from runtime.services.credential_broker import resolve_brokered_credential
 from runtime.services.events import append_runtime_event
 from runtime.services.executions import (
     create_execution_intent,
@@ -55,8 +57,12 @@ from runtime.services.profiles import (
     ProfileSeed,
     accept_cleanup_receipt,
     accept_materialization_receipt,
+    clear_model_binding,
     ensure_runtime_profile,
+    install_provider_key,
     list_profile_reconciliation,
+    remove_provider_key,
+    set_model_binding,
 )
 from runtime.services.publications import (
     MAX_PUBLICATION_FILE_BYTES,
@@ -68,7 +74,11 @@ from runtime.services.publications import (
     register_publication,
     upload_publication_file,
 )
-from runtime.services.routine_tools import call_routine_tool, routine_tool_token
+from runtime.services.routine_tools import (
+    call_integration_tool,
+    call_routine_tool,
+    routine_tool_token,
+)
 from runtime.services.routines import (
     accept_routine_dispatch,
     append_runtime_routine_result,
@@ -87,13 +97,16 @@ from .schemas import (
     ClaimRequest,
     CleanupReceiptRequest,
     CompleteRequest,
+    CredentialResolveRequest,
     EventRequest,
     ExecutionCommand,
     FailRequest,
     MaterializationReceiptRequest,
+    ModelBindingRequest,
     ProfileDeletionRequest,
     ProfileDeletionResumeRequest,
     ProfileProvisioningRequest,
+    ProviderKeyRequest,
     PublicationFrozenRequest,
     PublicationIntentRequest,
     PublicationRegisterRequest,
@@ -114,6 +127,7 @@ from .schemas import (
 from .schemas import ProfileProvisioningReceipt as ProfileProvisioningReceiptSchema
 
 _PROFILE_ID_NAMESPACE = uuid5(NAMESPACE_URL, "allies-foundry-profile-v1")
+_INTEGRATION_SLUG = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 
 class CloudServiceAuth(HttpBearer):
@@ -141,6 +155,7 @@ def register(api: NinjaExtraAPI) -> None:
                     not isinstance(body, dict)
                     or set(body) != {"call_id", "arguments"}
                     or not isinstance(body["arguments"], dict)
+                    or not isinstance(body["call_id"], str)
                 ):
                     raise ValueError("invalid fields")
                 call_id = UUID(body["call_id"])
@@ -148,6 +163,35 @@ def register(api: NinjaExtraAPI) -> None:
                 raise RuntimeValidationError("invalid routine request") from exc
             status, result = call_routine_tool(
                 _bearer(request), call_id=call_id, arguments=body["arguments"]
+            )
+            return JsonResponse(result, status=status)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/integrations/tool", auth=None)
+    def integration_tool(request: HttpRequest):
+        try:
+            if len(request.body) > 64 * 1024:
+                raise RuntimeValidationError("integration request too large")
+            try:
+                body = json.loads(request.body)
+                if (
+                    not isinstance(body, dict)
+                    or set(body) != {"call_id", "integration", "arguments"}
+                    or not isinstance(body["arguments"], dict)
+                    or not isinstance(body["call_id"], str)
+                    or not isinstance(body["integration"], str)
+                    or not _INTEGRATION_SLUG.fullmatch(body["integration"])
+                ):
+                    raise ValueError("invalid fields")
+                call_id = UUID(body["call_id"])
+            except (ValueError, TypeError, KeyError) as exc:
+                raise RuntimeValidationError("invalid integration request") from exc
+            status, result = call_integration_tool(
+                _bearer(request),
+                call_id=call_id,
+                integration=body["integration"],
+                arguments=body["arguments"],
             )
             return JsonResponse(result, status=status)
         except RuntimeDomainError as exc:
@@ -163,6 +207,17 @@ def register(api: NinjaExtraAPI) -> None:
             if claim is None:
                 return HttpResponse(status=204)
             return JsonResponse(_claim_json(claim), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.post("/runtime/credentials/resolve", auth=None)
+    def resolve_credential(request: HttpRequest, payload: CredentialResolveRequest):
+        try:
+            context = authenticate_runtime_token(_bearer(request))
+            value = resolve_brokered_credential(context, payload.reference)
+            response = JsonResponse({"value": value}, status=200)
+            response["Cache-Control"] = "no-store"
+            return response
         except RuntimeDomainError as exc:
             return _error(exc)
 
@@ -514,6 +569,67 @@ def register(api: NinjaExtraAPI) -> None:
             return JsonResponse(receipt, status=200)
         except RuntimeDomainError as exc:
             return _profile_provisioning_error(exc)
+
+    @api.put("/internal/profiles/{profile_id}/model-binding", auth=None)
+    def put_model_binding(
+        request: HttpRequest,
+        profile_id: UUID,
+        payload: ModelBindingRequest,
+    ):
+        try:
+            _authenticate_cloud_service(request)
+            if payload.profile_id != profile_id:
+                raise RuntimeValidationError(
+                    "profile binding identity does not match path"
+                )
+            receipt = set_model_binding(
+                profile_id,
+                {
+                    key: value
+                    for key, value in payload.model_dump().items()
+                    if key != "profile_id" and value is not None
+                },
+            )
+            return JsonResponse(_binding_receipt_json(receipt), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.delete("/internal/profiles/{profile_id}/model-binding", auth=None)
+    def delete_model_binding(request: HttpRequest, profile_id: UUID):
+        try:
+            _authenticate_cloud_service(request)
+            receipt = clear_model_binding(profile_id)
+            return JsonResponse(_binding_receipt_json(receipt), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.put("/internal/profiles/{profile_id}/provider-keys", auth=None)
+    def put_provider_key(
+        request: HttpRequest,
+        profile_id: UUID,
+        payload: ProviderKeyRequest,
+    ):
+        try:
+            _authenticate_cloud_service(request)
+            if payload.profile_id != profile_id:
+                raise RuntimeValidationError(
+                    "profile binding identity does not match path"
+                )
+            receipt = install_provider_key(
+                profile_id, payload.env_name, payload.reference
+            )
+            return JsonResponse(_binding_receipt_json(receipt), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
+
+    @api.delete("/internal/profiles/{profile_id}/provider-keys/{env_name}", auth=None)
+    def delete_provider_key(request: HttpRequest, profile_id: UUID, env_name: str):
+        try:
+            _authenticate_cloud_service(request)
+            receipt = remove_provider_key(profile_id, env_name)
+            return JsonResponse(_binding_receipt_json(receipt), status=200)
+        except RuntimeDomainError as exc:
+            return _error(exc)
 
     @api.post("/internal/profile-provisioning", auth=None)
     def profile_provisioning(
@@ -1055,6 +1171,10 @@ def _claim_json(claim):
         "hermes_profile_key": claim.hermes_profile_key,
         "model": claim.model,
         "reasoning_effort": claim.reasoning_effort,
+        "provider": claim.provider,
+        "model_options": claim.model_options,
+        "binding_generation": claim.binding_generation,
+        "binding_key_refs": claim.binding_key_refs,
         "conversation_id": claim.conversation_id,
         "session_id": claim.session_id,
         "stream_id": claim.stream_id,
@@ -1090,6 +1210,14 @@ def _approval_status_json(status):
             else None
         ),
         "expires_at": _timestamp(status.expires_at),
+    }
+
+
+def _binding_receipt_json(receipt):
+    return {
+        "profile_id": str(receipt.profile_id),
+        "generation": receipt.generation,
+        "binding": dict(receipt.binding),
     }
 
 

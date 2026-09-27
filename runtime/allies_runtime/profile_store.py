@@ -29,6 +29,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from .errors import IncomingFileError
+from .soul_upgrade import legacy_soul_for
 
 SKILLS_CATALOG = "/opt/allies/skills"
 SKILLS_CONFIG = f"skills:\n  external_dirs: [{json.dumps(SKILLS_CATALOG)}]\n"
@@ -142,6 +143,15 @@ class ProfileCleanupStatus(StrEnum):
     DEPROVISIONED = "DEPROVISIONED"
     REPAIR_REQUIRED = "REPAIR_REQUIRED"
     FENCED = "FENCED"
+
+
+class BindingApplyStatus(StrEnum):
+    APPLIED = "APPLIED"
+    CURRENT = "CURRENT"
+    REPAIR_REQUIRED = "REPAIR_REQUIRED"
+
+
+BINDING_SIDECAR_NAME = ".allies-binding.json"
 
 
 def derive_profile_key(foundry_profile_id: str | uuid.UUID) -> str:
@@ -544,6 +554,20 @@ class ProfileSeed:
         }
 
     @property
+    def legacy_soul_fingerprint(self) -> str | None:
+        """Return the fingerprint from before the platform-layer soul, if any."""
+
+        legacy = self.legacy_soul_seed
+        return None if legacy is None else legacy.fingerprint
+
+    @property
+    def legacy_soul_seed(self) -> ProfileSeed | None:
+        """Return this seed with its pre-platform-layer soul, if managed."""
+
+        legacy = legacy_soul_for(self.personality)
+        return None if legacy is None else replace(self, personality=legacy)
+
+    @property
     def legacy_compression_fingerprint(self) -> str:
         """Return the fingerprint from before the compression threshold."""
 
@@ -598,6 +622,18 @@ class ProfileSeed:
             "base_url": LEGACY_MODEL_BASE_URL,
         }
         return _fingerprint_digest(payload)
+
+    @property
+    def legacy_model_fingerprints(self) -> frozenset[str]:
+        """Return every pre-model-switch fingerprint for this seed's soul."""
+
+        return frozenset(
+            {
+                self.legacy_model_fingerprint,
+                self.legacy_memory_model_fingerprint,
+                self.legacy_compression_model_fingerprint,
+            }
+        )
 
     @property
     def legacy_memory_model_fingerprint(self) -> str:
@@ -713,6 +749,27 @@ class CleanupReceipt:
             "repair_code": self.repair_code,
             "attempt_id": self.attempt_id,
             "request_digest": self.request_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BindingReceipt:
+    status: BindingApplyStatus
+    profile_key: str
+    generation: int
+    repair_code: str | None = None
+
+    @property
+    def result_code(self) -> str:
+        return self.status.value.lower()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "result_code": self.result_code,
+            "profile_key": self.profile_key,
+            "generation": self.generation,
+            "repair_code": self.repair_code,
         }
 
 
@@ -1852,16 +1909,26 @@ class ProfileStore:
         legacy_compression_upgrade = (
             manifest.get("seed_fingerprint") == seed.legacy_compression_fingerprint
         )
-        legacy_model_upgrade = manifest.get("seed_fingerprint") in {
-            seed.legacy_model_fingerprint,
-            seed.legacy_memory_model_fingerprint,
-            seed.legacy_compression_model_fingerprint,
-        }
+        legacy_soul_seed = seed.legacy_soul_seed
+        # A volume asleep since before both switches carries the old soul and model.
+        legacy_soul_model_fingerprints = (
+            legacy_soul_seed.legacy_model_fingerprints
+            if legacy_soul_seed is not None
+            else frozenset()
+        )
+        legacy_model_upgrade = manifest.get("seed_fingerprint") in (
+            seed.legacy_model_fingerprints | legacy_soul_model_fingerprints
+        )
+        legacy_soul_upgrade = legacy_soul_seed is not None and (
+            manifest.get("seed_fingerprint") == legacy_soul_seed.fingerprint
+            or manifest.get("seed_fingerprint") in legacy_soul_model_fingerprints
+        )
         if (
             manifest.get("seed_fingerprint") != seed.fingerprint
             and not legacy_memory_upgrade
             and not legacy_compression_upgrade
             and not legacy_model_upgrade
+            and not legacy_soul_upgrade
         ):
             code = (
                 "instruction_version_conflict"
@@ -2010,6 +2077,23 @@ class ProfileStore:
                 ProfileProvisionStatus.REPAIR_REQUIRED,
                 repair_code="skills_config_requires_repair",
             )
+        if legacy_soul_upgrade:
+            # Managed souls are re-rendered from the Ally's original identity;
+            # the shared rules now live in the image's platform layer.
+            try:
+                self._write_bytes_atomic(
+                    profile / "SOUL.md", seed.personality.encode("utf-8"), mode=0o644
+                )
+                upgraded = dict(manifest)
+                upgraded["seed_fingerprint"] = seed.fingerprint
+                self._write_json_atomic(manifest_path, upgraded, mode=0o644)
+            except (ProfileStoreError, TypeError, UnicodeError, ValueError):
+                return self._receipt(
+                    seed,
+                    ProfileProvisionStatus.REPAIR_REQUIRED,
+                    repair_code="legacy_soul_upgrade_failed",
+                )
+            manifest = upgraded
         if legacy_memory_upgrade or legacy_compression_upgrade or legacy_model_upgrade:
             upgraded = dict(manifest)
             upgraded.update(
@@ -2550,6 +2634,111 @@ class ProfileStore:
                 ProfileCleanupStatus.REPAIR_REQUIRED,
                 repair_code="cleanup_unavailable",
             )
+
+
+    def apply_binding(
+        self,
+        profile_key: str,
+        *,
+        generation: int,
+        key_refs: Mapping[str, str],
+    ) -> BindingReceipt:
+        """Rewrite one live profile's key lines without touching its sessions.
+
+        Applies only when the profile is fully materialized and the incoming
+        generation is newer than the recorded one. The server key is preserved
+        from the current file; every reference resolves before any write, so a
+        failed resolution keeps the last-good files intact.
+        """
+
+        def failed(code: str) -> BindingReceipt:
+            return BindingReceipt(
+                status=BindingApplyStatus.REPAIR_REQUIRED,
+                profile_key=key,
+                generation=generation,
+                repair_code=code,
+            )
+
+        key = validate_profile_key(profile_key)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ProfileInputError("binding generation is invalid")
+        if not isinstance(key_refs, Mapping) or len(key_refs) > MAX_CREDENTIALS:
+            raise ProfileInputError("binding key references are invalid")
+        try:
+            server_key = self.read_api_key(key)
+        except (ProfileInputError, ProfileStoreError):
+            return BindingReceipt(
+                status=BindingApplyStatus.REPAIR_REQUIRED,
+                profile_key=profile_key if isinstance(profile_key, str) else "invalid",
+                generation=generation if isinstance(generation, int) else 0,
+                repair_code="incomplete_profile",
+            )
+        try:
+            with self._lock(key):
+                profile = self._profile_path(key)
+                manifest = self._read_json(profile / MANIFEST_NAME)
+                if (
+                    manifest is None
+                    or manifest.get("completion_state") != "complete"
+                    or not _is_regular_file(profile / ".env")
+                ):
+                    return failed("incomplete_profile")
+                sidecar = self._read_json(profile / BINDING_SIDECAR_NAME) or {}
+                applied = sidecar.get("generation", 0)
+                if (
+                    not isinstance(applied, int)
+                    or isinstance(applied, bool)
+                    or applied < 0
+                ):
+                    return failed("invalid_binding_state")
+                if applied >= generation:
+                    return BindingReceipt(
+                        status=BindingApplyStatus.CURRENT,
+                        profile_key=key,
+                        generation=applied,
+                    )
+                resolved: dict[str, str] = {}
+                for env_name, reference in key_refs.items():
+                    if (
+                        not isinstance(env_name, str)
+                        or not isinstance(reference, str)
+                        or ENV_NAME_PATTERN.fullmatch(env_name) is None
+                    ):
+                        return failed("invalid_binding_reference")
+                    try:
+                        resolved[env_name] = self._resolve_credential(reference)
+                    except ProfileStoreError:
+                        return failed("credential_resolution_failed")
+                lines = [f"API_SERVER_KEY={server_key}"]
+                lines.extend(f"{name}={resolved[name]}" for name in sorted(resolved))
+                self._write_bytes_atomic(
+                    profile / ".env",
+                    ("\n".join(lines) + "\n").encode("utf-8"),
+                    mode=0o600,
+                )
+                self._write_json_atomic(
+                    profile / BINDING_SIDECAR_NAME,
+                    {"generation": generation},
+                    mode=0o644,
+                )
+                return BindingReceipt(
+                    status=BindingApplyStatus.APPLIED,
+                    profile_key=key,
+                    generation=generation,
+                )
+        except ProfileStoreError as exc:
+            code = (
+                "lock_timeout"
+                if "timed out" in str(exc)
+                else "profile_store_unavailable"
+            )
+            return failed(code)
+        except OSError:
+            return failed("binding_publish_failed")
 
     def cleanup(
         self,

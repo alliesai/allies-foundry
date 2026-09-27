@@ -118,7 +118,7 @@ def switch_back_to_openai_gpt56(apps, _schema_editor):
 
 class Migration(migrations.Migration):
     dependencies: ClassVar = [
-        ("runtime", "0030_profile_compression_threshold"),
+        ("runtime", "0033_delivery_sequence_gap_since"),
     ]
 
     operations: ClassVar = [
