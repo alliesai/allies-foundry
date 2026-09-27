@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -21,6 +22,7 @@ from uuid import UUID, uuid4
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
+from observability.events import emit_event
 from runtime.exceptions import (
     RuntimeConflictError,
     RuntimeFencedError,
@@ -31,24 +33,33 @@ from runtime.exceptions import (
 )
 from runtime.models import (
     IN_FLIGHT_PROVISIONING_PHASES,
+    Attempt,
     AttemptStatus,
+    DeletedProfile,
     ExecutionStatus,
     Lease,
     LeaseState,
+    RoutineExecution,
+    RoutineLeaseAcquisition,
+    RoutineRunStatus,
     RuntimeProfile,
     RuntimeProfileLifecycleState,
     Workspace,
 )
 from runtime.profile_keys import derive_hermes_profile_key
 
+from .activity import advance_workspace_activity
+from .provisioning_hints import ensure_provisioning_hint_delivery
 from .retry import run_with_sqlite_lock_retry
 from .runtime_auth import RuntimeContext
+from .timing import emit_timing_event
 from .validation import digest_payload, validate_nonempty
 
 PROFILE_SEED_VERSION = 1
 PROFILE_FINGERPRINT_VERSION = 2
 DEFAULT_MEMORY_PROVIDER = "allies_mnemosyne"
-DEFAULT_MEMORY_MODE = "context_only"
+CONTEXT_ONLY_MEMORY_MODE = "context_only"
+DEFAULT_MEMORY_MODE = "narrow_tools"
 DEFAULT_MEMORY_POLICY_VERSION = "allies-mnemosyne-v1"
 MEMORY_MODES = frozenset({"context_only", "narrow_tools"})
 MEMORY_TOOLS = frozenset(
@@ -63,8 +74,14 @@ MEMORY_TOOLS = frozenset(
         "mnemosyne_update",
     }
 )
+DEFAULT_MEMORY_TOOL_ALLOWLIST = tuple(sorted(MEMORY_TOOLS))
+# Absolute compaction trigger: sessions compact at the lower of the
+# ratio-based threshold and this count. Set from the observed terminal-event
+# failure boundary: transcripts past ~256KB break single-event SSE parsing.
+DEFAULT_COMPRESSION_THRESHOLD_TOKENS = 100_000
 CLEANUP_GRACE_SECONDS = 60
 MAX_PROFILE_SEED_BYTES = 128 * 1024
+MAX_BINDING_KEY_REFS = 32
 _OPAQUE_REFERENCE = re.compile(
     r"^[a-z][a-z0-9+.-]{1,31}://[^\s]{1,191}$", re.IGNORECASE
 )
@@ -91,9 +108,10 @@ class ProfileSeed:
     memory_provider: str = DEFAULT_MEMORY_PROVIDER
     memory_mode: str = DEFAULT_MEMORY_MODE
     memory_policy_version: str = DEFAULT_MEMORY_POLICY_VERSION
-    memory_tool_allowlist: tuple[str, ...] = ()
+    memory_tool_allowlist: tuple[str, ...] = DEFAULT_MEMORY_TOOL_ALLOWLIST
     memory_profile_isolation: bool = True
     memory_sync_roles: tuple[str, ...] = ()
+    compression_threshold_tokens: int = DEFAULT_COMPRESSION_THRESHOLD_TOKENS
 
     def payload(self) -> dict[str, Any]:
         return _normalize_seed(self)
@@ -131,6 +149,8 @@ class ProfileDesiredState:
     cleanup_receipt_id: UUID | None
     cleanup_result_code: str
     cleanup_expires_at: datetime | None
+    cleanup_requires_quiescence: bool
+    cleanup_attempt_id: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,11 +188,15 @@ def ensure_runtime_profile(
         )
         if workspace is None:
             raise RuntimeValidationError("workspace does not exist")
+        if DeletedProfile.objects.filter(profile_id=profile_uuid).exists():
+            raise RuntimeFencedError("profile has been deleted")
         profile = (
             RuntimeProfile.objects.select_for_update().filter(pk=profile_uuid).first()
         )
         if profile is not None:
             _assert_profile_identity(profile, workspace_uuid, ally_ref, key)
+            if profile.cleanup_requires_quiescence:
+                raise RuntimeFencedError("profile deletion is in progress")
             _assert_seed_compatible(profile, payload, fingerprint)
             if not profile.seed_payload:
                 profile.seed_payload = payload
@@ -186,6 +210,7 @@ def ensure_runtime_profile(
                         "updated_at",
                     ]
                 )
+                advance_workspace_activity(workspace)
             return ProfileProvisioningReceipt(
                 profile.id,
                 profile.hermes_profile_key,
@@ -221,6 +246,7 @@ def ensure_runtime_profile(
             raise RuntimeConflictError(
                 "profile identity conflicts with existing state"
             ) from exc
+        advance_workspace_activity(workspace)
         return ProfileProvisioningReceipt(
             profile.id,
             profile.hermes_profile_key,
@@ -265,84 +291,133 @@ def accept_materialization_receipt(
     _require_context(context)
     profile_uuid = _uuid(profile_id, "profile_id")
     operation_uuid = _uuid(operation_id, "operation_id")
-    _validate_epoch(lifecycle_epoch)
-    _validate_generation(materialized_generation)
-    _validate_digest(seed_fingerprint, "seed_fingerprint")
-    result_code = _validate_result_code(result_code)
-    if result_code not in _MATERIALIZATION_RESULT_CODES:
-        raise RuntimeValidationError("materialization result_code is not successful")
-    request_digest = digest_payload(
-        {
-            "profile_id": str(profile_uuid),
-            "operation_id": str(operation_uuid),
-            "lifecycle_epoch": lifecycle_epoch,
-            "materialized_generation": materialized_generation,
-            "seed_fingerprint": seed_fingerprint,
-            "result_code": result_code,
-        }
+    workspace_id = context.workspace_id
+    started_at = time.monotonic()
+    _emit_profile_timing(
+        "runtime.operation.started",
+        operation="runtime.profile_materialization_receipt",
+        workspace_id=workspace_id,
+        profile_id=profile_uuid,
+        correlation_id=operation_uuid,
+        outcome="started",
     )
-
-    @transaction.atomic
-    def accept_once() -> ProfileReconciliationReceipt:
-        workspace = Workspace.objects.select_for_update().get(pk=context.workspace_id)
-        _check_context_generation(workspace, context)
-        _require_ready_workspace(workspace)
-        profile = (
-            RuntimeProfile.objects.select_for_update()
-            .filter(pk=profile_uuid, workspace_id=workspace.id)
-            .first()
+    try:
+        _validate_epoch(lifecycle_epoch)
+        _validate_generation(materialized_generation)
+        _validate_digest(seed_fingerprint, "seed_fingerprint")
+        result_code = _validate_result_code(result_code)
+        if result_code not in _MATERIALIZATION_RESULT_CODES:
+            raise RuntimeValidationError(
+                "materialization result_code is not successful"
+            )
+        request_digest = digest_payload(
+            {
+                "profile_id": str(profile_uuid),
+                "operation_id": str(operation_uuid),
+                "lifecycle_epoch": lifecycle_epoch,
+                "materialized_generation": materialized_generation,
+                "seed_fingerprint": seed_fingerprint,
+                "result_code": result_code,
+            }
         )
-        if profile is None:
-            raise RuntimeValidationError("profile is not in this workspace")
-        if profile.lifecycle_state in {
-            RuntimeProfileLifecycleState.CLEANUP_PENDING,
-            RuntimeProfileLifecycleState.DEPROVISIONED,
-            RuntimeProfileLifecycleState.REPAIR_REQUIRED,
-        }:
-            raise RuntimeRepairRequiredError(
-                "profile lifecycle has fenced provisioning"
+
+        @transaction.atomic
+        def accept_once() -> ProfileReconciliationReceipt:
+            workspace = Workspace.objects.select_for_update().get(
+                pk=context.workspace_id
             )
-        if profile.hermes_profile_key_version != 1:
-            raise RuntimeRepairRequiredError(
-                "legacy Hermes profile key requires repair"
+            _check_context_generation(workspace, context)
+            _require_ready_workspace(workspace)
+            profile = (
+                RuntimeProfile.objects.select_for_update()
+                .filter(pk=profile_uuid, workspace_id=workspace.id)
+                .first()
             )
-        if profile.lifecycle_epoch != lifecycle_epoch:
-            raise RuntimeFencedError("profile lifecycle operation is stale")
-        if profile.materialization_operation_id is not None:
-            if (
-                profile.materialization_operation_id != operation_uuid
-                or profile.materialization_request_digest != request_digest
-            ):
-                raise RuntimeIdempotencyConflictError(
-                    "materialization operation conflicts with stored receipt"
+            if profile is None:
+                raise RuntimeValidationError("profile is not in this workspace")
+            if profile.lifecycle_state in {
+                RuntimeProfileLifecycleState.CLEANUP_PENDING,
+                RuntimeProfileLifecycleState.DEPROVISIONED,
+                RuntimeProfileLifecycleState.REPAIR_REQUIRED,
+            }:
+                raise RuntimeRepairRequiredError(
+                    "profile lifecycle has fenced provisioning"
                 )
-            return _materialization_receipt(profile)
-        if profile.seed_fingerprint != seed_fingerprint:
-            raise RuntimeConflictError(
-                "materialization fingerprint does not match desired state"
+            if profile.hermes_profile_key_version != 1:
+                raise RuntimeRepairRequiredError(
+                    "legacy Hermes profile key requires repair"
+                )
+            if profile.lifecycle_epoch != lifecycle_epoch:
+                raise RuntimeFencedError("profile lifecycle operation is stale")
+            if profile.materialization_operation_id is not None:
+                if (
+                    profile.materialization_operation_id != operation_uuid
+                    or profile.materialization_request_digest != request_digest
+                ):
+                    raise RuntimeIdempotencyConflictError(
+                        "materialization operation conflicts with stored receipt"
+                    )
+                ensure_provisioning_hint_delivery(workspace, profile)
+                return _materialization_receipt(profile)
+            if profile.seed_fingerprint != seed_fingerprint:
+                raise RuntimeConflictError(
+                    "materialization fingerprint does not match desired state"
+                )
+            if materialized_generation != workspace.machine_generation:
+                raise RuntimeFencedError(
+                    "materialization belongs to a retired generation"
+                )
+            profile.lifecycle_state = RuntimeProfileLifecycleState.ACTIVE
+            profile.materialized_generation = materialized_generation
+            profile.materialization_operation_id = operation_uuid
+            profile.materialization_request_digest = request_digest
+            profile.materialization_receipt_id = uuid4()
+            profile.materialization_result_code = result_code
+            profile.save(
+                update_fields=[
+                    "lifecycle_state",
+                    "materialized_generation",
+                    "materialization_operation_id",
+                    "materialization_request_digest",
+                    "materialization_receipt_id",
+                    "materialization_result_code",
+                    "updated_at",
+                ]
             )
-        if materialized_generation != workspace.machine_generation:
-            raise RuntimeFencedError("materialization belongs to a retired generation")
-        profile.lifecycle_state = RuntimeProfileLifecycleState.ACTIVE
-        profile.materialized_generation = materialized_generation
-        profile.materialization_operation_id = operation_uuid
-        profile.materialization_request_digest = request_digest
-        profile.materialization_receipt_id = uuid4()
-        profile.materialization_result_code = result_code
-        profile.save(
-            update_fields=[
-                "lifecycle_state",
-                "materialized_generation",
-                "materialization_operation_id",
-                "materialization_request_digest",
-                "materialization_receipt_id",
-                "materialization_result_code",
-                "updated_at",
-            ]
-        )
-        return _materialization_receipt(profile)
+            ensure_provisioning_hint_delivery(workspace, profile)
+            return _materialization_receipt(profile)
 
-    return run_with_sqlite_lock_retry(accept_once)
+        receipt = run_with_sqlite_lock_retry(accept_once)
+    except BaseException as error:
+        _emit_profile_timing(
+            "runtime.operation.failed",
+            operation="runtime.profile_materialization_receipt",
+            workspace_id=workspace_id,
+            profile_id=profile_uuid,
+            correlation_id=operation_uuid,
+            duration_ms=(time.monotonic() - started_at) * 1000,
+            outcome="error",
+            error_type=type(error).__name__,
+            error_code=getattr(error, "code", None),
+        )
+        raise
+
+    def emit_committed() -> None:
+        _emit_profile_timing(
+            "runtime.operation.succeeded",
+            operation="runtime.profile_materialization_receipt",
+            workspace_id=workspace_id,
+            profile_id=receipt.profile_id,
+            request_id=receipt.receipt_id,
+            correlation_id=operation_uuid,
+            duration_ms=(time.monotonic() - started_at) * 1000,
+            outcome="committed",
+            reason_code=receipt.result_code,
+            generation=receipt.materialized_generation,
+        )
+
+    transaction.on_commit(emit_committed)
+    return receipt
 
 
 def request_profile_cleanup(
@@ -429,6 +504,7 @@ def request_profile_cleanup(
                 "updated_at",
             ]
         )
+        advance_workspace_activity(workspace)
         return _cleanup_receipt(profile, active_lease_count=len(active_leases))
 
     return run_with_sqlite_lock_retry(request_once)
@@ -444,6 +520,12 @@ def accept_cleanup_receipt(
     result_code: str,
     deleted: bool,
     active_lease_count: int,
+    attempt_id: UUID | None = None,
+    machine_generation: int | None = None,
+    runtime_start_epoch: int | None = None,
+    runtime_boot_id: UUID | None = None,
+    hermes_instance_id: UUID | None = None,
+    quiescence: Mapping[str, Any] | None = None,
 ) -> ProfileReconciliationReceipt:
     """Apply a runtime cleanup observation or durable repair result."""
 
@@ -489,6 +571,43 @@ def accept_cleanup_receipt(
             raise RuntimeIdempotencyConflictError(
                 "cleanup receipt does not match the request"
             )
+        if profile.cleanup_requires_quiescence:
+            if (
+                profile.cleanup_attempt_id != attempt_id
+                or profile.lifecycle_epoch != lifecycle_epoch
+            ):
+                raise RuntimeFencedError("cleanup attempt is stale")
+            if (
+                profile.cleanup_expires_at is None
+                or timezone.now() >= profile.cleanup_expires_at
+            ):
+                raise RuntimeFencedError("cleanup attempt has expired")
+            if deleted:
+                if (
+                    machine_generation != workspace.machine_generation
+                    or runtime_start_epoch != workspace.runtime_start_epoch
+                    or runtime_boot_id is None
+                    or runtime_boot_id != workspace.ready_boot_id
+                    or workspace.ready_generation != machine_generation
+                    or workspace.ready_start_epoch != runtime_start_epoch
+                    or not isinstance(hermes_instance_id, UUID)
+                ):
+                    raise RuntimeFencedError("cleanup proof belongs to a stale runtime")
+                if (
+                    not isinstance(quiescence, Mapping)
+                    or quiescence.get("state") != "quiesced"
+                    or quiescence.get("safe_error_code") != ""
+                    or any(
+                        type(quiescence.get(key)) is not int or quiescence[key] != 0
+                        for key in (
+                            "active_runs",
+                            "active_profile_io",
+                            "open_profile_stores",
+                            "owned_children",
+                        )
+                    )
+                ):
+                    raise RuntimeConflictError("profile resource closure is unverified")
         if profile.cleanup_receipt_id is not None:
             if profile.cleanup_result_code != result_code:
                 raise RuntimeIdempotencyConflictError(
@@ -535,6 +654,7 @@ def accept_cleanup_receipt(
                     "updated_at",
                 ]
             )
+            advance_workspace_activity(workspace)
             return _cleanup_receipt(profile, deleted=True)
         if result_code == "repair_required" or expired:
             _fence_profile_leases(profile.id)
@@ -553,6 +673,7 @@ def accept_cleanup_receipt(
                     "updated_at",
                 ]
             )
+            advance_workspace_activity(workspace)
             return _cleanup_receipt(profile, deleted=False, active_lease_count=0)
         profile.cleanup_retry_after = min(
             profile.cleanup_expires_at
@@ -592,6 +713,14 @@ def expire_profile_cleanups(
 
     @transaction.atomic
     def expire_once(profile_id: UUID) -> ProfileReconciliationReceipt | None:
+        profile_workspace = (
+            RuntimeProfile.objects.filter(pk=profile_id)
+            .values_list("workspace_id", flat=True)
+            .first()
+        )
+        if profile_workspace is None:
+            return None
+        workspace = Workspace.objects.select_for_update().get(pk=profile_workspace)
         profile = RuntimeProfile.objects.select_for_update().get(pk=profile_id)
         if (
             profile.lifecycle_state != RuntimeProfileLifecycleState.CLEANUP_PENDING
@@ -615,6 +744,7 @@ def expire_profile_cleanups(
                 "updated_at",
             ]
         )
+        advance_workspace_activity(workspace)
         return _cleanup_receipt(profile, deleted=False, active_lease_count=0)
 
     for profile_id in profile_ids:
@@ -662,6 +792,7 @@ def _normalize_seed(seed: ProfileSeed | Mapping[str, Any]) -> dict[str, Any]:
             "memory_tool_allowlist": list(seed.memory_tool_allowlist),
             "memory_profile_isolation": seed.memory_profile_isolation,
             "memory_sync_roles": list(seed.memory_sync_roles),
+            "compression_threshold_tokens": seed.compression_threshold_tokens,
         }
     elif isinstance(seed, Mapping):
         values = dict(seed)
@@ -682,41 +813,9 @@ def _normalize_seed(seed: ProfileSeed | Mapping[str, Any]) -> dict[str, Any]:
     base_url = values.get("base_url")
     if base_url is not None:
         base_url = _seed_text(base_url, "base_url", 512)
-    raw_refs = values.get("credential_refs", {})
-    if type(raw_refs) is not dict:
-        raise RuntimeValidationError("credential_refs must be an object")
-    if len(raw_refs) > 32:
-        raise RuntimeValidationError("credential_refs exceed the bounded size")
-    credential_refs: dict[str, str] = {}
-    for name, reference in raw_refs.items():
-        if (
-            type(name) is not str
-            or not (
-                re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name)
-                or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name)
-            )
-            or not isinstance(reference, str)
-            or not _OPAQUE_REFERENCE.fullmatch(reference)
-        ):
-            raise RuntimeValidationError(
-                "credential_refs must contain opaque references"
-            )
-        lowered = reference.lower()
-        if lowered.startswith(("bearer ", "token=", "key=", "sk-", "api_key=")):
-            raise RuntimeValidationError(
-                "credential_refs must not contain credential values"
-            )
-        normalized_name = name.upper().replace("-", "_")
-        if normalized_name == "API_SERVER_KEY":
-            raise RuntimeValidationError(
-                "credential_refs must not reserve the runtime API key"
-            )
-        if normalized_name in credential_refs:
-            raise RuntimeValidationError(
-                "credential_refs contain colliding environment names"
-            )
-        credential_refs[normalized_name] = reference
-    credential_refs = dict(sorted(credential_refs.items()))
+    credential_refs = _normalize_ref_entries(
+        values.get("credential_refs", {}), "credential_refs"
+    )
     memory_provider = values.get("memory_provider", DEFAULT_MEMORY_PROVIDER)
     if memory_provider != DEFAULT_MEMORY_PROVIDER:
         raise RuntimeValidationError("unsupported memory provider")
@@ -729,11 +828,12 @@ def _normalize_seed(seed: ProfileSeed | Mapping[str, Any]) -> dict[str, Any]:
     if memory_policy_version != DEFAULT_MEMORY_POLICY_VERSION:
         raise RuntimeValidationError("unsupported memory policy version")
     memory_tool_allowlist = _memory_string_list(
-        values.get("memory_tool_allowlist", []), "memory_tool_allowlist"
+        values.get("memory_tool_allowlist", DEFAULT_MEMORY_TOOL_ALLOWLIST),
+        "memory_tool_allowlist",
     )
     if not set(memory_tool_allowlist).issubset(MEMORY_TOOLS):
         raise RuntimeValidationError("unsupported memory tool allowlist")
-    if memory_mode == DEFAULT_MEMORY_MODE and memory_tool_allowlist:
+    if memory_mode == CONTEXT_ONLY_MEMORY_MODE and memory_tool_allowlist:
         raise RuntimeValidationError("context-only memory cannot advertise tools")
     if values.get("memory_profile_isolation", True) is not True:
         raise RuntimeValidationError("memory profile isolation is required")
@@ -742,6 +842,11 @@ def _normalize_seed(seed: ProfileSeed | Mapping[str, Any]) -> dict[str, Any]:
     )
     if memory_sync_roles:
         raise RuntimeValidationError("memory sync roles are disabled")
+    compression_threshold_tokens = values.get(
+        "compression_threshold_tokens", DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    )
+    if compression_threshold_tokens != DEFAULT_COMPRESSION_THRESHOLD_TOKENS:
+        raise RuntimeValidationError("unsupported compression threshold")
     payload = {
         "version": version,
         "personality": personality,
@@ -757,6 +862,7 @@ def _normalize_seed(seed: ProfileSeed | Mapping[str, Any]) -> dict[str, Any]:
         "memory_tool_allowlist": list(memory_tool_allowlist),
         "memory_profile_isolation": True,
         "memory_sync_roles": [],
+        "compression_threshold_tokens": compression_threshold_tokens,
     }
     if len(str(payload).encode("utf-8")) > MAX_PROFILE_SEED_BYTES:
         raise RuntimeValidationError("profile seed exceeds the bounded size")
@@ -792,6 +898,9 @@ def _seed_fingerprint(
             "tools": payload["memory_tool_allowlist"],
             "profile_isolation": payload["memory_profile_isolation"],
             "sync_roles": payload["memory_sync_roles"],
+        },
+        "compression": {
+            "threshold_tokens": payload["compression_threshold_tokens"],
         },
     }
     encoded = json.dumps(
@@ -843,6 +952,8 @@ def _desired_state(profile: RuntimeProfile) -> ProfileDesiredState:
         cleanup_receipt_id=profile.cleanup_receipt_id,
         cleanup_result_code=profile.cleanup_result_code,
         cleanup_expires_at=profile.cleanup_expires_at,
+        cleanup_requires_quiescence=profile.cleanup_requires_quiescence,
+        cleanup_attempt_id=profile.cleanup_attempt_id,
     )
 
 
@@ -860,6 +971,197 @@ def _assert_profile_identity(
         raise RuntimeConflictError("profile identity is immutable")
     if profile.hermes_profile_key_version == 0:
         raise RuntimeRepairRequiredError("legacy Hermes profile key requires repair")
+
+
+def _normalize_env_name(name: Any, field: str) -> str:
+    if type(name) is not str or not (
+        re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name)
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", name)
+    ):
+        raise RuntimeValidationError(f"{field} must contain opaque references")
+    normalized = name.upper().replace("-", "_")
+    if normalized == "API_SERVER_KEY":
+        raise RuntimeValidationError(f"{field} must not reserve the runtime API key")
+    return normalized
+
+
+def _normalize_ref_entries(raw: Any, field: str) -> dict[str, str]:
+    if type(raw) is not dict:
+        raise RuntimeValidationError(f"{field} must be an object")
+    if len(raw) > 32:
+        raise RuntimeValidationError(f"{field} exceed the bounded size")
+    refs: dict[str, str] = {}
+    for name, reference in raw.items():
+        if not isinstance(reference, str) or not _OPAQUE_REFERENCE.fullmatch(reference):
+            raise RuntimeValidationError(f"{field} must contain opaque references")
+        lowered = reference.lower()
+        if lowered.startswith(("bearer ", "token=", "key=", "sk-", "api_key=")):
+            raise RuntimeValidationError(f"{field} must not contain credential values")
+        normalized_name = _normalize_env_name(name, field)
+        if normalized_name in refs:
+            raise RuntimeValidationError(f"{field} contain colliding environment names")
+        refs[normalized_name] = reference
+    return dict(sorted(refs.items()))
+
+
+def normalize_model_binding(raw: Any) -> dict[str, Any]:
+    """Validate a mutable per-profile model binding (outside the seed)."""
+    if not isinstance(raw, Mapping):
+        raise RuntimeValidationError("model binding must be an object")
+    binding: dict[str, Any] = {}
+    provider = raw.get("provider")
+    if provider is not None:
+        # Bound matches the Hermes session-lock provider limit (80 chars);
+        # longer values would fail closed mid-turn instead of at set time.
+        binding["provider"] = _seed_text(provider, "binding provider", 80)
+    model = raw.get("model")
+    if model is not None:
+        binding["model"] = _seed_text(model, "binding model", 255)
+    reasoning = raw.get("reasoning")
+    if reasoning is not None:
+        # Matches the Hermes managed reasoning set; anything else would
+        # fail the turn at request-build time instead of at set time.
+        if reasoning not in ("high", "xhigh"):
+            raise RuntimeValidationError("binding reasoning must be high or xhigh")
+        binding["reasoning"] = reasoning
+    key_refs = raw.get("key_refs", {})
+    binding["key_refs"] = _normalize_ref_entries(key_refs, "binding key_refs")
+    unknown = set(raw) - {"provider", "model", "reasoning", "key_refs"}
+    if unknown:
+        raise RuntimeValidationError("model binding contains unknown fields")
+    return binding
+
+
+@dataclass(frozen=True, slots=True)
+class ModelBindingReceipt:
+    profile_id: UUID
+    generation: int
+    binding: Mapping[str, Any]
+
+
+def _binding_profile(profile_id: UUID | str) -> RuntimeProfile:
+    profile_uuid = _uuid(profile_id, "profile_id")
+    try:
+        profile = RuntimeProfile.objects.select_for_update().get(pk=profile_uuid)
+    except RuntimeProfile.DoesNotExist:
+        raise RuntimeValidationError("profile does not exist") from None
+    if profile.lifecycle_state not in ("pending", "active"):
+        raise RuntimeValidationError("profile binding is not mutable in its state")
+    return profile
+
+
+def _store_binding(
+    profile: RuntimeProfile, binding: dict[str, Any]
+) -> ModelBindingReceipt:
+    stored = profile.model_override if isinstance(profile.model_override, dict) else {}
+    generation = int(stored.get("generation", 0) or 0) + 1
+    profile.model_override = {"generation": generation, "binding": binding}
+    profile.save(update_fields=["model_override", "updated_at"])
+    return ModelBindingReceipt(
+        profile_id=profile.id, generation=generation, binding=binding
+    )
+
+
+def set_model_binding(profile_id: UUID | str, binding: Any) -> ModelBindingReceipt:
+    with transaction.atomic():
+        profile = _binding_profile(profile_id)
+        normalized = normalize_model_binding(binding)
+        if isinstance(binding, Mapping) and "key_refs" not in binding:
+            stored = (
+                profile.model_override
+                if isinstance(profile.model_override, dict)
+                else {}
+            )
+            current = (
+                stored.get("binding")
+                if isinstance(stored.get("binding"), dict)
+                else {}
+            )
+            installed = current.get("key_refs")
+            if isinstance(installed, dict) and installed:
+                normalized["key_refs"] = dict(installed)
+        return _store_binding(profile, normalized)
+
+
+def clear_model_binding(profile_id: UUID | str) -> ModelBindingReceipt:
+    with transaction.atomic():
+        profile = _binding_profile(profile_id)
+        return _store_binding(profile, {"key_refs": {}})
+
+
+def install_provider_key(
+    profile_id: UUID | str,
+    env_name: Any,
+    reference: Any,
+) -> ModelBindingReceipt:
+    with transaction.atomic():
+        profile = _binding_profile(profile_id)
+        stored = (
+            profile.model_override if isinstance(profile.model_override, dict) else {}
+        )
+        current = (
+            stored.get("binding") if isinstance(stored.get("binding"), dict) else {}
+        )
+        merged = dict(current.get("key_refs", {}))
+        merged.update(_normalize_ref_entries({env_name: reference}, "binding key_refs"))
+        # The runtime applies seed refs merged with binding refs, so the
+        # bound applies to the union — otherwise install could persist a
+        # generation apply_binding rejects and every later turn misses repair.
+        seed_refs = (
+            profile.seed_payload.get("credential_refs")
+            if isinstance(profile.seed_payload, dict)
+            else {}
+        )
+        if not isinstance(seed_refs, dict):
+            seed_refs = {}
+        if len(set(seed_refs) | set(merged)) > MAX_BINDING_KEY_REFS:
+            raise RuntimeValidationError(
+                "binding key_refs exceed the bounded size with seed references"
+            )
+        return _store_binding(profile, {**current, "key_refs": merged})
+
+
+def remove_provider_key(profile_id: UUID | str, env_name: Any) -> ModelBindingReceipt:
+    with transaction.atomic():
+        profile = _binding_profile(profile_id)
+        stored = (
+            profile.model_override if isinstance(profile.model_override, dict) else {}
+        )
+        current = (
+            stored.get("binding") if isinstance(stored.get("binding"), dict) else {}
+        )
+        merged = dict(current.get("key_refs", {}))
+        normalized = _normalize_env_name(env_name, "binding key_refs")
+        merged.pop(normalized, None)
+        return _store_binding(profile, {**current, "key_refs": merged})
+
+
+def effective_model_selection(profile: RuntimeProfile) -> dict[str, Any]:
+    """Resolve binding-over-seed model selection for one claim or turn.
+
+    Key refs merge seed-first so a live ``.env`` rewrite never drops the
+    deployment (org) keys: binding entries win on collision, and clearing
+    the binding restores exactly the seed set.
+    """
+    seed = profile.seed_payload if isinstance(profile.seed_payload, dict) else {}
+    stored = profile.model_override if isinstance(profile.model_override, dict) else {}
+    binding = stored.get("binding") if isinstance(stored.get("binding"), dict) else {}
+    provider = binding.get("provider") or seed.get("provider") or ""
+    model = binding.get("model") or seed.get("model") or ""
+    options: dict[str, Any] = {}
+    if binding.get("reasoning"):
+        options["reasoning"] = binding["reasoning"]
+    seed_refs = seed.get("credential_refs")
+    merged: dict[str, str] = dict(seed_refs) if isinstance(seed_refs, dict) else {}
+    binding_refs = binding.get("key_refs")
+    if isinstance(binding_refs, dict):
+        merged.update(binding_refs)
+    return {
+        "provider": provider,
+        "model": model,
+        "options": options,
+        "key_refs": merged,
+    }
 
 
 def _assert_seed_compatible(
@@ -912,29 +1214,88 @@ def _cleanup_receipt(
 
 
 def _fence_profile_leases(profile_id: UUID) -> None:
-    leases = list(
-        Lease.objects.select_for_update()
-        .select_related("attempt__execution")
-        .filter(
+    lease_refs = list(
+        Lease.objects.filter(
             profile_id=profile_id,
             state__in=(LeaseState.ACTIVE, LeaseState.STOPPING),
-        )
+        ).values_list("id", "attempt_id")
     )
-    for lease in leases:
-        lease.state = LeaseState.FENCED
-        lease.save(update_fields=["state", "updated_at"])
-        attempt = lease.attempt
-        if attempt.status in {
+    observed_at = timezone.now()
+    from .approvals import cancel_live_approval_requests
+    from .routines import _record_terminal_failure_result
+
+    for lease_id, attempt_id in lease_refs:
+        routine = (
+            RoutineExecution.objects.select_for_update()
+            .filter(profile_id=profile_id, current_attempt_id=attempt_id)
+            .first()
+        )
+        routine_was_terminal = routine is not None and routine.status in {
+            RoutineRunStatus.SUCCEEDED,
+            RoutineRunStatus.FAILED,
+            RoutineRunStatus.CANCELLED,
+            RoutineRunStatus.EXPIRED,
+        }
+        routine_result_event = None
+        if routine is not None and not routine_was_terminal:
+            routine_result_event = _record_terminal_failure_result(
+                routine,
+                text="Routine profile was fenced before completion.",
+                observed_at=observed_at,
+            )
+        attempt = (
+            Attempt.objects.select_for_update()
+            .select_related("execution")
+            .filter(pk=attempt_id, execution__profile_id=profile_id)
+            .first()
+        )
+        if attempt is None:
+            continue
+        lease = (
+            Lease.objects.select_for_update()
+            .filter(pk=lease_id, profile_id=profile_id, attempt_id=attempt.id)
+            .first()
+        )
+        if lease is None:
+            continue
+        unresolved = attempt.status in {
             AttemptStatus.QUEUED,
             AttemptStatus.LEASED,
             AttemptStatus.RUNNING,
-        }:
+        }
+        if unresolved or routine_result_event is not None:
             attempt.status = AttemptStatus.UNKNOWN
             attempt.save(update_fields=["status", "updated_at"])
         execution = attempt.execution
         if execution.status == ExecutionStatus.RUNNING:
             execution.status = ExecutionStatus.FAILED
             execution.save(update_fields=["status", "updated_at"])
+        if routine is not None and not routine_was_terminal:
+            routine.status = RoutineRunStatus.FAILED
+            routine.terminal_receipt = {
+                **(routine.terminal_receipt or {}),
+                "code": "PROFILE_FENCED",
+                **(
+                    {"result_event_id": str(routine_result_event.event_id)}
+                    if routine_result_event is not None
+                    else {}
+                ),
+            }
+            routine.save(update_fields=["status", "terminal_receipt", "updated_at"])
+        cancel_live_approval_requests(attempt, now=observed_at)
+        if routine is not None:
+            current = (
+                RoutineLeaseAcquisition.objects.select_for_update()
+                .filter(lease_id=lease.id, current=True)
+                .first()
+            )
+            if current is not None:
+                current.current = False
+                current.retired_at = observed_at
+                current.save(update_fields=["current", "retired_at"])
+        lease.current_acquisition = None
+        lease.state = LeaseState.FENCED
+        lease.save(update_fields=["current_acquisition", "state", "updated_at"])
 
 
 def _require_context(context: RuntimeContext) -> None:
@@ -1018,6 +1379,22 @@ def _memory_string_list(value: Any, name: str) -> tuple[str, ...]:
     if len(set(normalized)) != len(normalized):
         raise RuntimeValidationError(f"{name} contains duplicate values")
     return normalized
+
+
+def _emit_profile_timing(event_name: str, **fields: object) -> None:
+    """Emit a bounded profile event without changing receipt semantics."""
+
+    emit_timing_event(
+        event_name,
+        emitter=emit_event,
+        identifier_names=(
+            "workspace_id",
+            "profile_id",
+            "request_id",
+            "correlation_id",
+        ),
+        **fields,
+    )
 
 
 __all__ = [

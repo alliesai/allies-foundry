@@ -28,6 +28,10 @@ FIXTURE_PATH = (
     / "contracts"
     / "foundry-profile-provisioning-v1.json"
 )
+MULTILINE_JOB = (
+    "I want you to teach my German \n"
+    "I am currently at the A1 level and just started at A2"
+)
 
 
 @pytest.fixture
@@ -233,7 +237,12 @@ def test_fixture_request_creates_pending_profile_without_private_receipt_fields(
     assert receipt["operation_id"] == contract["request"]["operation_id"]
     assert receipt["request_fingerprint"] == contract["request"]["request_fingerprint"]
     assert receipt["status"] == "pending"
-    assert receipt["evidence_digest"] == contract["receipt"]["evidence_digest"]
+    # The historical receipt fixture predates the managed memory-tool
+    # default, the compression threshold default, the platform-layer soul,
+    # and the OpenRouter gpt-6-luna default route.
+    assert receipt["evidence_digest"] == (
+        "3b7851974976b9e2d0ca6d8c498eedaddd468b7be32cec556935ea641f62f7ad"
+    )
     assert re.fullmatch(r"[0-9a-f]{64}", receipt["evidence_digest"])
     assert "profile_id" not in receipt
     assert "hermes_profile_key" not in receipt
@@ -241,16 +250,16 @@ def test_fixture_request_creates_pending_profile_without_private_receipt_fields(
     assert "credentials" not in receipt
 
     profile = RuntimeProfile.objects.get(ally_ref=contract["request"]["ally_ref"])
+    assert receipt["evidence_digest"] == profile.seed_fingerprint
     assert profile.lifecycle_state == RuntimeProfileLifecycleState.PENDING
     soul = profile.seed_payload["personality"]
     assert contract["request"]["name"] in soul
     assert contract["request"]["job"] in soul
     assert contract["request"]["personality"] in soul
-    assert "Hermes is your private runtime" in soul
     assert "## Your personality" in soul
     assert "This personality is not decoration" in soul
-    assert "Respond to the moment you are actually in" in soul
-    assert "Be recognizable" in soul
+    assert "Be recognisable" in soul
+    assert "Hermes" not in soul
     instruction = profile.seed_payload["first_chat_instruction"]
     assert "start of a working relationship" in instruction
     assert "Do not repeat profile fields" in instruction
@@ -265,7 +274,6 @@ def test_fixture_request_creates_pending_profile_without_private_receipt_fields(
         ("job", "Study\tpartner"),
         ("job", "Study\x1bpartner"),
         ("job", "Study\u2028partner"),
-        ("personality", "Calm\nInjected instruction"),
         ("personality", "Calm\u2029Injected instruction"),
     ],
 )
@@ -300,6 +308,44 @@ def test_prompt_interpolation_fields_accept_normal_unicode(
     soul = profile.seed_payload["personality"]
     assert payload["name"] in soul
     assert payload["job"] in soul
+
+
+def test_multiline_job_and_personality_are_rendered_and_replayed(
+    workspace, contract, service_token
+):
+    payload = dict(contract["request"])
+    payload.update(
+        {
+            "job": MULTILINE_JOB,
+            "personality": "  Calm, curious, and specific.\n\nKeep the details.  ",
+        }
+    )
+
+    first = post_profile(payload)
+
+    assert first.status_code == 200, first.content
+    profile = RuntimeProfile.objects.get(workspace=workspace)
+    assert payload["job"] in profile.seed_payload["personality"]
+    assert payload["personality"] in profile.seed_payload["personality"]
+    assert profile.seed_fingerprint == first.json()["evidence_digest"]
+
+    replay = post_profile(payload)
+
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert RuntimeProfile.objects.filter(workspace=workspace).count() == 1
+    profile.refresh_from_db()
+    assert profile.seed_fingerprint == first.json()["evidence_digest"]
+
+    changed = dict(payload)
+    changed["job"] = MULTILINE_JOB.replace("German", "Spanish")
+    conflict = post_profile(changed)
+
+    assert conflict.status_code == 409
+    assert RuntimeProfile.objects.filter(workspace=workspace).count() == 1
+    profile.refresh_from_db()
+    assert payload["job"] in profile.seed_payload["personality"]
+    assert changed["job"] not in profile.seed_payload["personality"]
 
 
 def test_provisioning_seed_uses_deployment_settings(

@@ -25,7 +25,10 @@ DEFAULT_HERMES_IMAGE = (
     "b6f18532e2c082ef6686c659fc222427e41fde3eed08aa058411f0ea5ab705ca"
 )
 PINNED_HERMES_SOURCE_COMMIT = "36cb5ae5530a75def7df3195e49b7a4aa2add482"
-MAX_TIMEOUT_SECONDS = 180.0
+MAX_TIMEOUT_SECONDS = 14400.0
+DEFAULT_HERMES_REQUEST_TIMEOUT = 30.0
+DEFAULT_HERMES_STREAM_TIMEOUT = 30.0
+DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS = 300.0
 MAX_PROOF_SLOTS = 32
 MAX_WIDE_EVENT_BYTES = 16 * 1024
 MAX_WIDE_EVENT_QUEUE_SIZE = 4096
@@ -167,6 +170,19 @@ def _float_setting(env: Mapping[str, object], name: str, default: float) -> floa
     return result
 
 
+def _bounded_float_setting(
+    env: Mapping[str, object], name: str, default: float, *, maximum: float
+) -> float:
+    raw = env.get(name, default)
+    try:
+        result = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(f"{name} must be a number") from exc
+    if not 0 < result <= maximum:
+        raise SettingsError(f"{name} must be greater than 0 and at most {maximum:g}s")
+    return result
+
+
 def _int_setting(env: Mapping[str, object], name: str, default: int) -> int:
     raw = env.get(name, default)
     try:
@@ -252,8 +268,9 @@ class RuntimeSettings:
     credential_ref: CredentialReference = field(
         default_factory=lambda: CredentialReference("ref://hermes/api")
     )
-    request_timeout: float = 5.0
-    stream_timeout: float = 15.0
+    request_timeout: float = DEFAULT_HERMES_REQUEST_TIMEOUT
+    stream_timeout: float = DEFAULT_HERMES_STREAM_TIMEOUT
+    stream_idle_timeout: float = DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS
     proof_slots: int = 2
     volume_root: str = DEFAULT_VOLUME_ROOT
     marker_path: str = DEFAULT_MARKER_PATH
@@ -261,6 +278,11 @@ class RuntimeSettings:
     runtime_image: str | None = None
     source_commit: str = PINNED_HERMES_SOURCE_COMMIT
     wide_events: WideEventSettings = field(default_factory=WideEventSettings)
+    activity_wait_enabled: bool = True
+    activity_wait_seconds: float = 5.0
+    rich_approvals_enabled: bool = True
+    file_input_enabled: bool = True
+    file_publication_enabled: bool = True
 
 
 def load_settings(env: Mapping[str, object] | None = None) -> RuntimeSettings:
@@ -313,8 +335,17 @@ def load_settings(env: Mapping[str, object] | None = None) -> RuntimeSettings:
         foundry_origin=foundry_origin,
         foundry_credential_ref=foundry_ref,
         credential_ref=ref,
-        request_timeout=_float_setting(values, "HERMES_REQUEST_TIMEOUT", 5.0),
-        stream_timeout=_float_setting(values, "HERMES_STREAM_TIMEOUT", 15.0),
+        request_timeout=_float_setting(
+            values, "HERMES_REQUEST_TIMEOUT", DEFAULT_HERMES_REQUEST_TIMEOUT
+        ),
+        stream_timeout=_float_setting(
+            values, "HERMES_STREAM_TIMEOUT", DEFAULT_HERMES_STREAM_TIMEOUT
+        ),
+        stream_idle_timeout=_float_setting(
+            values,
+            "HERMES_STREAM_IDLE_TIMEOUT",
+            DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS,
+        ),
         proof_slots=_int_setting(values, "PROOF_SLOTS", 2),
         volume_root=str(root),
         marker_path=marker,
@@ -322,6 +353,24 @@ def load_settings(env: Mapping[str, object] | None = None) -> RuntimeSettings:
         runtime_image=runtime_image,
         source_commit=source_commit,
         wide_events=wide_events,
+        activity_wait_enabled=_observability_bool(
+            values, "ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED", True
+        ),
+        activity_wait_seconds=_bounded_float_setting(
+            values,
+            "ALLIES_RUNTIME_ACTIVITY_WAIT_SECONDS",
+            5.0,
+            maximum=5.0,
+        ),
+        rich_approvals_enabled=_observability_bool(
+            values, "ALLIES_RICH_APPROVALS_ENABLED", True
+        ),
+        file_input_enabled=_observability_bool(
+            values, "ALLIES_RUNTIME_FILE_INPUT_ENABLED", True
+        ),
+        file_publication_enabled=_observability_bool(
+            values, "ALLIES_RUNTIME_FILE_PUBLICATION_ENABLED", True
+        ),
     )
 
 
@@ -329,6 +378,7 @@ __all__ = [
     "DEFAULT_FOUNDRY_CREDENTIAL_REF",
     "DEFAULT_FOUNDRY_ORIGIN",
     "DEFAULT_HERMES_ORIGIN",
+    "DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS",
     "CredentialReference",
     "RuntimeSettings",
     "SettingsError",

@@ -10,6 +10,7 @@ durably acknowledged.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import json
 import random
@@ -17,7 +18,8 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -28,28 +30,50 @@ from .errors import (
     HermesHistoryMismatch,
     HermesMalformedResponse,
     HermesTimeout,
+    IncomingFileError,
 )
+from .files import stage_incoming_files
 from .hermes import (
     HermesBootstrap,
     HermesEvent,
     stable_session_identifiers,
+    validate_reasoning_effort,
     validate_stream_message,
 )
-from .observability import build_event, emit_runtime_event
+from .observability import (
+    build_event,
+    emit_runtime_event,
+    observe_runtime_operation,
+)
+from .profile_store import ProfileStoreError
+from .quiescence import ProfileResourceRegistry, QuiescenceError
 
 MAX_CLAIM_SLOTS = 8
 # Sequence 100001 is reserved for the single terminal event emitted when the
 # runtime exhausts its ordinary event budget.
 MAX_RUNTIME_EVENT_SEQUENCE = 100000
 MAX_TERMINAL_SEQUENCE = 100001
+MAX_ROUTINE_REFERENCE_COUNT = 32
+MAX_ROUTINE_TEXT_BYTES = 16 * 1024
+MAX_ROUTINE_EVENT_BYTES = 64 * 1024
+# Reserve space for the fixed routine envelope and execution snapshots when
+# preflighting the variable text/reference portion in the runtime image.
+MAX_ROUTINE_RESULT_FIXED_BYTES = 4 * 1024
 LEASE_SECONDS = 60.0
 DEFAULT_RENEW_INTERVAL = 20.0
 DEFAULT_STOP_SAFETY_MARGIN = 5.0
 DEFAULT_PROFILE_RECONCILE_INTERVAL = 5.0
+DEFAULT_PUBLICATION_RECOVERY_INTERVAL = 30.0
 MAX_PROFILE_RECONCILIATION_RETRY_DELAY = 5.0
 MIN_IDLE_BACKOFF_SECONDS = 1.0
 MAX_IDLE_BACKOFF_SECONDS = 10.0
 IDLE_BACKOFF_JITTER_RATIO = 0.25
+POST_MATERIALIZATION_FAST_POLLS = 8
+APPROVAL_POLL_INTERVAL = 0.5
+APPROVAL_ACKNOWLEDGEMENT_SECONDS = 30.0
+MAX_APPROVAL_LIFETIME_SECONDS = 300.0
+MAX_APPROVAL_LABEL_CHARS = 120
+MAX_APPROVAL_PREVIEW_BYTES = 16 * 1024
 
 
 def _jittered_idle_delay(base: float, minimum: float) -> float:
@@ -58,6 +82,74 @@ def _jittered_idle_delay(base: float, minimum: float) -> float:
         minimum,
         bounded * (1 - random.random() * IDLE_BACKOFF_JITTER_RATIO),
     )
+
+
+def _approval_request_id(attempt_id: str, run_id: str, hermes_id: str) -> str:
+    return str(
+        uuid5(
+            NAMESPACE_URL,
+            f"allies-foundry:approval:v1:{attempt_id}:{run_id}:{hermes_id}",
+        )
+    )
+
+
+def _approval_time(value: Any) -> float:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise HermesMalformedResponse("Hermes approval expiry was invalid") from exc
+    else:
+        raise HermesMalformedResponse("Hermes approval expiry was invalid")
+    if parsed.tzinfo is None:
+        raise HermesMalformedResponse("Hermes approval expiry was invalid")
+    return parsed.timestamp()
+
+
+def _routine_references(
+    value: Any,
+    *,
+    text: str | None = None,
+) -> list[dict[str, str]]:
+    if not isinstance(value, list) or len(value) > MAX_ROUTINE_REFERENCE_COUNT:
+        raise HermesMalformedResponse("Hermes routine references were malformed")
+    references: list[dict[str, str]] = []
+    for reference in value:
+        if not isinstance(reference, Mapping) or set(reference) != {"label", "url"}:
+            raise HermesMalformedResponse("Hermes routine references were malformed")
+        label = reference.get("label")
+        url = reference.get("url")
+        if (
+            not isinstance(label, str)
+            or not 1 <= len(label.encode("utf-8")) <= 255
+            or "\x00" in label
+            or not isinstance(url, str)
+            or not 1 <= len(url.encode("utf-8")) <= 2048
+            or "\x00" in url
+            or not url.startswith(("http://", "https://"))
+        ):
+            raise HermesMalformedResponse("Hermes routine references were malformed")
+        references.append({"label": label, "url": url})
+    if text is not None:
+        if not isinstance(text, str):
+            raise HermesMalformedResponse("Hermes routine result text was malformed")
+        variable_payload = json.dumps(
+            {"references": references, "text": text},
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if (
+            len(variable_payload) + MAX_ROUTINE_RESULT_FIXED_BYTES
+            > MAX_ROUTINE_EVENT_BYTES
+        ):
+            raise HermesMalformedResponse(
+                "Hermes routine result envelope was too large"
+            )
+    return references
 
 
 class _BootstrapResponseLost(HermesError):
@@ -71,7 +163,15 @@ class FoundryTransport(Protocol):
         path: str,
         *,
         headers: Mapping[str, str],
-        body: Mapping[str, Any] | None = None,
+        body: Mapping[str, Any] | bytes | None = None,
+    ) -> Any: ...
+
+    async def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: Mapping[str, str],
     ) -> Any: ...
 
 
@@ -181,6 +281,14 @@ class FoundryClaim:
     expires_at: datetime | str | None
     payload: Mapping[str, Any]
     claim_id: str
+    routine_id: str | None = None
+    reasoning_effort: str | None = None
+    command_id: str | None = None
+    routine_tool_token: str | None = None
+    provider: str = ""
+    model_options: dict = field(default_factory=dict)
+    binding_generation: int = 0
+    binding_key_refs: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:  # pragma: no cover - defensive redaction
         return (
@@ -222,6 +330,8 @@ class ProfileDesiredState:
     cleanup_result_code: str
     cleanup_expires_at: datetime | str | None
     active_lease_count: int = 0
+    cleanup_attempt_id: str | None = None
+    cleanup_requires_quiescence: bool = False
 
     def __repr__(self) -> str:  # pragma: no cover - defensive redaction
         return (
@@ -240,6 +350,14 @@ class RuntimeReconciliationSnapshot:
     machine_generation: int
     runtime_start_epoch: int | None
     profiles: tuple[ProfileDesiredState, ...]
+    activity_revision: int = 0
+    workspace_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityWaitReceipt:
+    revision: int
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +371,12 @@ class ProfileReceipt:
     result_code: str
     deleted: bool = False
     active_lease_count: int = 0
+    attempt_id: str | None = None
+    machine_generation: int | None = None
+    runtime_start_epoch: int | None = None
+    runtime_boot_id: str | None = None
+    hermes_instance_id: str | None = None
+    quiescence: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +410,16 @@ class TerminalReceipt:
 @dataclass(frozen=True, slots=True)
 class SessionReceipt:
     session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalStatus:
+    approval_request_id: str
+    status: str
+    decision: str | None
+    decided_at: datetime | str | None
+    acknowledgement_deadline_at: datetime | str | None
+    expires_at: datetime | str | None
 
 
 def deterministic_event_id(
@@ -329,12 +463,14 @@ class UrllibFoundryTransport:
         path: str,
         *,
         headers: Mapping[str, str],
-        body: Mapping[str, Any] | None = None,
+        body: Mapping[str, Any] | bytes | None = None,
     ) -> Any:
         payload = (
-            None
-            if body is None
+            body
+            if isinstance(body, bytes)
             else json.dumps(body, separators=(",", ":")).encode("utf-8")
+            if body is not None
+            else None
         )
 
         def send() -> Mapping[str, Any]:
@@ -343,7 +479,7 @@ class UrllibFoundryTransport:
                 data=payload,
                 method=method,
                 headers={**headers, "Content-Type": "application/json"}
-                if payload is not None
+                if body is not None and not isinstance(body, bytes)
                 else dict(headers),
             )
             try:
@@ -351,6 +487,30 @@ class UrllibFoundryTransport:
                     return {"status": response.status, "body": response.read(1_048_577)}
             except urllib.error.HTTPError as exc:
                 return {"status": exc.code, "body": exc.read(1_048_577)}
+
+        return await asyncio.to_thread(send)
+
+    async def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: Mapping[str, str],
+    ) -> Any:
+        """Open one bounded-read response without buffering its file body."""
+
+        def send() -> Mapping[str, Any]:
+            request = urllib.request.Request(
+                f"{self.base_url}{path}", method=method, headers=dict(headers)
+            )
+            try:
+                response = urllib.request.urlopen(request, timeout=self.timeout)
+                return {"status": response.status, "response": response}
+            except urllib.error.HTTPError as exc:
+                try:
+                    return {"status": exc.code, "body": exc.read(16_385)}
+                finally:
+                    exc.close()
 
         return await asyncio.to_thread(send)
 
@@ -459,6 +619,10 @@ def _profile_desired_state(value: Any, machine_generation: int) -> ProfileDesire
             cleanup_result_code=str(value.get("cleanup_result_code", "")),
             cleanup_expires_at=_parse_datetime(value.get("cleanup_expires_at")),
             active_lease_count=int(value.get("active_lease_count", 0)),
+            cleanup_attempt_id=_optional_text(value.get("cleanup_attempt_id")),
+            cleanup_requires_quiescence=_optional_bool(
+                value.get("cleanup_requires_quiescence", False)
+            ),
         )
     except (TypeError, ValueError):
         raise FoundryError(
@@ -494,8 +658,14 @@ def _profile_receipt(value: Mapping[str, Any] | None) -> ProfileReceipt:
             seed_fingerprint=str(value["seed_fingerprint"]),
             receipt_id=_optional_text(value.get("receipt_id")),
             result_code=str(value["result_code"]),
-            deleted=bool(value.get("deleted", False)),
+            deleted=_optional_bool(value.get("deleted", False)),
             active_lease_count=int(value.get("active_lease_count", 0)),
+            attempt_id=_optional_text(value.get("attempt_id")),
+            machine_generation=_optional_int(value.get("machine_generation")),
+            runtime_start_epoch=_optional_int(value.get("runtime_start_epoch")),
+            runtime_boot_id=_optional_text(value.get("runtime_boot_id")),
+            hermes_instance_id=_optional_text(value.get("hermes_instance_id")),
+            quiescence=_optional_quiescence(value.get("quiescence")),
         )
     except (TypeError, ValueError):
         raise FoundryError(
@@ -511,6 +681,60 @@ def _optional_text(value: Any) -> str | None:
     if not isinstance(value, str) or not value:
         raise ValueError("optional value must be a non-empty string")
     return value
+
+
+def _optional_bool(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError("optional value must be a boolean")
+    return value
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TypeError("optional value must be a non-negative integer")
+    return value
+
+
+def _optional_mapping(value: Any) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("optional value must be an object")
+    return dict(value)
+
+
+def _optional_quiescence(value: Any) -> Mapping[str, Any] | None:
+    parsed = _optional_mapping(value)
+    if parsed is None:
+        return None
+    required = {
+        "state",
+        "safe_error_code",
+        "active_runs",
+        "active_profile_io",
+        "open_profile_stores",
+        "owned_children",
+    }
+    if set(parsed) != required:
+        raise ValueError("quiescence evidence has an unexpected shape")
+    if parsed["state"] not in {"quiescing", "quiesced", "repair_required"}:
+        raise ValueError("quiescence state is invalid")
+    if not isinstance(parsed["safe_error_code"], str):
+        raise TypeError("quiescence safe error code is invalid")
+    for name in required - {"state", "safe_error_code"}:
+        value = parsed[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TypeError("quiescence counter is invalid")
+    return parsed
+
+
+def _publication_uuid(value: str | UUID) -> str:
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("publication identity must be a UUID") from exc
 
 
 def _error_for(status: int, payload: Mapping[str, Any] | None) -> FoundryError:
@@ -539,6 +763,14 @@ def _error_for(status: int, payload: Mapping[str, Any] | None) -> FoundryError:
             message, status=status, code=code or getattr(cls, "code", "CONFLICT")
         )
     return FoundryError(message, status=status, code=code or "FOUNDRY_ERROR")
+
+
+BROKERED_CREDENTIAL_SCHEME = "allies-key://"
+BROKERED_CREDENTIAL_TIMEOUT_SECONDS = 15.0
+# Shared and small so a hung broker call can never multiply threads per key.
+_BROKER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="allies-credential"
+)
 
 
 class FoundryClient:
@@ -576,7 +808,8 @@ class FoundryClient:
         path: str,
         *,
         lease_token: str | None = None,
-        body: Mapping[str, Any] | None = None,
+        body: Mapping[str, Any] | bytes | None = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> Mapping[str, Any] | None:
         headers = {
             "Accept": "application/json",
@@ -591,6 +824,8 @@ class FoundryClient:
             ):
                 raise ValueError("lease token must be a bounded header value")
             headers["X-Foundry-Lease-Token"] = lease_token
+        if extra_headers is not None:
+            headers.update(extra_headers)
         try:
             request = getattr(self._transport, "request", self._transport)
             try:
@@ -650,12 +885,51 @@ class FoundryClient:
                 status=200,
                 code="MALFORMED_RESPONSE",
             )
+        if "reasoning_effort" in payload:
+            try:
+                raw_reasoning_effort = payload["reasoning_effort"]
+                reasoning_effort = validate_reasoning_effort(raw_reasoning_effort)
+                if reasoning_effort is None:
+                    raise ValueError("reasoning effort cannot be null")
+            except ValueError as exc:
+                raise FoundryError(
+                    "Foundry claim response contained an invalid reasoning effort",
+                    status=200,
+                    code="MALFORMED_RESPONSE",
+                ) from exc
+        else:
+            reasoning_effort = None
+        raw_command_id = payload.get("command_id")
+        if raw_command_id is not None:
+            try:
+                command_id = str(UUID(str(raw_command_id)))
+            except (TypeError, ValueError) as exc:
+                raise FoundryError(
+                    "Foundry claim response contained an invalid command identity",
+                    status=200,
+                    code="MALFORMED_RESPONSE",
+                ) from exc
+        else:
+            command_id = None
         return FoundryClaim(
             attempt_id=str(payload["attempt_id"]),
             execution_id=str(payload["execution_id"]),
             profile_id=str(payload["profile_id"]),
             hermes_profile_key=str(payload["hermes_profile_key"]),
             model=str(payload["model"]),
+            provider=str(payload.get("provider") or ""),
+            model_options=dict(payload["model_options"])
+            if isinstance(payload.get("model_options"), dict)
+            else {},
+            binding_generation=payload.get("binding_generation")
+            if isinstance(payload.get("binding_generation"), int)
+            and not isinstance(payload.get("binding_generation"), bool)
+            else 0,
+            binding_key_refs={
+                str(k): str(v)
+                for k, v in payload.get("binding_key_refs", {}).items()
+                if isinstance(payload.get("binding_key_refs"), dict)
+            },
             conversation_id=payload.get("conversation_id"),
             session_id=payload.get("session_id"),
             stream_id=str(payload["stream_id"]),
@@ -666,7 +940,232 @@ class FoundryClient:
             if isinstance(payload.get("payload"), Mapping)
             else {},
             claim_id=str(payload["claim_id"]),
+            routine_id=(
+                str(payload["routine_id"])
+                if payload.get("routine_id") is not None
+                else None
+            ),
+            reasoning_effort=reasoning_effort,
+            command_id=command_id,
+            routine_tool_token=payload.get("routine_tool_token"),
         )
+
+    async def incoming_file_chunks(
+        self,
+        attempt_id: str,
+        file_id: str,
+        lease_token: str,
+    ) -> AsyncIterator[bytes]:
+        """Yield one backend-authorized file in fixed-size chunks."""
+
+        try:
+            attempt = str(UUID(str(attempt_id)))
+            file = str(UUID(str(file_id)))
+        except (TypeError, ValueError):
+            raise InvalidRequestError("incoming file identity was invalid") from None
+        if (
+            not isinstance(lease_token, str)
+            or not lease_token
+            or "\r" in lease_token
+            or "\n" in lease_token
+        ):
+            raise ValueError("lease token must be a bounded header value")
+        stream = getattr(self._transport, "stream", None)
+        if not callable(stream):
+            raise FoundryError(
+                "Foundry file transport was unavailable",
+                status=0,
+                code="FILE_TRANSPORT_UNAVAILABLE",
+            )
+        headers = {
+            "Accept": "application/octet-stream",
+            "Authorization": f"Bearer {self._runtime_token}",
+            "X-Foundry-Lease-Token": lease_token,
+        }
+        path = f"/api/v1/runtime/attempts/{attempt}/files/{file}/content"
+        try:
+            raw = stream("GET", path, headers=headers)
+            if inspect.isawaitable(raw):
+                raw = await raw
+        except (TimeoutError, ConnectionError, OSError, urllib.error.URLError) as exc:
+            raise ResponseLossError("Foundry file response was lost") from exc
+        status, payload = _parse_response(raw)
+        if status < 200 or status >= 300:
+            raise _error_for(status, payload)
+        response = raw.get("response") if isinstance(raw, Mapping) else None
+        if response is None:
+            raise FoundryError(
+                "Foundry file response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        try:
+            while True:
+                chunk = await asyncio.to_thread(response.read, 64 * 1024)
+                if not chunk:
+                    return
+                if not isinstance(chunk, bytes) or len(chunk) > 64 * 1024:
+                    raise FoundryError(
+                        "Foundry file response was malformed",
+                        status=200,
+                        code="MALFORMED_RESPONSE",
+                    )
+                yield chunk
+        except FoundryError:
+            raise
+        except (OSError, ConnectionError) as exc:
+            raise ResponseLossError("Foundry file response was lost") from exc
+        finally:
+            response.close()
+
+    async def create_publication_intent(
+        self,
+        attempt_id: str | UUID,
+        lease_token: str,
+        tool_call_id: str,
+        files: list[Mapping[str, object]],
+    ) -> Mapping[str, Any]:
+        return await self._publication_response(
+            "POST",
+            f"/api/v1/runtime/attempts/{_publication_uuid(attempt_id)}/file-publication-intents",
+            lease_token=lease_token,
+            body={
+                "tool_call_id": tool_call_id,
+                "files": [dict(item) for item in files],
+            },
+        )
+
+    async def freeze_publication_intent(
+        self,
+        profile_id: str | UUID,
+        publication_id: str | UUID,
+        files: list[Mapping[str, object]],
+    ) -> Mapping[str, Any]:
+        return await self._publication_response(
+            "POST",
+            "/api/v1/runtime/profiles/"
+            f"{_publication_uuid(profile_id)}/file-publication-intents/"
+            f"{_publication_uuid(publication_id)}/frozen",
+            body={"files": [dict(item) for item in files]},
+        )
+
+    async def register_publication(
+        self,
+        attempt_id: str | UUID,
+        lease_token: str,
+        publication_id: str | UUID,
+        files: list[Mapping[str, object]],
+    ) -> Mapping[str, Any]:
+        return await self._publication_response(
+            "POST",
+            f"/api/v1/runtime/attempts/{_publication_uuid(attempt_id)}/file-publications",
+            lease_token=lease_token,
+            body={
+                "publication_id": _publication_uuid(publication_id),
+                "files": [dict(item) for item in files],
+            },
+        )
+
+    async def upload_publication_file(
+        self,
+        profile_id: str | UUID,
+        publication_id: str | UUID,
+        file_id: str | UUID,
+        generation: int,
+        content: bytes,
+        revision: int,
+        lease_token: str | UUID | None = None,
+    ) -> Mapping[str, Any]:
+        if isinstance(generation, bool) or generation < 1:
+            raise ValueError("publication generation must be positive")
+        if isinstance(revision, bool) or revision < 1:
+            raise ValueError("publication revision must be positive")
+        if not isinstance(content, bytes) or not content:
+            raise ValueError("publication content must be non-empty bytes")
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(content)),
+            "X-Allies-Publication-Revision": str(revision),
+        }
+        if lease_token is not None:
+            headers["X-Allies-Publication-Lease-Token"] = _publication_uuid(lease_token)
+        return await self._publication_response(
+            "PUT",
+            "/api/v1/runtime/profiles/"
+            f"{_publication_uuid(profile_id)}/file-publications/"
+            f"{_publication_uuid(publication_id)}/files/{_publication_uuid(file_id)}"
+            f"/content?generation={generation}",
+            body=content,
+            extra_headers=headers,
+        )
+
+    async def get_publication(
+        self, profile_id: str | UUID, publication_id: str | UUID
+    ) -> Mapping[str, Any]:
+        return await self._publication_response(
+            "GET",
+            "/api/v1/runtime/profiles/"
+            f"{_publication_uuid(profile_id)}/file-publications/"
+            f"{_publication_uuid(publication_id)}",
+        )
+
+    async def claim_publication_retries(
+        self, profile_id: str | UUID, limit: int = 20
+    ) -> list[Mapping[str, Any]]:
+        if isinstance(limit, bool) or not 1 <= limit <= 20:
+            raise ValueError("publication recovery limit must be from 1 to 20")
+        value = await self._publication_response(
+            "POST",
+            "/api/v1/runtime/profiles/"
+            f"{_publication_uuid(profile_id)}/file-publication-retries/claim",
+            body={"limit": limit},
+        )
+        items = value.get("items")
+        if not isinstance(items, list) or any(
+            not isinstance(item, Mapping) for item in items
+        ):
+            raise FoundryError(
+                "Foundry publication recovery response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        return [dict(item) for item in items]
+
+    async def publication_retry_result(
+        self,
+        profile_id: str | UUID,
+        publication_id: str | UUID,
+        revision: int,
+        lease_token: str | UUID,
+        outcome: str,
+        safe_error_code: str | None = None,
+    ) -> Mapping[str, Any]:
+        body: dict[str, object] = {
+            "revision": revision,
+            "lease_token": _publication_uuid(lease_token),
+            "outcome": outcome,
+        }
+        if safe_error_code is not None:
+            body["safe_error_code"] = safe_error_code
+        return await self._publication_response(
+            "POST",
+            "/api/v1/runtime/profiles/"
+            f"{_publication_uuid(profile_id)}/file-publications/"
+            f"{_publication_uuid(publication_id)}/retry-result",
+            body=body,
+        )
+
+    async def _publication_response(
+        self, method: str, path: str, **kwargs: Any
+    ) -> Mapping[str, Any]:
+        result = await self._request(method, path, **kwargs)
+        if not isinstance(result, Mapping):
+            raise FoundryError(
+                "Foundry publication response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        return result
 
     async def reconciliation_snapshot(self) -> RuntimeReconciliationSnapshot:
         """Read profile state plus the current server-owned start epoch."""
@@ -681,6 +1180,10 @@ class FoundryClient:
         rows = payload.get("profiles")
         generation = payload.get("machine_generation")
         runtime_start_epoch = payload.get("runtime_start_epoch")
+        activity_revision = payload.get("activity_revision", 0)
+        workspace_id = payload.get("workspace_id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            workspace_id = None
         if (
             not isinstance(rows, list)
             or isinstance(generation, bool)
@@ -702,10 +1205,22 @@ class FoundryClient:
                 status=200,
                 code="MALFORMED_RESPONSE",
             )
+        if (
+            isinstance(activity_revision, bool)
+            or not isinstance(activity_revision, int)
+            or activity_revision < 0
+        ):
+            raise FoundryError(
+                "Foundry profile reconciliation response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
         snapshot = RuntimeReconciliationSnapshot(
             machine_generation=generation,
             runtime_start_epoch=runtime_start_epoch,
             profiles=tuple(_profile_desired_state(row, generation) for row in rows),
+            activity_revision=activity_revision,
+            workspace_id=workspace_id,
         )
         self.last_reconciliation_snapshot = snapshot
         return snapshot
@@ -714,6 +1229,54 @@ class FoundryClient:
         """Read the current-generation, workspace-scoped profile desired state."""
 
         return (await self.reconciliation_snapshot()).profiles
+
+    async def wait_for_activity(
+        self,
+        after_revision: int,
+        wait_seconds: float,
+    ) -> ActivityWaitReceipt:
+        if (
+            isinstance(after_revision, bool)
+            or not isinstance(after_revision, int)
+            or after_revision < 0
+        ):
+            raise ValueError("after_revision must be a non-negative integer")
+        if isinstance(wait_seconds, bool):
+            raise TypeError("wait_seconds must be a positive number")
+        try:
+            wait_seconds = float(wait_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("wait_seconds must be a positive number") from exc
+        if not 0 < wait_seconds <= 5:
+            raise ValueError("wait_seconds must be greater than 0 and at most 5")
+        payload = await self._request(
+            "POST",
+            "/api/v1/runtime/activity-waits",
+            body={
+                "after_revision": after_revision,
+                "wait_seconds": wait_seconds,
+            },
+        )
+        if not payload:
+            raise FoundryError(
+                "Foundry activity wait response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        revision = payload.get("revision")
+        reason = payload.get("reason")
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+            or reason not in {"changed", "timeout"}
+        ):
+            raise FoundryError(
+                "Foundry activity wait response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        return ActivityWaitReceipt(revision=revision, reason=reason)
 
     async def report_readiness(
         self,
@@ -799,19 +1362,38 @@ class FoundryClient:
         result_code: str,
         deleted: bool,
         active_lease_count: int,
+        attempt_id: str | UUID | None = None,
+        machine_generation: int | None = None,
+        runtime_start_epoch: int | None = None,
+        runtime_boot_id: str | UUID | None = None,
+        hermes_instance_id: str | UUID | None = None,
+        quiescence: Mapping[str, Any] | None = None,
     ) -> ProfileReceipt:
+        body: dict[str, Any] = {
+            "profile_id": str(profile_id),
+            "operation_id": str(operation_id),
+            "lifecycle_epoch": lifecycle_epoch,
+            "request_digest": request_digest,
+            "result_code": result_code,
+            "deleted": deleted,
+            "active_lease_count": active_lease_count,
+        }
+        if attempt_id is not None:
+            body["attempt_id"] = str(attempt_id)
+        if machine_generation is not None:
+            body["machine_generation"] = machine_generation
+        if runtime_start_epoch is not None:
+            body["runtime_start_epoch"] = runtime_start_epoch
+        if runtime_boot_id is not None:
+            body["runtime_boot_id"] = str(runtime_boot_id)
+        if hermes_instance_id is not None:
+            body["hermes_instance_id"] = str(hermes_instance_id)
+        if quiescence is not None:
+            body["quiescence"] = dict(_optional_quiescence(quiescence))
         result = await self._request(
             "POST",
             f"/api/v1/runtime/profiles/{profile_id}/cleanup-receipt",
-            body={
-                "profile_id": str(profile_id),
-                "operation_id": str(operation_id),
-                "lifecycle_epoch": lifecycle_epoch,
-                "request_digest": request_digest,
-                "result_code": result_code,
-                "deleted": deleted,
-                "active_lease_count": active_lease_count,
-            },
+            body=body,
         )
         return _profile_receipt(result)
 
@@ -830,6 +1412,65 @@ class FoundryClient:
         return LeaseReceipt(
             str(payload["lease_id"]), _parse_datetime(payload.get("expires_at"))
         )
+
+    async def approval_status(
+        self,
+        attempt_id: str | UUID,
+        lease_token: str,
+        approval_request_id: str | UUID,
+    ) -> ApprovalStatus:
+        """Read one lease-bound approval and lazily reconcile its deadlines."""
+
+        try:
+            request_uuid = UUID(str(approval_request_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("approval_request_id must be a UUID") from exc
+        payload = await self._request(
+            "GET",
+            f"/api/v1/runtime/attempts/{attempt_id}/approval-requests/{request_uuid}",
+            lease_token=lease_token,
+        )
+        if not payload:
+            raise FoundryError(
+                "Foundry approval response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        status = payload.get("status")
+        decision = payload.get("decision")
+        if status not in {
+            "pending",
+            "decision_recorded",
+            "applied",
+            "expired",
+            "cancelled",
+            "outcome_unknown",
+        } or (decision is not None and decision not in {"approve", "reject"}):
+            raise FoundryError(
+                "Foundry approval response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        if "approval_request_id" not in payload or str(
+            payload["approval_request_id"]
+        ) != str(request_uuid):
+            raise FoundryError(
+                "Foundry approval identity was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        return ApprovalStatus(
+            approval_request_id=str(request_uuid),
+            status=status,
+            decision=decision,
+            decided_at=_parse_datetime(payload.get("decided_at")),
+            acknowledgement_deadline_at=_parse_datetime(
+                payload.get("acknowledgement_deadline_at")
+            ),
+            expires_at=_parse_datetime(payload.get("expires_at")),
+        )
+
+    poll_approval = approval_status
 
     async def event(
         self,
@@ -899,7 +1540,54 @@ class FoundryClient:
             )
         return SessionReceipt(str(result["session_id"]))
 
+    async def bind_routine(
+        self,
+        attempt_id: str | UUID,
+        lease_token: str,
+        *,
+        expected_session_id: str | None,
+        effective_session_id: str,
+    ) -> SessionReceipt:
+        result = await self._request(
+            "PUT",
+            f"/api/v1/runtime/attempts/{attempt_id}/routine-session-binding",
+            lease_token=lease_token,
+            body={
+                "expected_session_id": expected_session_id,
+                "effective_session_id": effective_session_id,
+            },
+        )
+        if not result or "session_id" not in result:
+            raise FoundryError(
+                "Foundry routine session response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        return SessionReceipt(str(result["session_id"]))
+
     update_session_binding = bind
+
+    async def resolve_credential(self, reference: str) -> str:
+        payload = await self._request(
+            "POST",
+            "/api/v1/runtime/credentials/resolve",
+            body={"reference": reference},
+        )
+        value = payload.get("value") if isinstance(payload, Mapping) else None
+        if not isinstance(value, str) or not value:
+            raise FoundryError(
+                "Foundry credential response was malformed",
+                status=200,
+                code="MALFORMED_RESPONSE",
+            )
+        return value
+
+    def resolve_credential_blocking(self, reference: str) -> str:
+        """Resolve from sync profile-store code, whatever thread it runs on."""
+
+        return _BROKER_EXECUTOR.submit(
+            asyncio.run, self.resolve_credential(reference)
+        ).result(timeout=BROKERED_CREDENTIAL_TIMEOUT_SECONDS)
 
     async def stopped(
         self, attempt_id: str | UUID, lease_token: str, *, reason: str
@@ -933,24 +1621,58 @@ class FoundryClient:
         sequence: int,
         payload: Mapping[str, Any],
         receipt: Mapping[str, Any],
+        session_binding: Mapping[str, Any] | None = None,
     ) -> TerminalReceipt:
         _validate_sequence(sequence, MAX_TERMINAL_SEQUENCE, "terminal event")
         event_id = deterministic_event_id(attempt_id, stream_id, sequence)
+        body = {
+            "event_id": event_id,
+            "stream_id": stream_id,
+            "sequence": sequence,
+            "payload": dict(payload),
+            "receipt": dict(receipt),
+        }
+        if session_binding is not None:
+            body["session_binding"] = dict(session_binding)
         result = await self._request(
             "POST",
             f"/api/v1/runtime/attempts/{attempt_id}/complete",
             lease_token=lease_token,
-            body={
-                "event_id": event_id,
-                "stream_id": stream_id,
-                "sequence": sequence,
-                "payload": dict(payload),
-                "receipt": dict(receipt),
-            },
+            body=body,
         )
         return self._terminal(result)
 
     complete_attempt = complete
+
+    async def routine_result(
+        self,
+        attempt_id: str | UUID,
+        lease_token: str,
+        *,
+        event_id: str | UUID,
+        sequence: int,
+        outcome: str,
+        text: str,
+        references: list[Mapping[str, str]],
+        delayed: bool,
+    ) -> TerminalReceipt:
+        _validate_sequence(sequence, MAX_TERMINAL_SEQUENCE, "routine result")
+        if outcome not in {"changed", "unchanged", "failed"}:
+            raise ValueError("routine result outcome is invalid")
+        result = await self._request(
+            "POST",
+            f"/api/v1/runtime/attempts/{attempt_id}/routine-result",
+            lease_token=lease_token,
+            body={
+                "event_id": str(event_id),
+                "sequence": sequence,
+                "outcome": outcome,
+                "text": text,
+                "references": [dict(reference) for reference in references],
+                "delayed": delayed,
+            },
+        )
+        return self._terminal(result)
 
     async def fail(
         self,
@@ -1014,6 +1736,147 @@ async def _close_stream(stream: Any) -> None:
             return
 
 
+DELTA_COALESCE_SECONDS = 0.15
+DELTA_COALESCE_MAX_BYTES = 4 * 1024
+_STREAM_TIMEOUT = object()
+_STREAM_END = object()
+
+
+class _CoalescedStream:
+    """Merge consecutive text deltas so each one does not cost a Foundry POST.
+
+    Deltas arriving within ``window`` seconds of the first buffered one are
+    joined into a single ``message.delta``; any other event, the byte cap, the
+    window or the end of the stream flushes the buffer first, so ordering is
+    unchanged. Closing cancels the in-flight read before closing the inner
+    stream, so the inner stream is never read and closed concurrently.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        window: float | None = None,
+        max_bytes: int | None = None,
+    ) -> None:
+        self._inner = inner
+        self._iterator = inner.__aiter__()
+        self._window = DELTA_COALESCE_SECONDS if window is None else window
+        self._max_bytes = DELTA_COALESCE_MAX_BYTES if max_bytes is None else max_bytes
+        self._pending: asyncio.Task[Any] | None = None
+        self._buffer: list[HermesEvent] = []
+        self._buffer_bytes = 0
+        self._deadline = 0.0
+        self._held: HermesEvent | None = None
+        self._error: BaseException | None = None
+        self._done = False
+        self._first_delta_sent = False
+
+    def __aiter__(self) -> _CoalescedStream:
+        return self
+
+    @staticmethod
+    def _delta_text(event: Any) -> str | None:
+        if (
+            isinstance(event, HermesEvent)
+            and event.name == "message.delta"
+            and set(event.payload) == {"text"}
+            and isinstance(event.payload["text"], str)
+        ):
+            return event.payload["text"]
+        return None
+
+    def _flush(self) -> HermesEvent:
+        first = self._buffer[0]
+        text = "".join(event.payload["text"] for event in self._buffer)
+        self._buffer = []
+        self._buffer_bytes = 0
+        if text == first.payload["text"]:
+            return first
+        return replace(first, payload={"text": text})
+
+    async def _next(self, timeout: float | None) -> Any:
+        if self._pending is None:
+            self._pending = asyncio.ensure_future(self._iterator.__anext__())
+        task = self._pending
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            return _STREAM_TIMEOUT
+        if self._pending is task:
+            self._pending = None
+        if task.cancelled():
+            # aclose() cancelled the read from another task; treat it as the end.
+            return _STREAM_END
+        try:
+            return task.result()
+        except StopAsyncIteration:
+            return _STREAM_END
+
+    async def __anext__(self) -> Any:
+        if self._held is not None:
+            event, self._held = self._held, None
+            return event
+        while True:
+            if self._done:
+                if self._buffer:
+                    return self._flush()
+                if self._error is not None:
+                    error, self._error = self._error, None
+                    raise error
+                raise StopAsyncIteration
+            timeout = (
+                max(0.0, self._deadline - time.monotonic()) if self._buffer else None
+            )
+            try:
+                event = await self._next(timeout)
+            except Exception as error:  # noqa: BLE001 - re-raised after the flush
+                self._done = True
+                self._error = error
+                continue
+            if event is _STREAM_TIMEOUT:
+                return self._flush()
+            if event is _STREAM_END:
+                self._done = True
+                continue
+            text = self._delta_text(event)
+            if text is not None and not self._first_delta_sent:
+                # The first text goes out at once so time-to-first-token is unchanged.
+                self._first_delta_sent = True
+                return event
+            if text is not None:
+                size = len(text.encode("utf-8"))
+                first = self._buffer[0] if self._buffer else None
+                if first is None or (
+                    first.session_id == event.session_id
+                    and first.run_id == event.run_id
+                    and first.profile_id == event.profile_id
+                    and self._buffer_bytes + size <= self._max_bytes
+                ):
+                    if first is None:
+                        self._deadline = time.monotonic() + self._window
+                    self._buffer.append(event)
+                    self._buffer_bytes += size
+                    continue
+                flushed = self._flush()
+                self._buffer = [event]
+                self._buffer_bytes = size
+                self._deadline = time.monotonic() + self._window
+                return flushed
+            if self._buffer:
+                self._held = event
+                return self._flush()
+            return event
+
+    async def aclose(self) -> None:
+        self._done = True
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            pending.cancel()
+            with suppress(BaseException):
+                await pending
+        await _close_stream(self._inner)
+
+
 def _validate_sequence(sequence: int, maximum: int, label: str) -> None:
     if (
         isinstance(sequence, bool)
@@ -1051,14 +1914,31 @@ async def _stream_events(
     message: str,
     *,
     session_key: str,
+    model_options: Mapping[str, Any] | None = None,
+    reasoning_effort: str | None = None,
+    routine_result: bool = False,
+    file_context: Mapping[str, Any] | None = None,
+    publication_context: str | None = None,
+    routine_tool_token: str | None = None,
 ) -> Any:
+    stream_kwargs: dict[str, Any] = {"session_key": session_key}
+    if model_options:
+        stream_kwargs["model_options"] = model_options
+    if reasoning_effort is not None:
+        stream_kwargs["reasoning_effort"] = reasoning_effort
+    if routine_result:
+        stream_kwargs["routine_result"] = True
+    elif routine_tool_token:
+        stream_kwargs["routine_tool_token"] = routine_tool_token
+    if file_context is not None:
+        stream_kwargs["file_context"] = file_context
+    if publication_context is not None:
+        stream_kwargs["publication_context"] = publication_context
     method = getattr(hermes, "stream_profile_incremental", None)
     if callable(method):
-        result = method(profile_id, session_id, message, session_key=session_key)
+        result = method(profile_id, session_id, message, **stream_kwargs)
     else:
-        result = hermes.stream_profile(
-            profile_id, session_id, message, session_key=session_key
-        )
+        result = hermes.stream_profile(profile_id, session_id, message, **stream_kwargs)
     if inspect.isawaitable(result):
         result = await result
     if hasattr(result, "__aiter__"):
@@ -1106,8 +1986,15 @@ class FoundryWorker:
         clock: Callable[[], float] = time.monotonic,
         profile_reconciler: Any | None = None,
         profile_reconcile_interval: float = DEFAULT_PROFILE_RECONCILE_INTERVAL,
+        binding_applier: Callable | None = None,
         readiness_heartbeat_interval: float = 15.0,
         boot_id: str | UUID | None = None,
+        activity_wait_enabled: bool = False,
+        activity_wait_seconds: float = 5.0,
+        approval_poll_interval: float = APPROVAL_POLL_INTERVAL,
+        profile_store: Any | None = None,
+        file_input_enabled: bool = False,
+        publication_bridge: Any | None = None,
     ):
         if (
             isinstance(slots, bool)
@@ -1121,6 +2008,27 @@ class FoundryWorker:
             raise ValueError("profile reconcile interval must be positive")
         if readiness_heartbeat_interval <= 0:
             raise ValueError("readiness heartbeat interval must be positive")
+        if binding_applier is not None and not callable(binding_applier):
+            raise ValueError("binding applier must be callable")
+        self.binding_applier = binding_applier
+        # Sessions this process already pinned: Hermes locks are ephemeral
+        # but the binding outlives restarts, so re-lock once per session
+        # per process instead of only on a fresh key apply.
+        self._session_model_locks: dict[str, tuple[str, str]] = {}
+        if not isinstance(activity_wait_enabled, bool):
+            raise TypeError("activity wait enabled must be a boolean")
+        if (
+            isinstance(activity_wait_seconds, bool)
+            or not 0 < float(activity_wait_seconds) <= 5
+        ):
+            raise ValueError("activity wait seconds must be between 0 and 5")
+        if (
+            isinstance(approval_poll_interval, bool)
+            or not 0 < float(approval_poll_interval) <= 5
+        ):
+            raise ValueError("approval poll interval must be between 0 and 5")
+        if not isinstance(file_input_enabled, bool):
+            raise TypeError("file input enabled must be a boolean")
         self.foundry = foundry
         self.hermes = hermes
         self.slots = slots
@@ -1136,8 +2044,19 @@ class FoundryWorker:
         self._readiness_heartbeat_interval = readiness_heartbeat_interval
         self.boot_id = str(boot_id or uuid4())
         self._last_readiness_report: float | None = None
+        self._activity_wait_enabled = activity_wait_enabled
+        self._activity_wait_seconds = float(activity_wait_seconds)
+        self._approval_poll_interval = float(approval_poll_interval)
+        self._profile_store = profile_store
+        self._file_input_enabled = file_input_enabled
+        self._publication_bridge = publication_bridge
+        self._last_publication_recovery: float | None = None
+        self._publication_profile_cursor: str | None = None
+        self._activity_revision = 0
         self._active: set[asyncio.Task[Any]] = set()
+        self._resource_registry = ProfileResourceRegistry()
         self._ambiguous_claims: dict[str, float] = {}
+        self._fast_polls_remaining = 0
         self._stopping = False
 
     @property
@@ -1148,8 +2067,42 @@ class FoundryWorker:
     def ambiguous_claim_ids(self) -> tuple[str, ...]:
         return tuple(self._ambiguous_claims)
 
+    async def quiesce_profile(
+        self, profile_key: str, *, timeout_seconds: float = 30.0
+    ) -> tuple[str, tuple[str, ...]]:
+        """Fence and join runtime-owned claim tasks for one profile."""
+
+        try:
+            return await self._resource_registry.quiesce(
+                profile_key, timeout_seconds=timeout_seconds
+            )
+        except QuiescenceError as exc:
+            return "repair_required", (getattr(exc, "code", "quiescence_failed"),)
+
+    def fence_profile(self, profile_key: str) -> None:
+        """Stop new claims for a profile before listener-level drain."""
+
+        self._resource_registry.fence(profile_key)
+
+    def _observability_context(self) -> dict[str, object]:
+        fields: dict[str, object] = {"correlation_id": self.boot_id}
+        snapshot = getattr(self.foundry, "last_reconciliation_snapshot", None)
+        if snapshot is None:
+            return fields
+        workspace_id = getattr(snapshot, "workspace_id", None)
+        if workspace_id is not None:
+            fields["workspace_id"] = workspace_id
+        generation = getattr(snapshot, "machine_generation", None)
+        if generation is not None:
+            fields["generation"] = generation
+        runtime_start_epoch = getattr(snapshot, "runtime_start_epoch", None)
+        if runtime_start_epoch is not None:
+            fields["runtime_start_epoch"] = runtime_start_epoch
+        return fields
+
     async def stop(self) -> None:
         self._stopping = True
+        self._fast_polls_remaining = 0
         tasks = tuple(self._active)
         if tasks:
             for task in tasks:
@@ -1220,20 +2173,219 @@ class FoundryWorker:
                 await self.foundry.renew(claim.attempt_id, claim.lease_token)
             except (FoundryError, TimeoutError, OSError, ConnectionError):
                 lost.set()
-                await _close_stream(stream)
+                await _close_stream(stream[0] if isinstance(stream, list) else stream)
                 return
 
+    async def _wait_for_approval(
+        self,
+        claim: FoundryClaim,
+        approval_request_id: str,
+        expires_at: Any,
+        lost: asyncio.Event,
+    ) -> tuple[str, str | None, Any]:
+        """Poll Foundry while the existing lease renewer keeps the turn alive."""
+
+        expiry = _approval_time(expires_at)
+        poll = getattr(self.foundry, "approval_status", None)
+        if not callable(poll):
+            poll = getattr(self.foundry, "poll_approval", None)
+        if not callable(poll):
+            raise FoundryError(
+                "Foundry approval polling was unavailable",
+                code="APPROVAL_UNAVAILABLE",
+            )
+        if not inspect.iscoroutinefunction(poll):
+            # Approval polling is async by contract; never invoke an unbounded sync adapter.
+            raise FoundryError(
+                "Foundry approval polling must be asynchronous",
+                code="APPROVAL_UNAVAILABLE",
+            )
+        while not lost.is_set():
+            remaining = expiry - time.time()
+            if remaining <= 0:
+                return "expired", None, None
+            try:
+                status = await asyncio.wait_for(
+                    poll(
+                        claim.attempt_id,
+                        claim.lease_token,
+                        approval_request_id,
+                    ),
+                    remaining,
+                )
+            except TimeoutError:
+                return "expired", None, None
+            except (ResponseLossError, RateLimitedError, ServiceUnavailableError):
+                # The status read is idempotent; keep the bounded wait alive.
+                remaining = expiry - time.time()
+                if remaining <= 0:
+                    return "expired", None, None
+                await asyncio.sleep(min(self._approval_poll_interval, remaining))
+                continue
+            reported_request_id = getattr(status, "approval_request_id", None)
+            state = getattr(status, "status", None)
+            decision = getattr(status, "decision", None)
+            if isinstance(status, Mapping):
+                reported_request_id = status.get("approval_request_id")
+                state = status.get("status")
+                decision = status.get("decision")
+            if (
+                reported_request_id is None
+                or str(reported_request_id) != approval_request_id
+            ):
+                raise FoundryError(
+                    "Foundry approval identity was malformed",
+                    code="MALFORMED_RESPONSE",
+                )
+            if state == "decision_recorded":
+                if decision not in {"approve", "reject"}:
+                    raise FoundryError(
+                        "Foundry approval decision was malformed",
+                        code="MALFORMED_RESPONSE",
+                    )
+                acknowledgement_deadline = getattr(
+                    status, "acknowledgement_deadline_at", None
+                )
+                if isinstance(status, Mapping):
+                    acknowledgement_deadline = status.get("acknowledgement_deadline_at")
+                if acknowledgement_deadline is None:
+                    raise FoundryError(
+                        "Foundry approval acknowledgement deadline was malformed",
+                        code="MALFORMED_RESPONSE",
+                    )
+                return "decision", decision, acknowledgement_deadline
+            if state == "expired":
+                return "expired", None, None
+            if state in {"cancelled", "outcome_unknown"}:
+                return state, None, None
+            remaining = expiry - time.time()
+            if remaining <= 0:
+                return "expired", None, None
+            await asyncio.sleep(min(self._approval_poll_interval, remaining))
+        return "cancelled", None, None
+
+    async def _reconcile_hermes_approval(
+        self,
+        profile_id: str,
+        session_id: str,
+        run_id: str,
+        hermes_approval_id: str,
+        decision: str,
+        session_key: str,
+        acknowledgement_deadline: Any,
+        pending_approval: dict[str, str],
+    ) -> None:
+        """Reconcile one lost Hermes decision response without resending it."""
+
+        status_reader = getattr(self.hermes, "approval_status", None)
+        if not callable(status_reader):
+            raise HermesTimeout("Hermes approval acknowledgement was lost")
+        try:
+            deadline = _approval_time(acknowledgement_deadline)
+        except HermesMalformedResponse:
+            raise FoundryError(
+                "Foundry approval acknowledgement deadline was malformed",
+                code="MALFORMED_RESPONSE",
+            ) from None
+        expected = "approved" if decision == "approve" else "rejected"
+        while not pending_approval.get("acknowledged"):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise HermesTimeout("Hermes approval acknowledgement timed out")
+            try:
+                status_result = status_reader(
+                    profile_id,
+                    session_id,
+                    run_id,
+                    hermes_approval_id,
+                    session_key=session_key,
+                )
+                if inspect.isawaitable(status_result):
+                    status = await asyncio.wait_for(status_result, remaining)
+                else:
+                    status = status_result
+            except TimeoutError:
+                raise HermesTimeout("Hermes approval status timed out") from None
+            except (HermesTimeout, HermesDisconnected):
+                await asyncio.sleep(min(self._approval_poll_interval, remaining))
+                continue
+            state = getattr(status, "status", None)
+            outcome = getattr(status, "outcome", None)
+            if isinstance(status, Mapping):
+                state = status.get("status")
+                outcome = status.get("outcome")
+            if state == "resolved":
+                if outcome != expected:
+                    raise HermesMalformedResponse(
+                        "Hermes approval acknowledgement conflicted with decision"
+                    )
+                pending_approval["acknowledged"] = "1"
+                return
+            if state in {"expired", "cancelled"}:
+                if outcome != state:
+                    raise HermesError("Hermes approval terminal receipt was malformed")
+                pending_approval["wait_outcome"] = state
+                return
+            await asyncio.sleep(min(self._approval_poll_interval, remaining))
+
+    async def _report_routine_failure(
+        self,
+        claim: FoundryClaim,
+        *,
+        sequence: int,
+    ) -> TerminalReceipt:
+        routine_result = getattr(self.foundry, "routine_result", None)
+        if not callable(routine_result):
+            raise HermesError("Foundry routine result endpoint was unavailable")
+        return await _retry_response_loss(
+            lambda: routine_result(
+                claim.attempt_id,
+                claim.lease_token,
+                event_id=deterministic_event_id(
+                    claim.attempt_id, claim.stream_id, sequence
+                ),
+                sequence=sequence,
+                outcome="failed",
+                text="Routine failed before completion.",
+                references=[],
+                delayed=bool(claim.payload.get("delayed", False)),
+            )
+        )
+
     async def _run_claim(self, claim: FoundryClaim) -> Any:
+        resource_token = self._resource_registry.register(
+            claim.hermes_profile_key,
+            claim.session_id or claim.execution_id,
+            future=asyncio.current_task(),
+        )
         stream = None
+        stream_ref = [None]
         lost = asyncio.Event()
+        publication_context: str | None = None
         renewal: asyncio.Task[Any] | None = None
         sequence = 0
+        result_text: list[str] = []
+        result_text_bytes = 0
         try:
+            files = claim.payload.get("files")
             try:
-                message = validate_stream_message(claim.payload.get("message"))
+                message_value = claim.payload.get(
+                    "execution_prompt" if claim.routine_id is not None else "message"
+                )
+                message = (
+                    ""
+                    if files is not None
+                    and claim.routine_id is None
+                    and message_value == ""
+                    else validate_stream_message(message_value)
+                )
             except ValueError:
                 raise InvalidRequestError("Execution message was invalid")
-            input_conversation = claim.payload.get("cloud_conversation_ref")
+            input_conversation = claim.payload.get(
+                "run_conversation_id"
+                if claim.routine_id is not None
+                else "cloud_conversation_ref"
+            )
             if claim.conversation_id is None:
                 if (
                     not isinstance(input_conversation, str)
@@ -1257,6 +2409,32 @@ class FoundryWorker:
 
             identifiers = stable_session_identifiers(claim.profile_id, conversation_id)
             session_id = claim.session_id or identifiers.candidate_id
+            approval = claim.payload.get("routine_approval")
+            if claim.routine_id is not None and isinstance(approval, Mapping):
+                routine_result = getattr(self.foundry, "routine_result", None)
+                if not callable(routine_result):
+                    raise HermesError(
+                        "Foundry routine continuation result endpoint was unavailable"
+                    )
+                return await _retry_response_loss(
+                    lambda: routine_result(
+                        claim.attempt_id,
+                        claim.lease_token,
+                        event_id=deterministic_event_id(
+                            claim.attempt_id,
+                            claim.stream_id,
+                            MAX_TERMINAL_SEQUENCE,
+                        ),
+                        sequence=MAX_TERMINAL_SEQUENCE,
+                        outcome="failed",
+                        text=(
+                            "Approved action continuation is unavailable; "
+                            "no action was executed."
+                        ),
+                        references=[],
+                        delayed=bool(claim.payload.get("delayed", False)),
+                    )
+                )
             bootstrap = _first_turn_bootstrap(claim.payload.get("bootstrap"))
             if bootstrap is not None and claim.session_id is not None:
                 raise InvalidRequestError("Execution bootstrap arrived after binding")
@@ -1288,6 +2466,38 @@ class FoundryWorker:
 
             if bootstrap is not None:
                 await self._bootstrap_first_turn(claim, session_id)
+
+            if claim.routine_id is None and self._publication_bridge is not None:
+                publication_context = self._publication_bridge.activate(
+                    claim, cancelled=lost.is_set
+                )
+
+            file_context = None
+            if files is not None:
+                if claim.routine_id is not None:
+                    raise InvalidRequestError(
+                        "Routine executions cannot use incoming files"
+                    )
+                if not self._file_input_enabled:
+                    raise NotReadyError("incoming file input is disabled")
+                workspace_path = getattr(self._profile_store, "workspace_path", None)
+                if not callable(workspace_path):
+                    raise HermesError("profile workspace staging was unavailable")
+                renewal = asyncio.create_task(self._renew_loop(claim, stream_ref, lost))
+                staged = await stage_incoming_files(
+                    workspace_path(claim.hermes_profile_key),
+                    claim.command_id or claim.execution_id,
+                    files,
+                    lambda descriptor: self.foundry.incoming_file_chunks(
+                        claim.attempt_id,
+                        descriptor.file_id,
+                        claim.lease_token,
+                    ),
+                    cancelled=lost.is_set,
+                )
+                if lost.is_set():
+                    raise LeaseConflictError("lease was lost while staging files")
+                file_context = staged.hermes_context()
 
             sequence = 1
             dispatch_payload = {"status": "dispatched"}
@@ -1323,15 +2533,73 @@ class FoundryWorker:
                 if inspect.isawaitable(ensured):
                     await ensured
 
+            if claim.binding_generation and self.binding_applier is not None:
+                try:
+                    receipt = await asyncio.to_thread(
+                        self.binding_applier,
+                        claim.hermes_profile_key,
+                        claim.binding_generation,
+                        claim.binding_key_refs,
+                    )
+                except ProfileStoreError:
+                    return await self.foundry.stopped(
+                        claim.attempt_id,
+                        claim.lease_token,
+                        reason="binding_repair_required",
+                    )
+                applied = str(getattr(getattr(receipt, "status", ""), "value", ""))
+                if applied not in ("APPLIED", "CURRENT"):
+                    return await self.foundry.stopped(
+                        claim.attempt_id,
+                        claim.lease_token,
+                        reason="binding_repair_required",
+                    )
+            if claim.binding_generation and (claim.provider or claim.model):
+                pinned = self._session_model_locks.get(session_id)
+                if pinned != (claim.provider, claim.model):
+                    lock_session = getattr(self.hermes, "lock_session_model", None)
+                    if not callable(lock_session):
+                        raise HermesError("Hermes session model lock was unavailable")
+                    try:
+                        locked = lock_session(
+                            claim.hermes_profile_key,
+                            session_id,
+                            provider=claim.provider or None,
+                            model=claim.model or None,
+                        )
+                        if inspect.isawaitable(locked):
+                            await locked
+                    except (HermesError, ValueError):
+                        return await self.foundry.stopped(
+                            claim.attempt_id,
+                            claim.lease_token,
+                            reason="binding_repair_required",
+                        )
+                    if len(self._session_model_locks) > 1024:
+                        self._session_model_locks.clear()
+                    self._session_model_locks[session_id] = (
+                        claim.provider,
+                        claim.model,
+                    )
             stream = await _stream_events(
                 self.hermes,
                 claim.hermes_profile_key,
                 session_id,
                 message,
                 session_key=identifiers.session_key,
+                reasoning_effort=claim.reasoning_effort,
+                routine_result=claim.routine_id is not None,
+                file_context=file_context,
+                publication_context=publication_context,
+                routine_tool_token=claim.routine_tool_token,
+                model_options=claim.model_options,
             )
-            renewal = asyncio.create_task(self._renew_loop(claim, stream, lost))
+            stream = _CoalescedStream(stream)
+            stream_ref[0] = stream
+            if renewal is None:
+                renewal = asyncio.create_task(self._renew_loop(claim, stream, lost))
             terminal: HermesEvent | None = None
+            pending_approval: dict[str, str] | None = None
             proof_hold = claim.payload.get("proof_hold_after_first_safe_event") is True
             held_after_safe_event = False
             async for event in stream:
@@ -1344,14 +2612,33 @@ class FoundryWorker:
                 if terminal is not None:
                     raise HermesError("Hermes returned an event after completion")
                 if event.name == "execution.completed":
+                    if pending_approval is not None:
+                        raise HermesMalformedResponse(
+                            "Hermes completed while approval was pending"
+                        )
                     terminal = event
                     continue
                 if event.session_id != session_id or event.name not in {
                     "message.delta",
                     "activity.started",
                     "activity.completed",
+                    "approval.request",
+                    "approval.responded",
                 }:
                     raise HermesError("Hermes event identity did not match claim")
+                if event.name == "message.delta":
+                    delta_text = event.payload.get("text")
+                    if claim.routine_id is not None and isinstance(delta_text, str):
+                        delta_text_bytes = len(delta_text.encode("utf-8"))
+                        if (
+                            result_text_bytes + delta_text_bytes
+                            > MAX_ROUTINE_TEXT_BYTES
+                        ):
+                            raise HermesMalformedResponse(
+                                "Hermes routine result text was too large"
+                            )
+                        result_text.append(delta_text)
+                        result_text_bytes += delta_text_bytes
                 if lost.is_set():
                     break
                 if sequence >= MAX_RUNTIME_EVENT_SEQUENCE:
@@ -1365,6 +2652,11 @@ class FoundryWorker:
                         "retryable": False,
                     }
                     try:
+                        if claim.routine_id is not None:
+                            return await self._report_routine_failure(
+                                claim,
+                                sequence=MAX_TERMINAL_SEQUENCE,
+                            )
                         return await _retry_response_loss(
                             lambda payload=failure_payload: self.foundry.fail(
                                 claim.attempt_id,
@@ -1379,9 +2671,272 @@ class FoundryWorker:
                         )
                     except ResponseLossError:
                         # Leave terminal reconciliation to the durable lease expiry path.
+                        if claim.routine_id is not None:
+                            try:
+                                return await self.foundry.stopped(
+                                    claim.attempt_id,
+                                    claim.lease_token,
+                                    reason="routine_result_response_lost",
+                                )
+                            except FoundryError:
+                                return None
                         return None
                     except FoundryError:
                         return None
+                if event.name == "approval.request":
+                    if pending_approval is not None:
+                        raise HermesMalformedResponse(
+                            "Hermes returned a second pending approval"
+                        )
+                    if set(event.payload) != {
+                        "hermes_approval_id",
+                        "action_kind",
+                        "action_label",
+                        "action_preview",
+                        "expires_at",
+                    }:
+                        raise HermesMalformedResponse(
+                            "Hermes approval request was malformed"
+                        )
+                    hermes_approval_id = event.payload.get("hermes_approval_id")
+                    action_kind = event.payload.get("action_kind")
+                    action_label = event.payload.get("action_label")
+                    action_preview = event.payload.get("action_preview")
+                    expires_at = event.payload.get("expires_at")
+                    if (
+                        not isinstance(hermes_approval_id, str)
+                        or not hermes_approval_id
+                        or action_kind
+                        not in {"terminal", "execute_code", "plugin_tool"}
+                        or not isinstance(action_label, str)
+                        or not 1 <= len(action_label) <= MAX_APPROVAL_LABEL_CHARS
+                        or "\x00" in action_label
+                        or not isinstance(action_preview, str)
+                        or not action_preview
+                        or "\x00" in action_preview
+                        or len(action_preview.encode("utf-8"))
+                        > MAX_APPROVAL_PREVIEW_BYTES
+                        or not isinstance(expires_at, str)
+                    ):
+                        raise HermesMalformedResponse(
+                            "Hermes approval request was malformed"
+                        )
+                    expiry = _approval_time(expires_at)
+                    now = time.time()
+                    if expiry <= now or expiry > now + MAX_APPROVAL_LIFETIME_SECONDS:
+                        raise HermesMalformedResponse(
+                            "Hermes approval expiry was outside the bounded window"
+                        )
+                    approval_request_id = _approval_request_id(
+                        claim.attempt_id, event.run_id, hermes_approval_id
+                    )
+                    awaiting_payload = {
+                        "approval_request_id": approval_request_id,
+                        "action_kind": action_kind,
+                        "action_label": action_label,
+                        "action_preview": action_preview,
+                        "expires_at": expires_at,
+                    }
+                    sequence += 1
+                    try:
+                        await _retry_response_loss(
+                            lambda current_sequence=sequence, current_payload=awaiting_payload: (
+                                self.foundry.event(
+                                    claim.attempt_id,
+                                    claim.lease_token,
+                                    stream_id=claim.stream_id,
+                                    sequence=current_sequence,
+                                    event_type="execution.awaiting_action",
+                                    payload=current_payload,
+                                    event_id=deterministic_event_id(
+                                        claim.attempt_id,
+                                        claim.stream_id,
+                                        current_sequence,
+                                    ),
+                                )
+                            )
+                        )
+                    except ResponseLossError:
+                        lost.set()
+                        await _close_stream(stream)
+                        try:
+                            return await self.foundry.stopped(
+                                claim.attempt_id,
+                                claim.lease_token,
+                                reason="event_response_lost",
+                            )
+                        except FoundryError:
+                            return None
+                    pending_approval = {
+                        "request_id": approval_request_id,
+                        "hermes_id": hermes_approval_id,
+                        "run_id": event.run_id,
+                        "expires_at": expires_at,
+                        "decision": "",
+                    }
+                    (
+                        wait_outcome,
+                        decision,
+                        acknowledgement_deadline,
+                    ) = await self._wait_for_approval(
+                        claim,
+                        approval_request_id,
+                        expires_at,
+                        lost,
+                    )
+                    if lost.is_set():
+                        break
+                    if wait_outcome == "outcome_unknown":
+                        raise HermesError(
+                            "Foundry approval acknowledgement was not confirmed"
+                        )
+                    if wait_outcome == "expired" or time.time() >= expiry:
+                        pending_approval["decision"] = ""
+                        pending_approval["wait_outcome"] = "expired"
+                        continue
+                    if decision is not None:
+                        try:
+                            acknowledgement_epoch = _approval_time(
+                                acknowledgement_deadline
+                            )
+                        except HermesMalformedResponse:
+                            raise FoundryError(
+                                "Foundry approval acknowledgement deadline was malformed",
+                                code="MALFORMED_RESPONSE",
+                            ) from None
+                        if min(expiry, acknowledgement_epoch) <= time.time():
+                            raise HermesError(
+                                "Foundry approval acknowledgement was not confirmed"
+                            )
+                    resolver_deadline: Any = expires_at
+                    if decision is not None and acknowledgement_epoch < expiry:
+                        resolver_deadline = acknowledgement_deadline
+                    resolver = getattr(self.hermes, "resolve_approval", None)
+                    if not callable(resolver):
+                        raise HermesError("Hermes approval resolution was unavailable")
+                    # Expiry/cancellation is resolved as a one-time reject so
+                    # the blocked guard cannot execute.  The durable Foundry
+                    # outcome remains the state returned by its poll.
+                    hermes_decision = decision or "reject"
+                    resolve_remaining = expiry - time.time()
+                    if decision is not None:
+                        resolve_remaining = min(
+                            resolve_remaining,
+                            acknowledgement_epoch - time.time(),
+                        )
+                    if resolve_remaining <= 0:
+                        raise HermesError(
+                            "Foundry approval acknowledgement was not confirmed"
+                        )
+                    try:
+                        resolved = resolver(
+                            claim.hermes_profile_key,
+                            session_id,
+                            event.run_id,
+                            hermes_approval_id,
+                            hermes_decision,
+                            session_key=identifiers.session_key,
+                            deadline_at=resolver_deadline,
+                        )
+                        if inspect.isawaitable(resolved):
+                            resolved = await asyncio.wait_for(
+                                resolved, resolve_remaining
+                            )
+                        if isinstance(resolved, Mapping) and resolved.get("status") in {
+                            "expired",
+                            "cancelled",
+                        }:
+                            pending_approval["wait_outcome"] = resolved["status"]
+                    except TimeoutError as exc:
+                        raise HermesTimeout(
+                            "Hermes approval resolution timed out"
+                        ) from exc
+                    except (HermesTimeout, HermesDisconnected):
+                        if decision is None:
+                            raise
+                        await self._reconcile_hermes_approval(
+                            claim.hermes_profile_key,
+                            session_id,
+                            event.run_id,
+                            hermes_approval_id,
+                            decision,
+                            identifiers.session_key,
+                            acknowledgement_deadline,
+                            pending_approval,
+                        )
+                    pending_approval["decision"] = decision or ""
+                    pending_approval.setdefault("wait_outcome", wait_outcome)
+                    continue
+                if event.name == "approval.responded":
+                    if pending_approval is None:
+                        raise HermesMalformedResponse(
+                            "Hermes approval response had no pending request"
+                        )
+                    if set(event.payload) != {"hermes_approval_id", "outcome"}:
+                        raise HermesMalformedResponse(
+                            "Hermes approval response was malformed"
+                        )
+                    if (
+                        event.payload.get("hermes_approval_id")
+                        != pending_approval["hermes_id"]
+                    ):
+                        raise HermesMalformedResponse(
+                            "Hermes approval response identity changed"
+                        )
+                    outcome = event.payload.get("outcome")
+                    if outcome not in {"approved", "rejected", "expired", "cancelled"}:
+                        raise HermesMalformedResponse(
+                            "Hermes approval response outcome was invalid"
+                        )
+                    decision = pending_approval.get("decision")
+                    wait_outcome = pending_approval.get("wait_outcome")
+                    if wait_outcome in {"expired", "cancelled"}:
+                        if outcome != wait_outcome:
+                            raise HermesMalformedResponse(
+                                "Hermes approval response conflicted with terminal receipt"
+                            )
+                    elif decision and outcome != (
+                        "approved" if decision == "approve" else "rejected"
+                    ):
+                        raise HermesMalformedResponse(
+                            "Hermes approval response conflicted with decision"
+                        )
+                    resolution_payload = {
+                        "approval_request_id": pending_approval["request_id"],
+                        "outcome": outcome,
+                    }
+                    sequence += 1
+                    try:
+                        await _retry_response_loss(
+                            lambda current_sequence=sequence, current_payload=resolution_payload: (
+                                self.foundry.event(
+                                    claim.attempt_id,
+                                    claim.lease_token,
+                                    stream_id=claim.stream_id,
+                                    sequence=current_sequence,
+                                    event_type="execution.approval_resolved",
+                                    payload=current_payload,
+                                    event_id=deterministic_event_id(
+                                        claim.attempt_id,
+                                        claim.stream_id,
+                                        current_sequence,
+                                    ),
+                                )
+                            )
+                        )
+                    except ResponseLossError:
+                        lost.set()
+                        await _close_stream(stream)
+                        try:
+                            return await self.foundry.stopped(
+                                claim.attempt_id,
+                                claim.lease_token,
+                                reason="event_response_lost",
+                            )
+                        except FoundryError:
+                            return None
+                    pending_approval = None
+                    continue
                 sequence += 1
                 try:
                     await _retry_response_loss(
@@ -1425,41 +2980,116 @@ class FoundryWorker:
                 )
             await _close_stream(stream)
             stream = None
-            try:
-                await _retry_response_loss(
-                    lambda: self.foundry.bind(
+            if claim.routine_id is not None:
+                try:
+                    bind_routine = getattr(self.foundry, "bind_routine", None)
+                    if not callable(bind_routine):
+                        raise HermesError(
+                            "Foundry routine session binding was unavailable"
+                        )
+                    await _retry_response_loss(
+                        lambda: bind_routine(
+                            claim.attempt_id,
+                            claim.lease_token,
+                            expected_session_id=claim.session_id,
+                            effective_session_id=terminal.session_id,
+                        )
+                    )
+                except ResponseLossError:
+                    return await self.foundry.stopped(
                         claim.attempt_id,
                         claim.lease_token,
-                        cloud_conversation_ref=conversation_id,
-                        expected_session_id=claim.session_id,
-                        effective_session_id=terminal.session_id,
+                        reason="session_response_lost",
                     )
-                )
-            except ResponseLossError:
-                return await self.foundry.stopped(
-                    claim.attempt_id,
-                    claim.lease_token,
-                    reason="session_response_lost",
-                )
             sequence += 1
-            try:
+            if claim.routine_id is not None:
+                routine_result = getattr(self.foundry, "routine_result", None)
+                if not callable(routine_result):
+                    raise HermesError("Foundry routine result endpoint was unavailable")
+                if not isinstance(terminal.payload, Mapping):
+                    raise HermesMalformedResponse("Hermes routine result was malformed")
+                outcome = terminal.payload.get("outcome")
+                if outcome not in {"changed", "unchanged", "failed"}:
+                    raise HermesMalformedResponse(
+                        "Hermes routine result outcome was invalid"
+                    )
+                typed_text = terminal.payload.get("result_text")
+                if (
+                    not isinstance(typed_text, str)
+                    or not typed_text
+                    or "references" not in terminal.payload
+                ):
+                    raise HermesMalformedResponse(
+                        "Hermes routine result was missing its typed report"
+                    )
+                routine_text = typed_text
+                if len(routine_text.encode("utf-8")) > MAX_ROUTINE_TEXT_BYTES:
+                    raise HermesMalformedResponse(
+                        "Hermes routine result text was too large"
+                    )
+                references = _routine_references(
+                    terminal.payload.get("references", []),
+                    text=routine_text,
+                )
                 return await _retry_response_loss(
-                    lambda: self.foundry.complete(
+                    lambda: routine_result(
                         claim.attempt_id,
                         claim.lease_token,
-                        stream_id=claim.stream_id,
+                        event_id=deterministic_event_id(
+                            claim.attempt_id, claim.stream_id, sequence
+                        ),
                         sequence=sequence,
-                        payload=terminal.payload,
-                        receipt={
-                            "code": "ok",
-                            **(
-                                {"history_verified": True}
-                                if expected_history_marker is not None
-                                else {}
-                            ),
-                        },
+                        outcome=outcome,
+                        text=routine_text,
+                        references=references,
+                        delayed=bool(claim.payload.get("delayed", False)),
                     )
                 )
+            try:
+                with observe_runtime_operation(
+                    "attempt.finalization",
+                    attempt_id=claim.attempt_id,
+                    execution_id=claim.execution_id,
+                    profile_id=claim.profile_id,
+                    **self._observability_context(),
+                ) as finalization:
+                    try:
+                        return await _retry_response_loss(
+                            lambda: self.foundry.complete(
+                                claim.attempt_id,
+                                claim.lease_token,
+                                stream_id=claim.stream_id,
+                                sequence=sequence,
+                                payload=terminal.payload,
+                                receipt={
+                                    "code": "ok",
+                                    **(
+                                        {"history_verified": True}
+                                        if expected_history_marker is not None
+                                        else {}
+                                    ),
+                                },
+                                session_binding=(
+                                    None
+                                    if claim.routine_id is not None
+                                    else {
+                                        "cloud_conversation_ref": conversation_id,
+                                        "expected_session_id": claim.session_id,
+                                        "effective_session_id": terminal.session_id,
+                                    }
+                                ),
+                            )
+                        )
+                    except FoundryError as exc:
+                        finalization.update(
+                            status_code=exc.status or type(exc).status,
+                            reason_code=(
+                                "complete_response_lost"
+                                if isinstance(exc, ResponseLossError)
+                                else "complete_rejected"
+                            ),
+                        )
+                        raise
             except ResponseLossError:
                 # Completion may already be durable; only stopped is safe to
                 # attempt after the bounded replay also loses its response.
@@ -1498,6 +3128,15 @@ class FoundryWorker:
                     )
                 except FoundryError:
                     return None
+            if claim.routine_id is not None and isinstance(exc, ResponseLossError):
+                try:
+                    return await self.foundry.stopped(
+                        claim.attempt_id,
+                        claim.lease_token,
+                        reason="routine_result_response_lost",
+                    )
+                except FoundryError:
+                    return None
             failure_code = getattr(exc, "code", "runtime_error")
             # A retryable failure is only safe after the Hermes producer has
             # stopped.  Close it before issuing the durable fail/requeue.
@@ -1508,6 +3147,24 @@ class FoundryWorker:
             # failed completion at the boundary must not manufacture an
             # invalid sequence or bypass lease-expiry reconciliation.
             sequence = min(max(sequence + 1, 1), MAX_TERMINAL_SEQUENCE)
+            if claim.routine_id is not None:
+                try:
+                    return await self._report_routine_failure(
+                        claim,
+                        sequence=sequence,
+                    )
+                except ResponseLossError:
+                    lost.set()
+                    try:
+                        return await self.foundry.stopped(
+                            claim.attempt_id,
+                            claim.lease_token,
+                            reason="routine_result_response_lost",
+                        )
+                    except FoundryError:
+                        return None
+                except FoundryError:
+                    return None
             failure_payload = {
                 "code": failure_code,
                 "retryable": False,
@@ -1539,6 +3196,9 @@ class FoundryWorker:
             except FoundryError:
                 return None
         finally:
+            self._resource_registry.release(resource_token)
+            if publication_context is not None and self._publication_bridge is not None:
+                self._publication_bridge.deactivate(publication_context)
             if renewal is not None:
                 renewal.cancel()
                 await asyncio.gather(renewal, return_exceptions=True)
@@ -1560,6 +3220,7 @@ class FoundryWorker:
                 "worker.started",
                 operation="worker_loop",
                 outcome="started",
+                **self._observability_context(),
             )
         )
         try:
@@ -1576,6 +3237,8 @@ class FoundryWorker:
                     duration_ms=(time.monotonic() - started_at) * 1000,
                     outcome="error",
                     error_type=type(error).__name__,
+                    error_code=getattr(error, "code", None),
+                    **self._observability_context(),
                 )
             )
             raise
@@ -1585,6 +3248,7 @@ class FoundryWorker:
                 operation="worker_loop",
                 duration_ms=(time.monotonic() - started_at) * 1000,
                 outcome="success",
+                **self._observability_context(),
             )
         )
         return results
@@ -1617,11 +3281,25 @@ class FoundryWorker:
         idle_backoff = initial_idle_delay
         poll_delay = initial_idle_delay
         retry_pending = False
-        while not self._stopping:
-            if await self._reconcile_profiles_or_wait(
-                force=True, retry_delay=poll_delay
-            ):
-                break
+        initialized = False
+        with observe_runtime_operation(
+            "worker.initialization",
+            **self._observability_context(),
+        ) as initialization:
+            while not self._stopping:
+                if await self._reconcile_profiles_or_wait(
+                    force=True, retry_delay=poll_delay
+                ):
+                    initialization.update(**self._observability_context())
+                    initialized = True
+                    break
+            if not initialized:
+                initialization.update(
+                    outcome="error",
+                    error_type="WorkerStopped",
+                    error_code="worker_stopped",
+                    reason_code="stopped",
+                )
         while not self._stopping and (max_turns is None or len(results) < max_turns):
             if not await self._reconcile_profiles_or_wait(retry_delay=poll_delay):
                 continue
@@ -1668,9 +3346,17 @@ class FoundryWorker:
                     retry_pending = False
                 if claim is None:
                     empty += 1
-                    poll_delay = _jittered_idle_delay(idle_backoff, initial_idle_delay)
-                    idle_backoff = min(MAX_IDLE_BACKOFF_SECONDS, idle_backoff * 2)
+                    if self._fast_polls_remaining:
+                        self._fast_polls_remaining -= 1
+                        idle_backoff = initial_idle_delay
+                        poll_delay = initial_idle_delay
+                    else:
+                        poll_delay = _jittered_idle_delay(
+                            idle_backoff, initial_idle_delay
+                        )
+                        idle_backoff = min(MAX_IDLE_BACKOFF_SECONDS, idle_backoff * 2)
                     break
+                self._fast_polls_remaining = 0
                 idle_backoff = initial_idle_delay
                 poll_delay = initial_idle_delay
                 task = asyncio.create_task(self._run_claim(claim))
@@ -1701,6 +3387,35 @@ class FoundryWorker:
                 continue
             if (idle_cycles is not None and empty >= idle_cycles) or self._stopping:
                 break
+            if self._activity_wait_enabled and not retry_pending and poll_delay > 1.0:
+                try:
+                    waited = await self._wait_for_activity()
+                except (FencedError, InvalidCredentialError):
+                    self._stopping = True
+                    break
+                except NotReadyError:
+                    self._profiles_reconciled = False
+                    poll_delay = _jittered_idle_delay(idle_backoff, initial_idle_delay)
+                    idle_backoff = min(MAX_IDLE_BACKOFF_SECONDS, idle_backoff * 2)
+                    await asyncio.sleep(poll_delay)
+                    continue
+                except (ResponseLossError, RateLimitedError, ServiceUnavailableError):
+                    poll_delay = _jittered_idle_delay(idle_backoff, initial_idle_delay)
+                    idle_backoff = min(MAX_IDLE_BACKOFF_SECONDS, idle_backoff * 2)
+                    await asyncio.sleep(poll_delay)
+                    continue
+                if waited is not None:
+                    self._activity_revision = max(
+                        self._activity_revision, waited.revision
+                    )
+                    if waited.reason == "changed":
+                        self._profiles_reconciled = False
+                        empty = 0
+                        idle_backoff = initial_idle_delay
+                        poll_delay = initial_idle_delay
+                        continue
+                    await asyncio.sleep(random.uniform(0.1, 0.25))
+                    continue
             await asyncio.sleep(poll_delay)
         if self._active:
             done, _ = await asyncio.wait(self._active)
@@ -1732,13 +3447,112 @@ class FoundryWorker:
                     "runtime.operation.retried",
                     operation="profile_reconciliation",
                     outcome="retry",
+                    retry_count=self._profile_reconciliation_retry_attempts,
                     error_type=type(error).__name__,
+                    error_code=getattr(error, "code", None),
+                    **self._observability_context(),
                 )
             )
-            await asyncio.sleep(bounded_delay)
+            with observe_runtime_operation(
+                "profile.reconciliation_retry_wait",
+                retry_count=self._profile_reconciliation_retry_attempts,
+                **self._observability_context(),
+            ):
+                await asyncio.sleep(bounded_delay)
             return False
         self._profile_reconciliation_retry_attempts = 0
         return True
+
+    async def _wait_for_activity(self) -> ActivityWaitReceipt | None:
+        method = getattr(self.foundry, "wait_for_activity", None)
+        if not callable(method):
+            return None
+        try:
+            result = method(self._activity_revision, self._activity_wait_seconds)
+            if inspect.isawaitable(result):
+                result = await result
+        except FoundryError as error:
+            if error.status == 422:
+                # Independently deployed servers may allow a shorter wait.
+                # Optional acceleration must never stop the runtime worker.
+                self._activity_wait_enabled = False
+                return None
+            # Older Foundry servers do not know this optional endpoint.  A
+            # malformed optional response has the same safe fallback: keep
+            # the established bounded polling loop alive.
+            if error.status == 404 or error.code == "MALFORMED_RESPONSE":
+                raise ServiceUnavailableError(
+                    "Foundry activity wait is unavailable",
+                    status=503,
+                    code="ACTIVITY_WAIT_UNAVAILABLE",
+                ) from error
+            raise
+        if result is None:
+            return None
+        if isinstance(result, ActivityWaitReceipt):
+            return result
+        if isinstance(result, Mapping):
+            revision = result.get("revision")
+            reason = result.get("reason")
+        else:
+            revision = getattr(result, "revision", None)
+            reason = getattr(result, "reason", None)
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+            or reason not in {"changed", "timeout"}
+        ):
+            raise ServiceUnavailableError(
+                "Foundry activity wait response was malformed",
+                status=503,
+                code="MALFORMED_RESPONSE",
+            )
+        return ActivityWaitReceipt(revision=revision, reason=reason)
+
+    async def _recover_publications(self, snapshot: Any) -> None:
+        bridge = self._publication_bridge
+        now = self._clock()
+        if (
+            bridge is None
+            or self._last_publication_recovery is not None
+            and now - self._last_publication_recovery
+            < DEFAULT_PUBLICATION_RECOVERY_INTERVAL
+        ):
+            return
+        profiles = sorted(
+            (
+                (profile_id, profile_key)
+                for profile in (getattr(snapshot, "profiles", ()) if snapshot else ())
+                if isinstance((profile_id := getattr(profile, "profile_id", None)), str)
+                and isinstance(
+                    (profile_key := getattr(profile, "hermes_profile_key", None)), str
+                )
+            ),
+            key=lambda item: item[0],
+        )
+        if not profiles:
+            return
+        self._last_publication_recovery = now
+        profile_id, profile_key = next(
+            (
+                item
+                for item in profiles
+                if item[0] > (self._publication_profile_cursor or "")
+            ),
+            profiles[0],
+        )
+        self._publication_profile_cursor = profile_id
+        try:
+            await bridge.recover(profile_id, profile_key, limit=20)
+        except (
+            FoundryError,
+            IncomingFileError,
+            ProfileStoreError,
+            OSError,
+            ValueError,
+        ):
+            return
 
     async def _reconcile_profiles(self, *, force: bool = False) -> None:
         if self.profile_reconciler is None:
@@ -1752,10 +3566,21 @@ class FoundryWorker:
             < self._profile_reconcile_interval
         ):
             return
-        await self.profile_reconciler.reconcile()
+        report = await self.profile_reconciler.reconcile()
+        if getattr(report, "materialized", ()):
+            self._fast_polls_remaining = POST_MATERIALIZATION_FAST_POLLS
         self._profiles_reconciled = True
         self._last_profile_reconciliation = self._clock()
         snapshot = getattr(self.foundry, "last_reconciliation_snapshot", None)
+        await self._recover_publications(snapshot)
+        if snapshot is not None:
+            activity_revision = getattr(snapshot, "activity_revision", 0)
+            if isinstance(activity_revision, int) and not isinstance(
+                activity_revision, bool
+            ):
+                self._activity_revision = max(
+                    self._activity_revision, activity_revision
+                )
         if (
             snapshot is not None
             and snapshot.runtime_start_epoch is not None
@@ -1767,25 +3592,39 @@ class FoundryWorker:
             )
         ):
             try:
-                hermes_ready = await self._hermes_ready()
+                with observe_runtime_operation(
+                    "readiness.hermes_health",
+                    **self._observability_context(),
+                ) as health_operation:
+                    hermes_ready = await self._hermes_ready()
+                    if not hermes_ready:
+                        health_operation.update(
+                            outcome="error",
+                            error_type="HermesNotReady",
+                            error_code="hermes_not_ready",
+                            reason_code="not_ready",
+                        )
+                        raise ServiceUnavailableError(
+                            "Hermes is not ready for a runtime receipt",
+                            status=503,
+                            code="HERMES_NOT_READY",
+                        )
             except HermesError as error:
                 raise ServiceUnavailableError(
                     "Hermes is not ready for a runtime receipt",
                     status=503,
                     code="HERMES_NOT_READY",
                 ) from error
-            if not hermes_ready:
-                raise ServiceUnavailableError(
-                    "Hermes is not ready for a runtime receipt",
-                    status=503,
-                    code="HERMES_NOT_READY",
-                )
             try:
-                await self.foundry.report_readiness(
-                    boot_id=self.boot_id,
-                    reconciled_generation=snapshot.machine_generation,
-                    runtime_start_epoch=snapshot.runtime_start_epoch,
-                )
+                with observe_runtime_operation(
+                    "readiness.publication",
+                    **self._observability_context(),
+                ):
+                    await self.foundry.report_readiness(
+                        boot_id=self.boot_id,
+                        reconciled_generation=snapshot.machine_generation,
+                        runtime_start_epoch=snapshot.runtime_start_epoch,
+                    )
             except FencedError as error:
                 self._profiles_reconciled = False
                 raise NotReadyError(
@@ -1824,9 +3663,14 @@ FoundrySupervisor = FoundryWorker
 
 
 __all__ = [
+    "MAX_APPROVAL_LABEL_CHARS",
+    "MAX_APPROVAL_LIFETIME_SECONDS",
+    "MAX_APPROVAL_PREVIEW_BYTES",
     "MAX_CLAIM_SLOTS",
     "MAX_RUNTIME_EVENT_SEQUENCE",
     "MAX_TERMINAL_SEQUENCE",
+    "ActivityWaitReceipt",
+    "ApprovalStatus",
     "EventReceipt",
     "FencedError",
     "FoundryClaim",

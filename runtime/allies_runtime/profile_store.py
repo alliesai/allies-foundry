@@ -1,4 +1,4 @@
-"""Dependency-free, secret-safe materialization of one Hermes profile.
+"""Secret-safe materialization of one Hermes profile.
 
 The profile store owns only the files below ``<volume>/profiles/<key>``.  The
 Foundry lifecycle service remains the authority for the profile's lifecycle;
@@ -28,13 +28,26 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
+from .errors import IncomingFileError
+from .soul_upgrade import legacy_soul_for
+
+SKILLS_CATALOG = "/opt/allies/skills"
+SKILLS_CONFIG = f"skills:\n  external_dirs: [{json.dumps(SKILLS_CATALOG)}]\n"
+
 MANIFEST_NAME = ".allies-profile.json"
 MANIFEST_SCHEMA = "allies.profile"
 MANIFEST_VERSION = 2
 PROFILE_FINGERPRINT_VERSION = 2
 DEFAULT_MEMORY_PROVIDER = "allies_mnemosyne"
-DEFAULT_MEMORY_MODE = "context_only"
+CONTEXT_ONLY_MEMORY_MODE = "context_only"
+DEFAULT_MEMORY_MODE = "narrow_tools"
 DEFAULT_MEMORY_POLICY_VERSION = "allies-mnemosyne-v1"
+# Absolute compaction trigger; sessions compact at the lower of the
+# ratio-based threshold and this count. See backend DEFAULT_COMPRESSION_THRESHOLD_TOKENS.
+DEFAULT_COMPRESSION_THRESHOLD_TOKENS = 100_000
+# Previous default model route, kept for the legacy upgrade path only.
+LEGACY_MODEL_DEFAULT = "gpt-5.6-luna"
+LEGACY_MODEL_BASE_URL = "https://api.openai.com/v1"
 MEMORY_MODES = frozenset({"context_only", "narrow_tools"})
 MEMORY_TOOLS = frozenset(
     {
@@ -48,6 +61,7 @@ MEMORY_TOOLS = frozenset(
         "mnemosyne_update",
     }
 )
+DEFAULT_MEMORY_TOOL_ALLOWLIST = tuple(sorted(MEMORY_TOOLS))
 MEMORY_TOOL_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 PROFILE_KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 ENV_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
@@ -74,6 +88,7 @@ MAX_CLEANUP_ENTRIES = 8_192
 DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
 DEFAULT_STALE_LOCK_SECONDS = 60.0
 DEFAULT_CLEANUP_TIMEOUT_SECONDS = 30.0
+MAX_DELETION_EXPIRY_SECONDS = 24 * 60 * 60
 _RECEIPT_ID_PATTERN = re.compile(r"^(?:pr|cr)-[0-9a-f]{32}$")
 _SAFE_REPAIR_CODES = frozenset(
     {
@@ -130,6 +145,15 @@ class ProfileCleanupStatus(StrEnum):
     FENCED = "FENCED"
 
 
+class BindingApplyStatus(StrEnum):
+    APPLIED = "APPLIED"
+    CURRENT = "CURRENT"
+    REPAIR_REQUIRED = "REPAIR_REQUIRED"
+
+
+BINDING_SIDECAR_NAME = ".allies-binding.json"
+
+
 def derive_profile_key(foundry_profile_id: str | uuid.UUID) -> str:
     """Derive the immutable Hermes key used for a Foundry profile UUID."""
 
@@ -184,6 +208,13 @@ def _canonical_json(value: Any) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _fingerprint_digest(payload: Mapping[str, object]) -> str:
+    return hashlib.sha256(
+        f"allies-profile-seed-v{PROFILE_FINGERPRINT_VERSION}\0".encode()
+        + _canonical_json(payload)
+    ).hexdigest()
 
 
 def _string_generation(value: str | int) -> str:
@@ -281,9 +312,10 @@ class ProfileSeed:
     memory_provider: str = DEFAULT_MEMORY_PROVIDER
     memory_mode: str = DEFAULT_MEMORY_MODE
     memory_policy_version: str = DEFAULT_MEMORY_POLICY_VERSION
-    memory_tool_allowlist: tuple[str, ...] = ()
+    memory_tool_allowlist: tuple[str, ...] = DEFAULT_MEMORY_TOOL_ALLOWLIST
     memory_profile_isolation: bool = True
     memory_sync_roles: tuple[str, ...] = ()
+    compression_threshold_tokens: int = DEFAULT_COMPRESSION_THRESHOLD_TOKENS
 
     def __post_init__(self) -> None:
         try:
@@ -472,6 +504,8 @@ class ProfileSeed:
         )
         if not set(self.memory_tool_allowlist).issubset(MEMORY_TOOLS):
             raise ProfileInputError("memory tool allowlist is unsupported")
+        if self.compression_threshold_tokens != DEFAULT_COMPRESSION_THRESHOLD_TOKENS:
+            raise ProfileInputError("compression threshold tokens is unsupported")
         if self.memory_sync_roles:
             raise ProfileInputError("memory sync roles are disabled")
         if (
@@ -479,14 +513,20 @@ class ProfileSeed:
             or not self.memory_profile_isolation
         ):
             raise ProfileInputError("memory profile isolation is required")
-        if self.memory_mode == DEFAULT_MEMORY_MODE and self.memory_tool_allowlist:
+        if (
+            self.memory_mode == CONTEXT_ONLY_MEMORY_MODE
+            and self.memory_tool_allowlist
+        ):
             raise ProfileInputError("context-only memory cannot advertise tools")
 
     @property
     def fingerprint(self) -> str:
         """Return a deterministic digest containing no resolved credentials."""
 
-        payload = {
+        return _fingerprint_digest(self._fingerprint_payload())
+
+    def _fingerprint_payload(self) -> dict[str, object]:
+        return {
             "schema_version": self.seed_version,
             "foundry_profile_id": self.foundry_profile_id,
             "hermes_profile_key": self.hermes_profile_key,
@@ -508,11 +548,32 @@ class ProfileSeed:
                 "profile_isolation": self.memory_profile_isolation,
                 "sync_roles": list(self.memory_sync_roles),
             },
+            "compression": {
+                "threshold_tokens": self.compression_threshold_tokens,
+            },
         }
-        return hashlib.sha256(
-            f"allies-profile-seed-v{PROFILE_FINGERPRINT_VERSION}\0".encode()
-            + _canonical_json(payload)
-        ).hexdigest()
+
+    @property
+    def legacy_soul_fingerprint(self) -> str | None:
+        """Return the fingerprint from before the platform-layer soul, if any."""
+
+        legacy = self.legacy_soul_seed
+        return None if legacy is None else legacy.fingerprint
+
+    @property
+    def legacy_soul_seed(self) -> ProfileSeed | None:
+        """Return this seed with its pre-platform-layer soul, if managed."""
+
+        legacy = legacy_soul_for(self.personality)
+        return None if legacy is None else replace(self, personality=legacy)
+
+    @property
+    def legacy_compression_fingerprint(self) -> str:
+        """Return the fingerprint from before the compression threshold."""
+
+        payload = self._fingerprint_payload()
+        del payload["compression"]
+        return _fingerprint_digest(payload)
 
     @property
     def legacy_fingerprint(self) -> str:
@@ -536,6 +597,75 @@ class ProfileSeed:
         return hashlib.sha256(
             b"allies-profile-seed-v1\0" + _canonical_json(payload)
         ).hexdigest()
+
+    @property
+    def legacy_memory_fingerprint(self) -> str:
+        """Return the fingerprint of the previous managed memory default."""
+
+        swapped = replace(
+            self,
+            memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+            memory_tool_allowlist=(),
+        )
+        payload = swapped._fingerprint_payload()
+        del payload["compression"]
+        return _fingerprint_digest(payload)
+
+    @property
+    def legacy_model_fingerprint(self) -> str:
+        """Return the fingerprint from before the default model switch."""
+
+        payload = self._fingerprint_payload()
+        payload["model"] = {
+            "provider": self.provider,
+            "default": LEGACY_MODEL_DEFAULT,
+            "base_url": LEGACY_MODEL_BASE_URL,
+        }
+        return _fingerprint_digest(payload)
+
+    @property
+    def legacy_model_fingerprints(self) -> frozenset[str]:
+        """Return every pre-model-switch fingerprint for this seed's soul."""
+
+        return frozenset(
+            {
+                self.legacy_model_fingerprint,
+                self.legacy_memory_model_fingerprint,
+                self.legacy_compression_model_fingerprint,
+            }
+        )
+
+    @property
+    def legacy_memory_model_fingerprint(self) -> str:
+        """Return the fingerprint predating both memory and model defaults."""
+
+        swapped = replace(
+            self,
+            memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+            memory_tool_allowlist=(),
+        )
+        payload = swapped._fingerprint_payload()
+        del payload["compression"]
+        payload["model"] = {
+            "provider": self.provider,
+            "default": LEGACY_MODEL_DEFAULT,
+            "base_url": LEGACY_MODEL_BASE_URL,
+        }
+        return _fingerprint_digest(payload)
+
+    @property
+    def legacy_compression_model_fingerprint(self) -> str:
+        """Return the fingerprint of a volume upgraded past memory defaults
+        but asleep since before the compression threshold."""
+
+        payload = self._fingerprint_payload()
+        del payload["compression"]
+        payload["model"] = {
+            "provider": self.provider,
+            "default": LEGACY_MODEL_DEFAULT,
+            "base_url": LEGACY_MODEL_BASE_URL,
+        }
+        return _fingerprint_digest(payload)
 
     @property
     def model_provider_name(self) -> str:
@@ -597,6 +727,8 @@ class CleanupReceipt:
     operation_id: str
     receipt_id: str
     repair_code: str | None = None
+    attempt_id: str | None = None
+    request_digest: str | None = None
 
     @property
     def result_code(self) -> str:
@@ -614,6 +746,29 @@ class CleanupReceipt:
             "lifecycle_epoch": self.lifecycle_epoch,
             "operation_id": self.operation_id,
             "receipt_id": self.receipt_id,
+            "repair_code": self.repair_code,
+            "attempt_id": self.attempt_id,
+            "request_digest": self.request_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BindingReceipt:
+    status: BindingApplyStatus
+    profile_key: str
+    generation: int
+    repair_code: str | None = None
+
+    @property
+    def result_code(self) -> str:
+        return self.status.value.lower()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "result_code": self.result_code,
+            "profile_key": self.profile_key,
+            "generation": self.generation,
             "repair_code": self.repair_code,
         }
 
@@ -654,22 +809,179 @@ def _profile_config_bytes(seed: ProfileSeed) -> bytes:
     ]
     if seed.base_url is not None:
         lines.append(f"  base_url: {_yaml_string(seed.base_url)}")
-    lines.extend(
-        [
-            "memory:",
-            f"  provider: {_yaml_string(seed.memory_provider)}",
-            f"  mode: {_yaml_string(seed.memory_mode)}",
-            f"  policy_version: {_yaml_string(seed.memory_policy_version)}",
-            f"  profile_isolation: {'true' if seed.memory_profile_isolation else 'false'}",
-            f"  tools: {json.dumps(list(seed.memory_tool_allowlist), ensure_ascii=False)}",
-            f"  sync_roles: {json.dumps(list(seed.memory_sync_roles), ensure_ascii=False)}",
-            "  mnemosyne:",
-            "    profile_isolation: true",
-            "    shared_surface_read: false",
-            "    storage: mnemosyne",
-        ]
+    lines.extend(_memory_config_lines(seed))
+    lines.extend(_compression_config_lines(seed))
+    return ("\n".join(lines) + "\n" + SKILLS_CONFIG).encode("utf-8")
+
+
+def _memory_config_lines(seed: ProfileSeed) -> list[str]:
+    return [
+        "memory:",
+        f"  provider: {_yaml_string(seed.memory_provider)}",
+        f"  mode: {_yaml_string(seed.memory_mode)}",
+        f"  policy_version: {_yaml_string(seed.memory_policy_version)}",
+        f"  profile_isolation: {'true' if seed.memory_profile_isolation else 'false'}",
+        f"  tools: {json.dumps(list(seed.memory_tool_allowlist), ensure_ascii=False)}",
+        f"  sync_roles: {json.dumps(list(seed.memory_sync_roles), ensure_ascii=False)}",
+        "  mnemosyne:",
+        "    profile_isolation: true",
+        "    shared_surface_read: false",
+        "    storage: mnemosyne",
+    ]
+
+
+def _compression_config_lines(seed: ProfileSeed) -> list[str]:
+    return [
+        "compression:",
+        f"  threshold_tokens: {seed.compression_threshold_tokens}",
+    ]
+
+
+def _replace_legacy_memory_config(content: bytes, seed: ProfileSeed) -> bytes:
+    content = _config_with_catalog(content)
+    import yaml
+
+    config = yaml.safe_load(content)
+    legacy_memory = {
+        "provider": DEFAULT_MEMORY_PROVIDER,
+        "mode": CONTEXT_ONLY_MEMORY_MODE,
+        "policy_version": DEFAULT_MEMORY_POLICY_VERSION,
+        "profile_isolation": True,
+        "tools": [],
+        "sync_roles": [],
+        "mnemosyne": {
+            "profile_isolation": True,
+            "shared_surface_read": False,
+            "storage": "mnemosyne",
+        },
+    }
+    desired_memory = {
+        "provider": seed.memory_provider,
+        "mode": seed.memory_mode,
+        "policy_version": seed.memory_policy_version,
+        "profile_isolation": seed.memory_profile_isolation,
+        "tools": list(seed.memory_tool_allowlist),
+        "sync_roles": list(seed.memory_sync_roles),
+        "mnemosyne": legacy_memory["mnemosyne"],
+    }
+    if not isinstance(config, dict):
+        raise TypeError("legacy memory config does not match")
+    if config.get("memory") == desired_memory:
+        return content
+    if config.get("memory") != legacy_memory:
+        raise ValueError("legacy memory config does not match")
+    config["memory"] = desired_memory
+    return yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+
+def _replace_legacy_compression_config(content: bytes, seed: ProfileSeed) -> bytes:
+    content = _config_with_catalog(content)
+    import yaml
+
+    config = yaml.safe_load(content)
+    desired = {"threshold_tokens": seed.compression_threshold_tokens}
+    if config.get("compression") == desired:
+        return content
+    if "compression" in config:
+        raise ValueError("legacy compression config does not match")
+    config["compression"] = desired
+    return yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+
+def _replace_legacy_model_config(content: bytes, seed: ProfileSeed) -> bytes:
+    content = _config_with_catalog(content)
+    import yaml
+
+    config = yaml.safe_load(content)
+    desired = {
+        "provider": seed.provider,
+        "default": seed.model,
+        "base_url": seed.base_url,
+    }
+    current = config.get("model")
+    if current == desired:
+        return content
+    if not isinstance(current, dict) or current != {
+        "provider": seed.provider,
+        "default": LEGACY_MODEL_DEFAULT,
+        "base_url": LEGACY_MODEL_BASE_URL,
+    }:
+        raise ValueError("legacy model config does not match")
+    config["model"] = desired
+    return yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode("utf-8")
+
+
+def _is_legacy_managed_memory_manifest(seed: ProfileSeed, manifest: Mapping[str, Any]) -> bool:
+    return (
+        seed.memory_mode == DEFAULT_MEMORY_MODE
+        and seed.memory_tool_allowlist == DEFAULT_MEMORY_TOOL_ALLOWLIST
+        and manifest.get("seed_fingerprint")
+        in {
+            seed.legacy_memory_fingerprint,
+            seed.legacy_memory_model_fingerprint,
+            _fingerprint_digest(
+                replace(
+                    seed,
+                    memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+                    memory_tool_allowlist=(),
+                )._fingerprint_payload()
+            ),
+        }
+        and manifest.get("memory_provider") == DEFAULT_MEMORY_PROVIDER
+        and manifest.get("memory_policy_version") == DEFAULT_MEMORY_POLICY_VERSION
+        and manifest.get("memory_mode") == CONTEXT_ONLY_MEMORY_MODE
+        and manifest.get("memory_tools") == []
+        and manifest.get("memory_storage") == "mnemosyne"
     )
-    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _config_with_catalog(content: bytes) -> bytes:
+    import yaml
+
+    class ProfileConfigLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            keys = [self.construct_object(key, deep=deep) for key, _ in node.value]
+            if any(not isinstance(key, str) for key in keys) or len(set(keys)) != len(
+                keys
+            ):
+                raise ValueError("ambiguous profile config")
+            return super().construct_mapping(node, deep=deep)
+
+    if len(content) > MAX_PROFILE_TEXT_BYTES:
+        raise ValueError("oversized profile config")
+    text = content.decode("utf-8")
+    loader = ProfileConfigLoader(text)
+    try:
+        if any(
+            isinstance(
+                token, (yaml.AliasToken, yaml.AnchorToken, yaml.DocumentEndToken)
+            )
+            for token in yaml.scan(text)
+        ):
+            raise ValueError("unsupported profile config")
+        node = loader.get_single_node()
+        if not isinstance(node, yaml.MappingNode):
+            raise TypeError("profile config must be a mapping")
+        config = loader.construct_document(node)
+        if "skills" in config:
+            skills = config["skills"]
+            dirs = skills.get("external_dirs", []) if isinstance(skills, dict) else []
+            if dirs == SKILLS_CATALOG or (
+                isinstance(dirs, list) and SKILLS_CATALOG in dirs
+            ):
+                return content
+            raise ValueError("custom skills config needs repair")
+        if node.flow_style:
+            raise ValueError("cannot append to flow config")
+        return (
+            content
+            + (b"" if content.endswith(b"\n") else b"\n")
+            + SKILLS_CONFIG.encode()
+        )
+    except yaml.YAMLError:
+        raise ValueError("invalid profile config") from None
+    finally:
+        loader.dispose()
 
 
 def _legacy_soul_bytes(seed: ProfileSeed) -> bytes:
@@ -705,9 +1017,42 @@ def _receipt_id(
     return "pr-" + hashlib.sha256(payload).hexdigest()[:32]
 
 
-def _cleanup_receipt_id(*, profile_key: str, operation_id: str, epoch: int) -> str:
-    payload = f"cleanup\0{profile_key}\0{operation_id}\0{epoch}".encode()
+def _cleanup_receipt_id(
+    *, profile_key: str, operation_id: str, epoch: int, attempt_id: str | None = None
+) -> str:
+    payload = (
+        f"cleanup\0{profile_key}\0{operation_id}\0{epoch}"
+        if attempt_id is None
+        else f"cleanup\0{profile_key}\0{operation_id}\0{attempt_id}\0{epoch}"
+    ).encode()
     return "cr-" + hashlib.sha256(payload).hexdigest()[:32]
+
+
+def _cleanup_attempt_id(value: Any, *, required: bool) -> str | None:
+    if value is None and not required:
+        return None
+    if isinstance(value, uuid.UUID):
+        value = str(value)
+    try:
+        canonical = str(uuid.UUID(value)) if isinstance(value, str) else ""
+    except (TypeError, ValueError):
+        canonical = ""
+    if not isinstance(value, str) or value != value.lower() or canonical != value:
+        raise ProfileInputError("cleanup attempt ID is invalid")
+    return value
+
+
+def _cleanup_request_digest(value: Any, *, required: bool) -> str | None:
+    if value is None and not required:
+        return None
+    if (
+        not isinstance(value, str)
+        or value != value.lower()
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ProfileInputError("cleanup request digest is invalid")
+    return value
 
 
 def _safe_repair_code(value: Any) -> str | None:
@@ -1053,7 +1398,9 @@ class ProfileStore:
             profiles = self.volume_root / "profiles"
             if _is_symlink(profiles):
                 raise ProfileStoreError("profile namespace is symlinked")
-            profiles.mkdir(exist_ok=True)
+            profiles.mkdir(mode=0o755, exist_ok=True)
+            if os.name != "nt" and os.geteuid() == 0:
+                os.chmod(profiles, 0o755)
             if not _is_directory(profiles):
                 raise ProfileStoreError("profile namespace is not a directory")
             return profiles
@@ -1079,7 +1426,9 @@ class ProfileStore:
         if _is_symlink(root):
             raise ProfileStoreError("profile tombstone namespace is symlinked")
         try:
-            root.mkdir(exist_ok=True)
+            root.mkdir(mode=0o755, exist_ok=True)
+            if os.name != "nt" and os.geteuid() == 0:
+                os.chmod(root, 0o755)
         except OSError:
             raise ProfileStoreError(
                 "profile tombstone namespace is unavailable"
@@ -1131,6 +1480,15 @@ class ProfileStore:
             raise ProfileStoreError("profile API key is unavailable") from None
         except (OSError, UnicodeError):
             raise ProfileStoreError("profile API key is unavailable") from None
+
+    def workspace_path(self, profile_key: str) -> Path:
+        """Return the existing private workspace for one materialized profile."""
+
+        profile = self._profile_path(profile_key)
+        workspace = profile / "workspace"
+        if workspace.is_symlink() or not _is_directory(workspace):
+            raise ProfileStoreError("profile workspace is unavailable")
+        return workspace
 
     def _local_lock(self, key: str) -> threading.Lock:
         identity = (str(self.volume_root), key)
@@ -1206,10 +1564,7 @@ class ProfileStore:
         try:
             fd = os.open(
                 path,
-                os.O_CREAT
-                | os.O_EXCL
-                | os.O_WRONLY
-                | getattr(os, "O_BINARY", 0),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
                 mode,
             )
             try:
@@ -1414,6 +1769,10 @@ class ProfileStore:
                 _canonical_json(manifest) + b"\n",
                 mode=0o644,
             )
+            if os.name != "nt" and os.geteuid() == 0:
+                for child in temporary.iterdir():
+                    os.chown(child, 10000, 10000, follow_symlinks=False)
+                os.chown(temporary, 10000, 10000, follow_symlinks=False)
             self._sync_directory(temporary)
             return key, receipt_id
         except ProfileStoreError:
@@ -1479,7 +1838,7 @@ class ProfileStore:
                 manifest.get("foundry_profile_id") != seed.foundry_profile_id
                 or manifest.get("hermes_profile_key") != seed.hermes_profile_key
                 or manifest.get("seed_fingerprint") != seed.legacy_fingerprint
-                or seed.memory_mode != DEFAULT_MEMORY_MODE
+                or seed.memory_mode != CONTEXT_ONLY_MEMORY_MODE
                 or seed.memory_tool_allowlist
                 or seed.memory_sync_roles
                 or manifest.get("lifecycle_epoch") != seed.lifecycle_epoch
@@ -1546,7 +1905,31 @@ class ProfileStore:
             return self._receipt(
                 seed, ProfileProvisionStatus.CONFLICT, repair_code="identity_collision"
             )
-        if manifest.get("seed_fingerprint") != seed.fingerprint:
+        legacy_memory_upgrade = _is_legacy_managed_memory_manifest(seed, manifest)
+        legacy_compression_upgrade = (
+            manifest.get("seed_fingerprint") == seed.legacy_compression_fingerprint
+        )
+        legacy_soul_seed = seed.legacy_soul_seed
+        # A volume asleep since before both switches carries the old soul and model.
+        legacy_soul_model_fingerprints = (
+            legacy_soul_seed.legacy_model_fingerprints
+            if legacy_soul_seed is not None
+            else frozenset()
+        )
+        legacy_model_upgrade = manifest.get("seed_fingerprint") in (
+            seed.legacy_model_fingerprints | legacy_soul_model_fingerprints
+        )
+        legacy_soul_upgrade = legacy_soul_seed is not None and (
+            manifest.get("seed_fingerprint") == legacy_soul_seed.fingerprint
+            or manifest.get("seed_fingerprint") in legacy_soul_model_fingerprints
+        )
+        if (
+            manifest.get("seed_fingerprint") != seed.fingerprint
+            and not legacy_memory_upgrade
+            and not legacy_compression_upgrade
+            and not legacy_model_upgrade
+            and not legacy_soul_upgrade
+        ):
             code = (
                 "instruction_version_conflict"
                 if manifest.get("first_chat_version") != seed.first_chat_version
@@ -1644,6 +2027,106 @@ class ProfileStore:
             stored_operation = seed.operation_id
             stored_generation = seed.materialized_generation
             stored_receipt = updated["receipt_id"]
+            manifest = updated
+        try:
+            config_path = profile / "config.yaml"
+            descriptor = os.open(
+                config_path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            try:
+                original_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(original_stat.st_mode):
+                    raise ProfileStoreError("profile config is not a regular file")
+                config_bytes = _read_bounded_descriptor(descriptor)
+            finally:
+                os.close(descriptor)
+            updated_config = _config_with_catalog(config_bytes)
+            if legacy_memory_upgrade:
+                updated_config = _replace_legacy_memory_config(updated_config, seed)
+            if legacy_memory_upgrade or legacy_compression_upgrade or legacy_model_upgrade:
+                updated_config = _replace_legacy_compression_config(
+                    updated_config, seed
+                )
+            if legacy_model_upgrade:
+                updated_config = _replace_legacy_model_config(updated_config, seed)
+            if updated_config != config_bytes:
+                current_stat = config_path.stat(follow_symlinks=False)
+                if any(
+                    getattr(original_stat, field) != getattr(current_stat, field)
+                    for field in (
+                        "st_dev",
+                        "st_ino",
+                        "st_size",
+                        "st_mtime_ns",
+                    )
+                ):
+                    raise ProfileStoreError("profile config changed during migration")
+                self._write_bytes_atomic(config_path, updated_config, mode=0o644)
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            RecursionError,
+            ProfileStoreError,
+        ):
+            return self._receipt(
+                seed,
+                ProfileProvisionStatus.REPAIR_REQUIRED,
+                repair_code="skills_config_requires_repair",
+            )
+        if legacy_soul_upgrade:
+            # Managed souls are re-rendered from the Ally's original identity;
+            # the shared rules now live in the image's platform layer.
+            try:
+                self._write_bytes_atomic(
+                    profile / "SOUL.md", seed.personality.encode("utf-8"), mode=0o644
+                )
+                upgraded = dict(manifest)
+                upgraded["seed_fingerprint"] = seed.fingerprint
+                self._write_json_atomic(manifest_path, upgraded, mode=0o644)
+            except (ProfileStoreError, TypeError, UnicodeError, ValueError):
+                return self._receipt(
+                    seed,
+                    ProfileProvisionStatus.REPAIR_REQUIRED,
+                    repair_code="legacy_soul_upgrade_failed",
+                )
+            manifest = upgraded
+        if legacy_memory_upgrade or legacy_compression_upgrade or legacy_model_upgrade:
+            upgraded = dict(manifest)
+            upgraded.update(
+                {
+                    "seed_fingerprint": seed.fingerprint,
+                    "memory_provider": seed.memory_provider,
+                    "memory_policy_version": seed.memory_policy_version,
+                    "memory_mode": seed.memory_mode,
+                    "memory_tools": list(seed.memory_tool_allowlist),
+                }
+            )
+            try:
+                self._write_json_atomic(manifest_path, upgraded, mode=0o644)
+            except (ProfileStoreError, TypeError, UnicodeError, ValueError):
+                return self._receipt(
+                    seed,
+                    ProfileProvisionStatus.REPAIR_REQUIRED,
+                    repair_code="legacy_memory_upgrade_failed"
+                    if legacy_memory_upgrade
+                    else (
+                        "legacy_compression_upgrade_failed"
+                        if legacy_compression_upgrade
+                        else "legacy_model_upgrade_failed"
+                    ),
+                )
+        try:
+            self._refresh_seed_credentials(profile, seed)
+        except (ProfileStoreError, OSError, UnicodeError, ValueError):
+            return self._receipt(
+                seed,
+                ProfileProvisionStatus.REPAIR_REQUIRED,
+                repair_code="credential_refresh_failed",
+            )
         try:
             self._clean_owned_first_chat_block(seed, profile / "SOUL.md")
         except ProfileStoreError:
@@ -1660,6 +2143,32 @@ class ProfileStore:
             generation=stored_generation,
             receipt_id=stored_receipt,
         )
+
+    def _refresh_seed_credentials(self, profile: Path, seed: ProfileSeed) -> None:
+        """Rewrite stale seed credential lines so rotated keys reach the profile."""
+
+        # A model binding owns the whole .env once applied; leave it alone.
+        if (profile / BINDING_SIDECAR_NAME).exists():
+            return
+        lines = _read_profile_env(profile).decode("utf-8").splitlines()
+        wanted = {
+            name: self._resolve_credential(reference)
+            for name, reference in seed.credential_refs.items()
+        }
+        updated = []
+        for line in lines:
+            name, separator, _value = line.partition("=")
+            if separator and name in wanted:
+                updated.append(f"{name}={wanted.pop(name)}")
+            else:
+                updated.append(line)
+        updated.extend(f"{name}={value}" for name, value in wanted.items())
+        if updated != lines:
+            self._write_bytes_atomic(
+                profile / ".env",
+                ("\n".join(updated) + "\n").encode("utf-8"),
+                mode=0o600,
+            )
 
     def _clean_owned_first_chat_block(
         self, seed: ProfileSeed, path: Path
@@ -1690,9 +2199,39 @@ class ProfileStore:
 
     def _tombstone_receipt(self, payload: Mapping[str, Any]) -> CleanupReceipt | None:
         status = payload.get("status")
-        if status not in {item.value for item in ProfileCleanupStatus}:
+        if not isinstance(status, str) or status not in {
+            item.value for item in ProfileCleanupStatus
+        }:
             return None
         key = payload.get("profile_key")
+        if (
+            status == ProfileCleanupStatus.DEPROVISIONED.value
+            and payload.get("deleted") is True
+        ):
+            terminal_fields = {
+                "schema",
+                "schema_version",
+                "profile_key",
+                "status",
+                "deleted",
+            }
+            if (
+                set(payload) != terminal_fields
+                or payload.get("schema") != MANIFEST_SCHEMA
+                or payload.get("schema_version") != MANIFEST_VERSION
+            ):
+                return None
+            try:
+                validate_profile_key(key)
+            except ProfileInputError:
+                return None
+            return CleanupReceipt(
+                ProfileCleanupStatus.DEPROVISIONED,
+                key,
+                0,
+                "",
+                "",
+            )
         operation_id = payload.get("operation_id")
         epoch = payload.get("lifecycle_epoch")
         receipt_id = payload.get("receipt_id")
@@ -1710,6 +2249,13 @@ class ProfileStore:
             _safe_operation_id(operation_id)
         except ProfileInputError:
             return None
+        try:
+            attempt_id = _cleanup_attempt_id(payload.get("attempt_id"), required=False)
+            request_digest = _cleanup_request_digest(
+                payload.get("request_digest"), required=False
+            )
+        except ProfileInputError:
+            return None
         return CleanupReceipt(
             ProfileCleanupStatus(status),
             key,
@@ -1717,6 +2263,69 @@ class ProfileStore:
             operation_id,
             receipt_id,
             _safe_repair_code(payload.get("repair_code")),
+            attempt_id,
+            request_digest,
+        )
+
+    def _pending_tombstone_is_valid(
+        self, payload: Mapping[str, Any], profile_key: str
+    ) -> bool:
+        """Recognize the runtime's durable, still-active deletion fence."""
+
+        required = {
+            "schema",
+            "schema_version",
+            "profile_key",
+            "lifecycle_epoch",
+            "operation_id",
+            "receipt_id",
+            "status",
+            "expires_at",
+        }
+        optional = {"attempt_id", "request_digest"}
+        if set(payload) - required - optional or not required <= set(payload):
+            return False
+        if (
+            payload.get("schema") != MANIFEST_SCHEMA
+            or payload.get("schema_version") != MANIFEST_VERSION
+            or payload.get("profile_key") != profile_key
+            or payload.get("status") != "CLEANUP_PENDING"
+        ):
+            return False
+        epoch = payload.get("lifecycle_epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            return False
+        try:
+            operation_id = _safe_operation_id(payload.get("operation_id"))
+            receipt_id = payload.get("receipt_id")
+            if not isinstance(receipt_id, str) or not _RECEIPT_ID_PATTERN.fullmatch(
+                receipt_id
+            ):
+                return False
+            expires_at = payload.get("expires_at")
+            if (
+                isinstance(expires_at, bool)
+                or not isinstance(expires_at, (int, float))
+                or not math.isfinite(float(expires_at))
+            ):
+                return False
+            attempt_id = _cleanup_attempt_id(
+                payload.get("attempt_id"), required=False
+            )
+            request_digest = _cleanup_request_digest(
+                payload.get("request_digest"), required=False
+            )
+        except (ProfileInputError, TypeError, ValueError, OverflowError):
+            return False
+        return (
+            (attempt_id is None) == (request_digest is None)
+            and receipt_id
+            == _cleanup_receipt_id(
+                profile_key=profile_key,
+                operation_id=operation_id,
+                epoch=epoch,
+                attempt_id=attempt_id,
+            )
         )
 
     def materialize(
@@ -1747,6 +2356,21 @@ class ProfileStore:
             with self._lock(seed.hermes_profile_key or "invalid"):
                 tombstone = self._read_tombstone(seed.hermes_profile_key or "invalid")
                 if tombstone is not None:
+                    if self._pending_tombstone_is_valid(
+                        tombstone, seed.hermes_profile_key or "invalid"
+                    ):
+                        expires_at = float(tombstone["expires_at"])
+                        if expires_at <= time.time():
+                            return self._receipt(
+                                seed,
+                                ProfileProvisionStatus.REPAIR_REQUIRED,
+                                repair_code="cleanup_expired",
+                            )
+                        return self._receipt(
+                            seed,
+                            ProfileProvisionStatus.FENCED,
+                            repair_code="profile_deprovisioned",
+                        )
                     tombstone_receipt = self._tombstone_receipt(tombstone)
                     if (
                         tombstone_receipt is None
@@ -1839,14 +2463,17 @@ class ProfileStore:
     provision = materialize
     materialize_profile = materialize
 
-    def cleanup(
+    def fence_deletion(
         self,
         profile_key: str,
         operation_id: str,
         lifecycle_epoch: int,
         expires_at: datetime | float | str | None = None,
+        *,
+        attempt_id: str | uuid.UUID,
+        request_digest: str,
     ) -> CleanupReceipt:
-        """Fence and remove one exact profile directory, safely and idempotently."""
+        """Persist a deletion fence without touching profile-owned content."""
 
         key = validate_profile_key(profile_key)
         operation_id = _safe_operation_id(operation_id)
@@ -1856,17 +2483,38 @@ class ProfileStore:
             or lifecycle_epoch < 0
         ):
             raise ProfileInputError("lifecycle epoch is invalid")
+        cleanup_attempt = _cleanup_attempt_id(attempt_id, required=True)
+        cleanup_digest = _cleanup_request_digest(request_digest, required=True)
         expiry = self._expiry_timestamp(expires_at)
-        # Foundry commits the incremented lifecycle epoch before dispatching
-        # cleanup.  Runtime records that fenced epoch; it does not advance
-        # control-plane state a second time.
-        requested_epoch = lifecycle_epoch
+        now = time.time()
+        if expiry > now + MAX_DELETION_EXPIRY_SECONDS:
+            raise ProfileInputError("cleanup expiry exceeds the deletion bound")
         receipt_id = _cleanup_receipt_id(
-            profile_key=key, operation_id=operation_id, epoch=requested_epoch
+            profile_key=key,
+            operation_id=operation_id,
+            epoch=lifecycle_epoch,
+            attempt_id=cleanup_attempt,
         )
 
+        def receipt(
+            status: ProfileCleanupStatus,
+            *,
+            epoch: int = lifecycle_epoch,
+            repair_code: str | None = None,
+        ) -> CleanupReceipt:
+            return CleanupReceipt(
+                status,
+                key,
+                epoch,
+                operation_id,
+                receipt_id,
+                repair_code,
+                cleanup_attempt,
+                cleanup_digest,
+            )
+
         try:
-            profiles_root = self._profiles_root()
+            self._profiles_root()
             profile = self._profile_path(key)
             tombstone_path = self._tombstone_path(key)
             with self._lock(key):
@@ -1876,73 +2524,102 @@ class ProfileStore:
                     else None
                 )
                 if _lstat(tombstone_path) is not None and existing_payload is None:
-                    return CleanupReceipt(
+                    return receipt(
                         ProfileCleanupStatus.REPAIR_REQUIRED,
-                        key,
-                        requested_epoch,
-                        operation_id,
-                        receipt_id,
-                        "invalid_cleanup_tombstone",
+                        repair_code="invalid_cleanup_tombstone",
                     )
                 if existing_payload is not None:
-                    existing_status = existing_payload.get("status")
-                    if existing_status == "CLEANUP_PENDING":
+                    if (
+                        existing_payload.get("status")
+                        == ProfileCleanupStatus.DEPROVISIONED.value
+                        and existing_payload.get("deleted") is True
+                    ):
+                        terminal = self._tombstone_receipt(existing_payload)
+                        if terminal is None or terminal.profile_key != key:
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
+                        return receipt(ProfileCleanupStatus.DEPROVISIONED)
+                    if existing_payload.get("status") == "CLEANUP_PENDING":
+                        if not self._pending_tombstone_is_valid(existing_payload, key):
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
                         existing_key = existing_payload.get("profile_key")
                         existing_operation = existing_payload.get("operation_id")
                         existing_epoch = existing_payload.get("lifecycle_epoch")
+                        try:
+                            existing_attempt = _cleanup_attempt_id(
+                                existing_payload.get("attempt_id"), required=True
+                            )
+                            existing_digest = _cleanup_request_digest(
+                                existing_payload.get("request_digest"), required=True
+                            )
+                        except ProfileInputError:
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
                         if (
                             existing_key != key
-                            or not isinstance(existing_operation, str)
+                            or existing_operation != operation_id
                             or not isinstance(existing_epoch, int)
                             or isinstance(existing_epoch, bool)
                         ):
-                            return CleanupReceipt(
-                                ProfileCleanupStatus.REPAIR_REQUIRED,
-                                key,
-                                requested_epoch,
-                                operation_id,
-                                receipt_id,
-                                "invalid_cleanup_tombstone",
+                            return receipt(
+                                ProfileCleanupStatus.FENCED,
+                                epoch=(
+                                    existing_epoch
+                                    if isinstance(existing_epoch, int)
+                                    and not isinstance(existing_epoch, bool)
+                                    else lifecycle_epoch
+                                ),
+                                repair_code="stale_cleanup_epoch",
                             )
                         if (
-                            existing_operation == operation_id
-                            and existing_epoch == requested_epoch
+                            existing_epoch == lifecycle_epoch
+                            and existing_attempt == cleanup_attempt
+                            and existing_digest == cleanup_digest
                         ):
-                            pass  # Resume an interrupted delete for the same operation.
-                        elif requested_epoch <= existing_epoch:
-                            return CleanupReceipt(
+                            existing_expiry = existing_payload.get("expires_at")
+                            if (
+                                isinstance(existing_expiry, bool)
+                                or not isinstance(existing_expiry, (int, float))
+                                or not math.isfinite(float(existing_expiry))
+                            ):
+                                return receipt(
+                                    ProfileCleanupStatus.REPAIR_REQUIRED,
+                                    repair_code="invalid_cleanup_tombstone",
+                                )
+                            if existing_expiry <= time.time():
+                                return receipt(
+                                    ProfileCleanupStatus.REPAIR_REQUIRED,
+                                    repair_code="cleanup_expired",
+                                )
+                            return receipt(ProfileCleanupStatus.FENCED)
+                        if lifecycle_epoch <= existing_epoch:
+                            return receipt(
                                 ProfileCleanupStatus.FENCED,
-                                key,
-                                existing_epoch,
-                                operation_id,
-                                receipt_id,
-                                "stale_cleanup_epoch",
+                                epoch=existing_epoch,
+                                repair_code="stale_cleanup_epoch",
                             )
                     else:
                         existing = self._tombstone_receipt(existing_payload)
                         if existing is None or existing.profile_key != key:
-                            return CleanupReceipt(
+                            return receipt(
                                 ProfileCleanupStatus.REPAIR_REQUIRED,
-                                key,
-                                requested_epoch,
-                                operation_id,
-                                receipt_id,
-                                "invalid_cleanup_tombstone",
+                                repair_code="invalid_cleanup_tombstone",
                             )
                         if (
-                            existing.operation_id == operation_id
-                            and existing.lifecycle_epoch == requested_epoch
+                            existing.status is not ProfileCleanupStatus.REPAIR_REQUIRED
+                            and lifecycle_epoch <= existing.lifecycle_epoch
                         ):
-                            if existing.status is ProfileCleanupStatus.DEPROVISIONED:
-                                return existing
-                        elif requested_epoch <= existing.lifecycle_epoch:
-                            return CleanupReceipt(
+                            return receipt(
                                 ProfileCleanupStatus.FENCED,
-                                key,
-                                existing.lifecycle_epoch,
-                                operation_id,
-                                receipt_id,
-                                "stale_cleanup_epoch",
+                                epoch=existing.lifecycle_epoch,
+                                repair_code="stale_cleanup_epoch",
                             )
 
                 if _is_directory(profile):
@@ -1957,13 +2634,371 @@ class ProfileStore:
                         and not isinstance(profile_epoch, bool)
                         and profile_epoch > lifecycle_epoch
                     ):
-                        return CleanupReceipt(
+                        return receipt(
                             ProfileCleanupStatus.FENCED,
-                            key,
-                            profile_epoch,
-                            operation_id,
-                            receipt_id,
-                            "stale_cleanup_epoch",
+                            epoch=profile_epoch,
+                            repair_code="stale_cleanup_epoch",
+                        )
+
+                pending_payload = {
+                    "schema": MANIFEST_SCHEMA,
+                    "schema_version": MANIFEST_VERSION,
+                    "profile_key": key,
+                    "lifecycle_epoch": lifecycle_epoch,
+                    "operation_id": operation_id,
+                    "receipt_id": receipt_id,
+                    "status": "CLEANUP_PENDING",
+                    "expires_at": expiry,
+                    "attempt_id": cleanup_attempt,
+                    "request_digest": cleanup_digest,
+                }
+                expired = expiry <= now
+                if expired:
+                    pending_payload["status"] = ProfileCleanupStatus.REPAIR_REQUIRED.value
+                    pending_payload["repair_code"] = "cleanup_expired"
+                self._write_json_atomic(tombstone_path, pending_payload, mode=0o644)
+                if expired:
+                    return receipt(
+                        ProfileCleanupStatus.REPAIR_REQUIRED,
+                        repair_code="cleanup_expired",
+                    )
+                return receipt(ProfileCleanupStatus.FENCED)
+        except ProfileStoreError:
+            return receipt(
+                ProfileCleanupStatus.REPAIR_REQUIRED,
+                repair_code="cleanup_unavailable",
+            )
+
+
+    def apply_binding(
+        self,
+        profile_key: str,
+        *,
+        generation: int,
+        key_refs: Mapping[str, str],
+    ) -> BindingReceipt:
+        """Rewrite one live profile's key lines without touching its sessions.
+
+        Applies only when the profile is fully materialized and the incoming
+        generation is newer than the recorded one. The server key is preserved
+        from the current file; every reference resolves before any write, so a
+        failed resolution keeps the last-good files intact.
+        """
+
+        def failed(code: str) -> BindingReceipt:
+            return BindingReceipt(
+                status=BindingApplyStatus.REPAIR_REQUIRED,
+                profile_key=key,
+                generation=generation,
+                repair_code=code,
+            )
+
+        key = validate_profile_key(profile_key)
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ProfileInputError("binding generation is invalid")
+        if not isinstance(key_refs, Mapping) or len(key_refs) > MAX_CREDENTIALS:
+            raise ProfileInputError("binding key references are invalid")
+        try:
+            server_key = self.read_api_key(key)
+        except (ProfileInputError, ProfileStoreError):
+            return BindingReceipt(
+                status=BindingApplyStatus.REPAIR_REQUIRED,
+                profile_key=profile_key if isinstance(profile_key, str) else "invalid",
+                generation=generation if isinstance(generation, int) else 0,
+                repair_code="incomplete_profile",
+            )
+        try:
+            with self._lock(key):
+                profile = self._profile_path(key)
+                manifest = self._read_json(profile / MANIFEST_NAME)
+                if (
+                    manifest is None
+                    or manifest.get("completion_state") != "complete"
+                    or not _is_regular_file(profile / ".env")
+                ):
+                    return failed("incomplete_profile")
+                sidecar = self._read_json(profile / BINDING_SIDECAR_NAME) or {}
+                applied = sidecar.get("generation", 0)
+                if (
+                    not isinstance(applied, int)
+                    or isinstance(applied, bool)
+                    or applied < 0
+                ):
+                    return failed("invalid_binding_state")
+                if applied >= generation:
+                    return BindingReceipt(
+                        status=BindingApplyStatus.CURRENT,
+                        profile_key=key,
+                        generation=applied,
+                    )
+                resolved: dict[str, str] = {}
+                for env_name, reference in key_refs.items():
+                    if (
+                        not isinstance(env_name, str)
+                        or not isinstance(reference, str)
+                        or ENV_NAME_PATTERN.fullmatch(env_name) is None
+                    ):
+                        return failed("invalid_binding_reference")
+                    try:
+                        resolved[env_name] = self._resolve_credential(reference)
+                    except ProfileStoreError:
+                        return failed("credential_resolution_failed")
+                lines = [f"API_SERVER_KEY={server_key}"]
+                lines.extend(f"{name}={resolved[name]}" for name in sorted(resolved))
+                self._write_bytes_atomic(
+                    profile / ".env",
+                    ("\n".join(lines) + "\n").encode("utf-8"),
+                    mode=0o600,
+                )
+                self._write_json_atomic(
+                    profile / BINDING_SIDECAR_NAME,
+                    {"generation": generation},
+                    mode=0o644,
+                )
+                return BindingReceipt(
+                    status=BindingApplyStatus.APPLIED,
+                    profile_key=key,
+                    generation=generation,
+                )
+        except ProfileStoreError as exc:
+            code = (
+                "lock_timeout"
+                if "timed out" in str(exc)
+                else "profile_store_unavailable"
+            )
+            return failed(code)
+        except OSError:
+            return failed("binding_publish_failed")
+
+    def cleanup(
+        self,
+        profile_key: str,
+        operation_id: str,
+        lifecycle_epoch: int,
+        expires_at: datetime | float | str | None = None,
+        *,
+        attempt_id: str | uuid.UUID | None = None,
+        request_digest: str | None = None,
+        deletion: bool = False,
+    ) -> CleanupReceipt:
+        """Fence and remove one exact profile directory, safely and idempotently."""
+
+        key = validate_profile_key(profile_key)
+        operation_id = _safe_operation_id(operation_id)
+        if (
+            isinstance(lifecycle_epoch, bool)
+            or not isinstance(lifecycle_epoch, int)
+            or lifecycle_epoch < 0
+        ):
+            raise ProfileInputError("lifecycle epoch is invalid")
+        if not isinstance(deletion, bool):
+            raise ProfileInputError("cleanup deletion flag is invalid")
+        cleanup_attempt = _cleanup_attempt_id(attempt_id, required=deletion)
+        cleanup_digest = _cleanup_request_digest(request_digest, required=deletion)
+        if not deletion and (cleanup_attempt is not None or cleanup_digest is not None):
+            raise ProfileInputError("cleanup deletion identity is unexpected")
+        expiry = self._expiry_timestamp(expires_at)
+        if deletion and expiry > time.time() + MAX_DELETION_EXPIRY_SECONDS:
+            raise ProfileInputError("cleanup expiry exceeds the deletion bound")
+        # Foundry commits the incremented lifecycle epoch before dispatching
+        # cleanup.  Runtime records that fenced epoch; it does not advance
+        # control-plane state a second time.
+        requested_epoch = lifecycle_epoch
+        receipt_id = _cleanup_receipt_id(
+            profile_key=key,
+            operation_id=operation_id,
+            epoch=requested_epoch,
+            attempt_id=cleanup_attempt,
+        )
+
+        def receipt(
+            status: ProfileCleanupStatus,
+            *,
+            epoch: int = requested_epoch,
+            repair_code: str | None = None,
+            operation: str = operation_id,
+            receipt: str = receipt_id,
+            attempt: str | None = cleanup_attempt,
+            digest: str | None = cleanup_digest,
+        ) -> CleanupReceipt:
+            return CleanupReceipt(
+                status,
+                key,
+                epoch,
+                operation,
+                receipt,
+                repair_code,
+                attempt,
+                digest,
+            )
+
+        try:
+            profiles_root = self._profiles_root()
+            profile = self._profile_path(key)
+            tombstone_path = self._tombstone_path(key)
+            with self._lock(key):
+                existing_payload = (
+                    self._read_json(tombstone_path)
+                    if _lstat(tombstone_path) is not None
+                    else None
+                )
+                if _lstat(tombstone_path) is not None and existing_payload is None:
+                    return receipt(
+                        ProfileCleanupStatus.REPAIR_REQUIRED,
+                        repair_code="invalid_cleanup_tombstone",
+                    )
+                if existing_payload is not None:
+                    existing_status = existing_payload.get("status")
+                    if (
+                        deletion
+                        and existing_status == ProfileCleanupStatus.DEPROVISIONED.value
+                        and existing_payload.get("deleted") is True
+                    ):
+                        terminal = self._tombstone_receipt(existing_payload)
+                        if terminal is None or terminal.profile_key != key:
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
+                        # Terminal deletion markers are intentionally
+                        # content-free.  Foundry binds replay to the current
+                        # attempt/digest; the local marker only proves that
+                        # this opaque profile key has already been removed.
+                        return receipt(ProfileCleanupStatus.DEPROVISIONED)
+                    if existing_status == "CLEANUP_PENDING":
+                        pending_is_valid = self._pending_tombstone_is_valid(
+                            existing_payload, key
+                        )
+                        if deletion and not pending_is_valid:
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
+                        if (
+                            not deletion
+                            and (
+                                "attempt_id" in existing_payload
+                                or "request_digest" in existing_payload
+                            )
+                            and not pending_is_valid
+                        ):
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
+                        existing_key = existing_payload.get("profile_key")
+                        existing_operation = existing_payload.get("operation_id")
+                        existing_epoch = existing_payload.get("lifecycle_epoch")
+                        if (
+                            existing_key != key
+                            or not isinstance(existing_operation, str)
+                            or not isinstance(existing_epoch, int)
+                            or isinstance(existing_epoch, bool)
+                        ):
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
+                        try:
+                            existing_attempt = _cleanup_attempt_id(
+                                existing_payload.get("attempt_id"), required=False
+                            )
+                            existing_digest = _cleanup_request_digest(
+                                existing_payload.get("request_digest"), required=False
+                            )
+                        except ProfileInputError:
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
+                        if (
+                            not deletion
+                            and (
+                                existing_attempt is not None
+                                or existing_digest is not None
+                            )
+                        ):
+                            return receipt(
+                                ProfileCleanupStatus.FENCED,
+                                epoch=existing_epoch,
+                                repair_code="stale_cleanup_epoch",
+                            )
+                        if (
+                            existing_operation == operation_id
+                            and existing_epoch == requested_epoch
+                            and (
+                                not deletion
+                                or (
+                                    existing_attempt == cleanup_attempt
+                                    and existing_digest == cleanup_digest
+                                )
+                            )
+                        ):
+                            pass  # Resume an interrupted delete for the same operation.
+                        elif requested_epoch <= existing_epoch:
+                            return receipt(
+                                ProfileCleanupStatus.FENCED,
+                                epoch=existing_epoch,
+                                repair_code="stale_cleanup_epoch",
+                            )
+                    else:
+                        existing = self._tombstone_receipt(existing_payload)
+                        if existing is None or existing.profile_key != key:
+                            return receipt(
+                                ProfileCleanupStatus.REPAIR_REQUIRED,
+                                repair_code="invalid_cleanup_tombstone",
+                            )
+                        if deletion and existing.status is ProfileCleanupStatus.DEPROVISIONED:
+                            if requested_epoch < existing.lifecycle_epoch:
+                                return receipt(
+                                    ProfileCleanupStatus.FENCED,
+                                    epoch=existing.lifecycle_epoch,
+                                    repair_code="stale_cleanup_epoch",
+                                )
+                        elif (
+                            existing.operation_id == operation_id
+                            and existing.lifecycle_epoch == requested_epoch
+                            and (
+                                not deletion
+                                or (
+                                    existing.attempt_id == cleanup_attempt
+                                    and existing.request_digest == cleanup_digest
+                                )
+                            )
+                        ):
+                            if existing.status is ProfileCleanupStatus.DEPROVISIONED:
+                                return (
+                                    receipt(ProfileCleanupStatus.DEPROVISIONED)
+                                    if deletion
+                                    else existing
+                                )
+                        elif requested_epoch <= existing.lifecycle_epoch:
+                            return receipt(
+                                ProfileCleanupStatus.FENCED,
+                                epoch=existing.lifecycle_epoch,
+                                repair_code="stale_cleanup_epoch",
+                            )
+
+                if _is_directory(profile):
+                    profile_manifest = self._read_json(profile / MANIFEST_NAME)
+                    profile_epoch = (
+                        profile_manifest.get("lifecycle_epoch")
+                        if profile_manifest
+                        else None
+                    )
+                    if (
+                        isinstance(profile_epoch, int)
+                        and not isinstance(profile_epoch, bool)
+                        and profile_epoch > lifecycle_epoch
+                    ):
+                        return receipt(
+                            ProfileCleanupStatus.FENCED,
+                            epoch=profile_epoch,
+                            repair_code="stale_cleanup_epoch",
                         )
 
                 if expiry <= time.time():
@@ -1977,14 +3012,13 @@ class ProfileStore:
                         "status": ProfileCleanupStatus.REPAIR_REQUIRED.value,
                         "repair_code": "cleanup_expired",
                     }
+                    if deletion:
+                        repair_payload["attempt_id"] = cleanup_attempt
+                        repair_payload["request_digest"] = cleanup_digest
                     self._write_json_atomic(tombstone_path, repair_payload, mode=0o644)
-                    return CleanupReceipt(
+                    return receipt(
                         ProfileCleanupStatus.REPAIR_REQUIRED,
-                        key,
-                        requested_epoch,
-                        operation_id,
-                        receipt_id,
-                        "cleanup_expired",
+                        repair_code="cleanup_expired",
                     )
 
                 pending_payload = {
@@ -1997,6 +3031,9 @@ class ProfileStore:
                     "status": "CLEANUP_PENDING",
                     "expires_at": expiry,
                 }
+                if deletion:
+                    pending_payload["attempt_id"] = cleanup_attempt
+                    pending_payload["request_digest"] = cleanup_digest
                 self._write_json_atomic(tombstone_path, pending_payload, mode=0o644)
 
                 if _is_symlink(profile):
@@ -2013,6 +3050,9 @@ class ProfileStore:
                     repair_code = "cleanup_bound_exceeded"
                 if repair_code is None:
                     try:
+                        from .files import cleanup_profile_publication_spools
+
+                        cleanup_profile_publication_spools(self.volume_root, key)
                         self._remove_owned_path(profile, parent=profiles_root)
                         temp_siblings = self._find_temp_siblings(profiles_root, key)
                         if temp_siblings is None:
@@ -2020,7 +3060,7 @@ class ProfileStore:
                         else:
                             for sibling in temp_siblings:
                                 self._remove_owned_path(sibling, parent=profiles_root)
-                    except ProfileStoreError:
+                    except (IncomingFileError, ProfileStoreError, OSError):
                         repair_code = "profile_cleanup_failed"
 
                 if repair_code is not None:
@@ -2035,34 +3075,32 @@ class ProfileStore:
                         )
                     except ProfileStoreError:
                         pass
-                    return CleanupReceipt(
+                    return receipt(
                         ProfileCleanupStatus.REPAIR_REQUIRED,
-                        key,
-                        requested_epoch,
-                        operation_id,
-                        receipt_id,
-                        repair_code,
+                        repair_code=repair_code,
                     )
 
-                complete_payload = dict(pending_payload)
-                complete_payload["status"] = ProfileCleanupStatus.DEPROVISIONED.value
-                complete_payload.pop("expires_at", None)
+                if deletion:
+                    # The terminal marker is deliberately content-free.  Do
+                    # not retain operation, attempt, expiry, receipt, epoch,
+                    # seed, or any provider-derived material after success.
+                    complete_payload = {
+                        "schema": MANIFEST_SCHEMA,
+                        "schema_version": MANIFEST_VERSION,
+                        "profile_key": key,
+                        "status": ProfileCleanupStatus.DEPROVISIONED.value,
+                        "deleted": True,
+                    }
+                else:
+                    complete_payload = dict(pending_payload)
+                    complete_payload["status"] = ProfileCleanupStatus.DEPROVISIONED.value
+                    complete_payload.pop("expires_at", None)
                 self._write_json_atomic(tombstone_path, complete_payload, mode=0o644)
-                return CleanupReceipt(
-                    ProfileCleanupStatus.DEPROVISIONED,
-                    key,
-                    requested_epoch,
-                    operation_id,
-                    receipt_id,
-                )
+                return receipt(ProfileCleanupStatus.DEPROVISIONED)
         except ProfileStoreError:
-            return CleanupReceipt(
+            return receipt(
                 ProfileCleanupStatus.REPAIR_REQUIRED,
-                key,
-                requested_epoch,
-                operation_id,
-                receipt_id,
-                "cleanup_unavailable",
+                repair_code="cleanup_unavailable",
             )
 
     deprovision = cleanup

@@ -115,6 +115,7 @@ from django.db.migrations.executor import MigrationExecutor
 
 MIGRATION_FROM = ("runtime", "0013_workspace_activation_claim")
 MIGRATION_TO = ("runtime", "0014_profile_memory_seed_v2")
+MIGRATION_DEFAULTS_TO = ("runtime", "0024_enable_mnemosyne_memory_defaults")
 database_path = sys.argv[1]
 connections.databases["default"]["NAME"] = database_path
 connections["default"].settings_dict["NAME"] = database_path
@@ -204,6 +205,28 @@ assert profile.materialization_request_digest == ""
 assert profile.materialization_receipt_id is None
 assert profile.materialization_result_code == ""
 assert profile.lifecycle_state == "active"
+
+migrate(MIGRATION_TO)
+migrate(MIGRATION_DEFAULTS_TO)
+_, enabled_model = models_at(MIGRATION_DEFAULTS_TO)
+profile = enabled_model.objects.get(pk=profile_id)
+assert profile.seed_payload["memory_mode"] == "narrow_tools"
+assert profile.seed_payload["memory_tool_allowlist"] == [
+    "mnemosyne_forget",
+    "mnemosyne_forget_canonical",
+    "mnemosyne_invalidate",
+    "mnemosyne_recall",
+    "mnemosyne_recall_canonical",
+    "mnemosyne_remember",
+    "mnemosyne_remember_canonical",
+    "mnemosyne_update",
+]
+assert profile.seed_fingerprint == "a45b4934f41eb21ac298b42b568e213822834e8263e5a9d0cb338c6d4ee74e28"
+assert profile.materialized_generation == 0
+assert profile.materialization_operation_id is None
+assert profile.materialization_request_digest == ""
+assert profile.materialization_receipt_id is None
+assert profile.materialization_result_code == ""
 """
 
 
@@ -228,6 +251,469 @@ def test_profile_memory_seed_migration_requeues_materialization(tmp_path):
     database_path = tmp_path / "memory.sqlite3"
     result = subprocess.run(
         [sys.executable, "-c", MEMORY_MIGRATION_PROBE, str(database_path)],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+COMPRESSION_MIGRATION_PROBE = r"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import uuid
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+import django
+
+django.setup()
+
+from django.db import connections
+from django.db.migrations.executor import MigrationExecutor
+
+MIGRATION_FROM = ("runtime", "0029_sleeping_ready_pool")
+MIGRATION_TO = ("runtime", "0030_profile_compression_threshold")
+database_path = sys.argv[1]
+connections.databases["default"]["NAME"] = database_path
+connections["default"].settings_dict["NAME"] = database_path
+connection = connections["default"]
+
+
+def migrate(target):
+    MigrationExecutor(connection).migrate([target])
+
+
+def models_at(target):
+    apps = MigrationExecutor(connection).loader.project_state([target]).apps
+    return apps.get_model("runtime", "Workspace"), apps.get_model("runtime", "RuntimeProfile")
+
+
+migrate(MIGRATION_FROM)
+workspace_model, profile_model = models_at(MIGRATION_FROM)
+workspace = workspace_model.objects.create(
+    id=uuid.uuid4(),
+    tenant_ref="compression-migration",
+    fly_app_ref="app-compression",
+    volume_ref="volume-compression",
+    machine_ref="machine-compression",
+    machine_generation=2,
+)
+profile_id = uuid.UUID("00000000-0000-0000-0000-000000000002")
+key = "ally-v1-00000000000000000000000000000002"
+seed = {
+    "version": 1,
+    "personality": "p",
+    "provider": "openai",
+    "model": "gpt-test",
+    "base_url": None,
+    "first_chat_instruction": "i",
+    "first_chat_instruction_version": 1,
+    "credential_refs": {"PROVIDER_API": "vault://p"},
+    "memory_provider": "allies_mnemosyne",
+    "memory_mode": "narrow_tools",
+    "memory_policy_version": "allies-mnemosyne-v1",
+    "memory_tool_allowlist": ["mnemosyne_recall"],
+    "memory_profile_isolation": True,
+    "memory_sync_roles": [],
+}
+canonical = {
+    "schema_version": 1,
+    "foundry_profile_id": str(profile_id),
+    "hermes_profile_key": key,
+    "identity": {"ally_name": "ally-b"},
+    "personality": "p",
+    "first_chat_version": 1,
+    "first_chat_instruction": "i",
+    "model": {"provider": "openai", "default": "gpt-test", "base_url": None},
+    "credential_refs": {"PROVIDER_API": "vault://p"},
+    "memory": {
+        "provider": "allies_mnemosyne",
+        "mode": "narrow_tools",
+        "policy_version": "allies-mnemosyne-v1",
+        "tools": ["mnemosyne_recall"],
+        "profile_isolation": True,
+        "sync_roles": [],
+    },
+}
+encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+legacy = hashlib.sha256(b"allies-profile-seed-v2\0" + encoded).hexdigest()
+profile_model.objects.create(
+    id=profile_id,
+    workspace=workspace,
+    ally_ref="ally-b",
+    hermes_profile_key=key,
+    lifecycle_state="active",
+    seed_payload=seed,
+    seed_fingerprint=legacy,
+    materialized_generation=2,
+    materialization_operation_id=uuid.uuid4(),
+    materialization_request_digest="b" * 64,
+    materialization_receipt_id=uuid.uuid4(),
+    materialization_result_code="created",
+)
+
+migrate(MIGRATION_TO)
+_, upgraded_model = models_at(MIGRATION_TO)
+profile = upgraded_model.objects.get(pk=profile_id)
+assert profile.seed_payload["compression_threshold_tokens"] == 100_000
+assert profile.seed_fingerprint != legacy
+assert profile.materialized_generation == 0
+assert profile.materialization_operation_id is None
+assert profile.materialization_request_digest == ""
+assert profile.materialization_receipt_id is None
+assert profile.materialization_result_code == ""
+assert profile.lifecycle_state == "active"
+
+migrate(MIGRATION_TO)
+profile = upgraded_model.objects.get(pk=profile_id)
+assert profile.seed_payload["compression_threshold_tokens"] == 100_000
+assert profile.materialized_generation == 0
+
+migrate(MIGRATION_FROM)
+_, rolled_back_model = models_at(MIGRATION_FROM)
+profile = rolled_back_model.objects.get(pk=profile_id)
+assert "compression_threshold_tokens" not in profile.seed_payload
+assert profile.seed_fingerprint == legacy
+assert profile.materialized_generation == 0
+"""
+
+
+def test_profile_compression_seed_migration_requeues_materialization(tmp_path):
+    database_path = tmp_path / "compression.sqlite3"
+    result = subprocess.run(
+        [sys.executable, "-c", COMPRESSION_MIGRATION_PROBE, str(database_path)],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+SOUL_MIGRATION_PROBE = r"""
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+from string import Template
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+import django
+
+django.setup()
+
+from django.db import connections
+from django.db.migrations.executor import MigrationExecutor
+
+MIGRATION_FROM = ("runtime", "0031_model_binding")
+MIGRATION_TO = ("runtime", "0032_platform_layer_soul")
+database_path = sys.argv[1]
+connections.databases["default"]["NAME"] = database_path
+connections["default"].settings_dict["NAME"] = database_path
+connection = connections["default"]
+values = {"ALLY_NAME": "Mira", "ALLY_JOB": "Run the studio", "ALLY_PERSONALITY": "Dry"}
+frozen = importlib.import_module("runtime.migrations.0032_platform_layer_soul")
+legacy_template = frozen._LEGACY_SOUL_TEMPLATE
+assert hashlib.sha256(legacy_template.encode()).hexdigest() == (
+    "09ffe46e0153a50701006e730221b5fcb702a3f12e22e3c2bc0bef957b4d03cd"
+)
+legacy_soul = Template(legacy_template).substitute(values)
+new_soul = Template(
+    Path("runtime/default_allies_soul.md").read_text(encoding="utf-8")
+).substitute(values)
+
+
+def migrate(target):
+    MigrationExecutor(connection).migrate([target])
+
+
+def models_at(target):
+    apps = MigrationExecutor(connection).loader.project_state([target]).apps
+    return apps.get_model("runtime", "Workspace"), apps.get_model("runtime", "RuntimeProfile")
+
+
+def fingerprint(profile_id, key, seed, ally_ref):
+    canonical = {
+        "schema_version": 1,
+        "foundry_profile_id": str(profile_id),
+        "hermes_profile_key": key,
+        "identity": {"ally_name": ally_ref},
+        "personality": seed["personality"],
+        "first_chat_version": 1,
+        "first_chat_instruction": "i",
+        "model": {"provider": "openai", "default": "gpt-test", "base_url": None},
+        "credential_refs": {"PROVIDER_API": "vault://p"},
+        "memory": {
+            "provider": "allies_mnemosyne",
+            "mode": "narrow_tools",
+            "policy_version": "allies-mnemosyne-v1",
+            "tools": ["mnemosyne_recall"],
+            "profile_isolation": True,
+            "sync_roles": [],
+        },
+        "compression": {"threshold_tokens": 100_000},
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(b"allies-profile-seed-v2\0" + encoded).hexdigest()
+
+
+migrate(MIGRATION_FROM)
+workspace_model, profile_model = models_at(MIGRATION_FROM)
+workspace = workspace_model.objects.create(
+    id=uuid.uuid4(),
+    tenant_ref="soul-migration",
+    fly_app_ref="app-soul",
+    volume_ref="volume-soul",
+    machine_ref="machine-soul",
+    machine_generation=2,
+)
+
+
+def create(index, personality):
+    profile_id = uuid.UUID(f"00000000-0000-0000-0000-00000000000{index}")
+    key = f"ally-v1-0000000000000000000000000000000{index}"
+    seed = {
+        "version": 1,
+        "personality": personality,
+        "provider": "openai",
+        "model": "gpt-test",
+        "base_url": None,
+        "first_chat_instruction": "i",
+        "first_chat_instruction_version": 1,
+        "credential_refs": {"PROVIDER_API": "vault://p"},
+        "memory_provider": "allies_mnemosyne",
+        "memory_mode": "narrow_tools",
+        "memory_policy_version": "allies-mnemosyne-v1",
+        "memory_tool_allowlist": ["mnemosyne_recall"],
+        "memory_profile_isolation": True,
+        "memory_sync_roles": [],
+        "compression_threshold_tokens": 100_000,
+    }
+    profile_model.objects.create(
+        id=profile_id,
+        workspace=workspace,
+        ally_ref=f"ally-s{index}",
+        hermes_profile_key=key,
+        lifecycle_state="active",
+        seed_payload=seed,
+        seed_fingerprint=fingerprint(profile_id, key, seed, f"ally-s{index}"),
+        materialized_generation=2,
+        materialization_operation_id=uuid.uuid4(),
+        materialization_request_digest="b" * 64,
+        materialization_receipt_id=uuid.uuid4(),
+        materialization_result_code="created",
+    )
+    return profile_id, key
+
+
+managed_id, managed_key = create(1, legacy_soul)
+custom_id, _ = create(2, "A hand-written soul.")
+
+migrate(MIGRATION_TO)
+_, upgraded_model = models_at(MIGRATION_TO)
+managed = upgraded_model.objects.get(pk=managed_id)
+assert managed.seed_payload["personality"] == new_soul
+assert managed.seed_fingerprint == fingerprint(managed_id, managed_key, managed.seed_payload, "ally-s1")
+assert managed.materialized_generation == 0
+assert managed.materialization_receipt_id is None
+custom = upgraded_model.objects.get(pk=custom_id)
+assert custom.seed_payload["personality"] == "A hand-written soul."
+assert custom.materialized_generation == 2
+
+migrate(MIGRATION_FROM)
+_, rolled_back_model = models_at(MIGRATION_FROM)
+managed = rolled_back_model.objects.get(pk=managed_id)
+assert managed.seed_payload["personality"] == legacy_soul
+assert managed.seed_fingerprint == fingerprint(managed_id, managed_key, managed.seed_payload, "ally-s1")
+"""
+
+
+def test_profile_soul_migration_adopts_platform_layer_template(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-c", SOUL_MIGRATION_PROBE, str(tmp_path / "soul.sqlite3")],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+MODEL_MIGRATION_PROBE = r"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import uuid
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+import django
+
+django.setup()
+
+from django.db import connections
+from django.db.migrations.executor import MigrationExecutor
+
+MIGRATION_FROM = ("runtime", "0033_delivery_sequence_gap_since")
+MIGRATION_TO = ("runtime", "0034_profile_default_model_openrouter")
+database_path = sys.argv[1]
+connections.databases["default"]["NAME"] = database_path
+connections["default"].settings_dict["NAME"] = database_path
+connection = connections["default"]
+
+
+def migrate(target):
+    MigrationExecutor(connection).migrate([target])
+
+
+def models_at(target):
+    apps = MigrationExecutor(connection).loader.project_state([target]).apps
+    return apps.get_model("runtime", "Workspace"), apps.get_model("runtime", "RuntimeProfile")
+
+
+def fingerprint(profile_id, key, ally_ref, seed, model, base_url):
+    canonical = {
+        "schema_version": seed["version"],
+        "foundry_profile_id": str(profile_id),
+        "hermes_profile_key": key,
+        "identity": {"ally_name": ally_ref},
+        "personality": seed["personality"],
+        "first_chat_version": seed["first_chat_instruction_version"],
+        "first_chat_instruction": seed["first_chat_instruction"],
+        "model": {"provider": "openai-api", "default": model, "base_url": base_url},
+        "credential_refs": {"OPENAI_API_KEY": "file:///run/secrets/openai-api-key"},
+        "memory": {
+            "provider": "allies_mnemosyne",
+            "mode": "narrow_tools",
+            "policy_version": "allies-mnemosyne-v1",
+            "tools": ["mnemosyne_recall"],
+            "profile_isolation": True,
+            "sync_roles": [],
+        },
+        "compression": {"threshold_tokens": 100_000},
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(b"allies-profile-seed-v2\0" + encoded).hexdigest()
+
+
+migrate(MIGRATION_FROM)
+workspace_model, profile_model = models_at(MIGRATION_FROM)
+workspace = workspace_model.objects.create(
+    id=uuid.uuid4(),
+    tenant_ref="model-migration",
+    fly_app_ref="app-model",
+    volume_ref="volume-model",
+    machine_ref="machine-model",
+    machine_generation=2,
+)
+profile_id = uuid.UUID("00000000-0000-0000-0000-000000000003")
+key = "ally-v1-00000000000000000000000000000003"
+seed = {
+    "version": 1,
+    "personality": "p",
+    "provider": "openai-api",
+    "model": "gpt-5.6-luna",
+    "base_url": "https://api.openai.com/v1",
+    "first_chat_instruction": "i",
+    "first_chat_instruction_version": 1,
+    "credential_refs": {"OPENAI_API_KEY": "file:///run/secrets/openai-api-key"},
+    "memory_provider": "allies_mnemosyne",
+    "memory_mode": "narrow_tools",
+    "memory_policy_version": "allies-mnemosyne-v1",
+    "memory_tool_allowlist": ["mnemosyne_recall"],
+    "memory_profile_isolation": True,
+    "memory_sync_roles": [],
+    "compression_threshold_tokens": 100_000,
+}
+legacy = fingerprint(
+    profile_id, key, "ally-c", seed, "gpt-5.6-luna", "https://api.openai.com/v1"
+)
+custom_id = uuid.UUID("00000000-0000-0000-0000-000000000004")
+custom_seed = dict(seed, model="custom-model")
+profile_model.objects.create(
+    id=profile_id,
+    workspace=workspace,
+    ally_ref="ally-c",
+    hermes_profile_key=key,
+    lifecycle_state="active",
+    seed_payload=seed,
+    seed_fingerprint=legacy,
+    materialized_generation=2,
+    materialization_operation_id=uuid.uuid4(),
+    materialization_request_digest="c" * 64,
+    materialization_receipt_id=uuid.uuid4(),
+    materialization_result_code="created",
+)
+profile_model.objects.create(
+    id=custom_id,
+    workspace=workspace,
+    ally_ref="ally-d",
+    hermes_profile_key="ally-v1-00000000000000000000000000000004",
+    lifecycle_state="active",
+    seed_payload=custom_seed,
+    seed_fingerprint="0" * 64,
+    materialized_generation=2,
+    materialization_operation_id=uuid.uuid4(),
+    materialization_request_digest="d" * 64,
+    materialization_receipt_id=uuid.uuid4(),
+    materialization_result_code="created",
+)
+
+migrate(MIGRATION_TO)
+_, upgraded_model = models_at(MIGRATION_TO)
+profile = upgraded_model.objects.get(pk=profile_id)
+assert profile.seed_payload["model"] == "openai/gpt-6-luna"
+assert profile.seed_payload["base_url"] == "https://openrouter.ai/api/v1"
+assert profile.seed_payload["provider"] == "openai-api"
+assert profile.seed_fingerprint != legacy
+assert profile.seed_fingerprint == fingerprint(
+    profile_id,
+    key,
+    "ally-c",
+    profile.seed_payload,
+    "openai/gpt-6-luna",
+    "https://openrouter.ai/api/v1",
+)
+assert profile.materialized_generation == 0
+assert profile.materialization_operation_id is None
+assert profile.lifecycle_state == "active"
+
+custom = upgraded_model.objects.get(pk=custom_id)
+assert custom.seed_payload["model"] == "custom-model"
+assert custom.seed_fingerprint == "0" * 64
+assert custom.materialized_generation == 2
+
+migrate(MIGRATION_TO)
+profile = upgraded_model.objects.get(pk=profile_id)
+assert profile.seed_payload["model"] == "openai/gpt-6-luna"
+assert profile.materialized_generation == 0
+
+migrate(MIGRATION_FROM)
+_, rolled_back_model = models_at(MIGRATION_FROM)
+profile = rolled_back_model.objects.get(pk=profile_id)
+assert profile.seed_payload["model"] == "gpt-5.6-luna"
+assert profile.seed_payload["base_url"] == "https://api.openai.com/v1"
+assert profile.seed_fingerprint == legacy
+assert profile.materialized_generation == 0
+"""
+
+
+def test_profile_default_model_migration_switches_and_restores(tmp_path):
+    database_path = tmp_path / "model.sqlite3"
+    result = subprocess.run(
+        [sys.executable, "-c", MODEL_MIGRATION_PROBE, str(database_path)],
         cwd=Path(__file__).resolve().parents[2],
         capture_output=True,
         text=True,

@@ -6,6 +6,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from django.conf import settings
 from django.db import OperationalError, close_old_connections
 from django.test import Client
 from django.utils import timezone
@@ -21,6 +22,7 @@ from runtime.exceptions import (
 )
 from runtime.models import (
     Attempt,
+    ConversationBinding,
     Execution,
     ExecutionEvent,
     ExecutionStatus,
@@ -91,6 +93,7 @@ def test_claim_replay_and_terminal_receipt(runtime_setup):
     replay = claim_next_execution(context, claim_id, 2)
     assert first is not None
     assert replay == first
+    assert first.reasoning_effort == "xhigh"
     assert Execution.objects.get(pk=execution.id).status == ExecutionStatus.RUNNING
     terminal = complete_attempt(
         context,
@@ -114,6 +117,27 @@ def test_claim_replay_and_terminal_receipt(runtime_setup):
             first.lease_token,
             {"code": "different"},
         )
+
+
+def test_claim_replay_samples_current_managed_reasoning_effort(runtime_setup):
+    _workspace, profile, execution, issued = runtime_setup
+    profile.seed_payload = {"model": "gpt-5.6-luna", "reasoning_effort": "low"}
+    profile.save(update_fields=["seed_payload", "updated_at"])
+    original_seed = dict(profile.seed_payload)
+    context = authenticate_runtime_token(issued.raw_token)
+    claim_id = uuid4()
+
+    with patch.object(settings, "ALLIES_RUNTIME_REASONING_EFFORT", "xhigh"):
+        first = claim_next_execution(context, claim_id, 1)
+    with patch.object(settings, "ALLIES_RUNTIME_REASONING_EFFORT", "high"):
+        replay = claim_next_execution(context, claim_id, 1)
+
+    assert first is not None
+    assert replay is not None
+    assert first.reasoning_effort == "xhigh"
+    assert replay.reasoning_effort == "high"
+    assert RuntimeProfile.objects.get(pk=profile.pk).seed_payload == original_seed
+    assert Execution.objects.get(pk=execution.pk).input_payload == {"message": "hello"}
 
 
 def test_generation_credential_issue_is_exactly_replayable(ready_workspace):
@@ -546,6 +570,7 @@ def test_internal_api_claim_and_event(runtime_setup):
     )
     assert response.status_code == 200, response.content
     claim = response.json()
+    assert claim["reasoning_effort"] == "xhigh"
     event_payload = {
         "event_id": str(uuid4()),
         "stream_id": claim["stream_id"],
@@ -563,12 +588,19 @@ def test_internal_api_claim_and_event(runtime_setup):
         },
     )
     assert event.status_code == 202, event.content
-    session = client.put(
-        f"/api/v1/runtime/attempts/{claim['attempt_id']}/session-binding",
+    rejected = client.post(
+        f"/api/v1/runtime/attempts/{claim['attempt_id']}/complete",
         data={
-            "cloud_conversation_ref": "cloud-conversation",
-            "expected_session_id": None,
-            "effective_session_id": "hermes-session",
+            "event_id": str(uuid4()),
+            "stream_id": claim["stream_id"],
+            "sequence": 2,
+            "payload": {"run_id": "run-1", "status": "invalid"},
+            "receipt": {"code": "ok"},
+            "session_binding": {
+                "cloud_conversation_ref": "cloud-conversation",
+                "expected_session_id": None,
+                "effective_session_id": "hermes-session",
+            },
         },
         content_type="application/json",
         headers={
@@ -576,7 +608,10 @@ def test_internal_api_claim_and_event(runtime_setup):
             "X-Foundry-Lease-Token": claim["lease_token"],
         },
     )
-    assert session.status_code == 200, session.content
+    assert rejected.status_code == 422, rejected.content
+    assert not ConversationBinding.objects.filter(
+        profile_id=claim["profile_id"]
+    ).exists()
     complete = client.post(
         f"/api/v1/runtime/attempts/{claim['attempt_id']}/complete",
         data={
@@ -585,6 +620,11 @@ def test_internal_api_claim_and_event(runtime_setup):
             "sequence": 2,
             "payload": {"run_id": "run-1", "status": "completed"},
             "receipt": {"code": "ok"},
+            "session_binding": {
+                "cloud_conversation_ref": "cloud-conversation",
+                "expected_session_id": None,
+                "effective_session_id": "hermes-session",
+            },
         },
         content_type="application/json",
         headers={

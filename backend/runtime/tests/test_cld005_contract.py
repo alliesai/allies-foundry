@@ -12,13 +12,18 @@ from django.test import Client
 from django.utils import timezone
 
 from runtime.contracts import (
+    ACTIVITY_KINDS,
     FINGERPRINT_PREFIX,
+    MAX_APPROVAL_LIFETIME_SECONDS,
     MAX_RUNTIME_EVENT_SEQUENCE,
     MAX_TERMINAL_SEQUENCE,
     ExecutionCommand,
+    ExecutionInput,
     FoundryEventEnvelope,
+    _validate_event_payload,
     build_event_envelope,
     command_fingerprint,
+    event_envelope_bytes,
     event_fingerprint,
     validate_command,
 )
@@ -45,12 +50,13 @@ from runtime.services.event_delivery import (
     publish_pending_event_deliveries,
     redrive_event_deliveries,
 )
-from runtime.services.events import append_runtime_event
+from runtime.services.events import _runtime_event_payload, append_runtime_event
 from runtime.services.executions import create_execution_intent
 from runtime.services.runtime_auth import (
     authenticate_runtime_token,
     issue_runtime_credential,
 )
+from runtime.services.validation import digest_payload
 
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[3]
@@ -58,12 +64,32 @@ FIXTURE_PATH = (
     / "contracts"
     / "foundry-execution-v1.json"
 )
+FILE_INPUT_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[3] / "docs" / "contracts" / "file-input-v1.json"
+)
+FILE_INPUT_COMMAND_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "docs"
+    / "contracts"
+    / "foundry-execution-file-input-v1.json"
+)
+ACTIVITY_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "docs"
+    / "contracts"
+    / "activity-presentation-v1.json"
+)
 PROFILE_NAMESPACE = uuid5(NAMESPACE_URL, "allies-foundry-profile-v1")
 
 
 @pytest.fixture
 def contract():
     return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def activity_contract():
+    return json.loads(ACTIVITY_FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
 @pytest.fixture
@@ -138,6 +164,58 @@ def test_fixture_is_strict_and_fingerprints_are_reproducible(contract):
     assert command.payload.text == "normalized user text"
 
 
+def test_activity_presentation_fixture_matches_foundry_validator(activity_contract):
+    assert set(activity_contract["activity_kinds"]) == ACTIVITY_KINDS
+    for case in activity_contract["accepted"]:
+        _validate_event_payload(case["event_type"], case["payload"])
+    for case in activity_contract["rejected"]:
+        with pytest.raises(RuntimeValidationError):
+            _validate_event_payload(case["event_type"], case["payload"])
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload", "expected"),
+    [
+        (
+            "activity.started",
+            {"activity_id": "legacy-activity-1", "kind": "tool"},
+            {"kind": "tool"},
+        ),
+        (
+            "activity.completed",
+            {"activity_id": "legacy-activity-1", "status": "completed"},
+            {"status": "completed"},
+        ),
+    ],
+)
+def test_legacy_activity_replay_preserves_storage_and_strips_only_wire_identity(
+    binding, contract, event_type, payload, expected
+):
+    assert _runtime_event_payload(event_type, payload) == payload
+    workspace, _profile = binding
+    create_execution_intent(ExecutionCommand.model_validate(contract["command"]))
+    issued = issue_runtime_credential(workspace.id, "runtime-contract-token")
+    context = authenticate_runtime_token(issued.raw_token)
+    claim = claim_next_execution(context, uuid4(), 1)
+    event_id = uuid4()
+    args = (
+        context,
+        claim.attempt_id,
+        claim.lease_token,
+        event_id,
+        claim.stream_id,
+        1,
+        event_type,
+        payload,
+    )
+    event = append_runtime_event(*args)
+    assert event.payload == payload
+    replay = append_runtime_event(*args)
+    assert replay.pk == event.pk
+    delivery = ExecutionEventDelivery.objects.get(event=event)
+    assert json.loads(bytes(delivery.envelope_bytes))["payload"] == expected
+
+
 def test_optional_bootstrap_is_fingerprinted_and_legacy_shape_stays_compatible(
     contract,
 ):
@@ -169,6 +247,86 @@ def test_optional_bootstrap_is_fingerprinted_and_legacy_shape_stays_compatible(
     invalid = invalid.model_copy(update={"fingerprint": command_fingerprint(invalid)})
     with pytest.raises(RuntimeValidationError, match="before the second"):
         validate_command(invalid)
+
+
+def test_file_input_contract_keeps_legacy_bytes_and_survives_claim(binding, contract):
+    legacy = ExecutionCommand.model_validate(contract["command"])
+    assert command_fingerprint(legacy) == contract["command"]["fingerprint"]
+    file_input = json.loads(FILE_INPUT_FIXTURE_PATH.read_text(encoding="utf-8"))
+    data = legacy.model_dump(mode="json", exclude_none=True)
+    data["payload"] = file_input
+    with_files = ExecutionCommand.model_validate(data)
+    with_files = with_files.model_copy(
+        update={"fingerprint": command_fingerprint(with_files)}
+    )
+
+    receipt = create_execution_intent(with_files)
+    assert receipt.status == "accepted"
+    execution = Execution.objects.get(command_id=with_files.command_id)
+    assert execution.input_payload["message"] == ""
+    assert execution.input_payload["files"] == file_input["files"]
+
+    workspace, _profile = binding
+    issued = issue_runtime_credential(workspace.id, "runtime-files-token")
+    claim = claim_next_execution(
+        authenticate_runtime_token(issued.raw_token), uuid4(), 1
+    )
+    assert claim is not None
+    assert claim.payload["files"] == file_input["files"]
+
+
+def test_file_input_commands_match_golden_fingerprints():
+    contract = json.loads(FILE_INPUT_COMMAND_FIXTURE_PATH.read_text(encoding="utf-8"))
+    for command_data in contract["commands"].values():
+        command = ExecutionCommand.model_validate(command_data)
+        validate_command(command)
+        assert command_fingerprint(command) == command_data["fingerprint"]
+
+
+def _file_input(size: int, suffix: str) -> dict:
+    return {
+        "file_id": f"550e8400-e29b-41d4-a716-4466554400{suffix}",
+        "name": f"report-{suffix}.pdf",
+        "media_type": "application/pdf",
+        "size": size,
+        "sha256": "a" * 64,
+    }
+
+
+def test_file_input_rejects_explicit_null_empty_and_oversized_manifests():
+    omitted = ExecutionInput.model_validate(
+        {"kind": "execution_input", "text": "normalized user text"}
+    )
+    assert "files" not in omitted.model_fields_set
+    with pytest.raises(ValueError, match="files must be omitted"):
+        ExecutionInput.model_validate(
+            {"kind": "execution_input", "text": "normalized user text", "files": None}
+        )
+    with pytest.raises(ValueError):
+        ExecutionInput.model_validate(
+            {"kind": "execution_input", "text": "normalized user text", "files": []}
+        )
+
+    accepted = ExecutionInput.model_validate(
+        {
+            "kind": "execution_input",
+            "text": "",
+            "files": [_file_input(25_000_000, "01"), _file_input(25_000_000, "02")],
+        }
+    )
+    assert sum(file.size for file in accepted.files or []) == 50_000_000
+    with pytest.raises(ValueError, match="aggregate size"):
+        ExecutionInput.model_validate(
+            {
+                "kind": "execution_input",
+                "text": "",
+                "files": [
+                    _file_input(25_000_000, "01"),
+                    _file_input(25_000_000, "02"),
+                    _file_input(1, "03"),
+                ],
+            }
+        )
 
 
 def test_bootstrap_is_persisted_and_claimed_as_an_immutable_payload(binding, contract):
@@ -399,6 +557,42 @@ def test_dispatched_runtime_event_is_published_as_accepted(binding, contract):
     assert ExecutionEvent.objects.filter(attempt=claim.attempt_id).count() == 1
 
 
+def test_delivery_rebuild_uses_event_time_for_rich_approval_expiry(delivery):
+    attempt = delivery.event.attempt
+    created_at = timezone.now() - timedelta(seconds=MAX_APPROVAL_LIFETIME_SECONDS + 60)
+    payload = {
+        "approval_request_id": str(uuid4()),
+        "action_kind": "plugin_tool",
+        "action_label": "Connect Nabu",
+        "action_preview": "Connect to the selected Nabu space",
+        "expires_at": (created_at + timedelta(seconds=120)).isoformat(),
+    }
+    event = ExecutionEvent.objects.create(
+        attempt=attempt,
+        event_id=uuid4(),
+        stream_id=f"stream-{attempt.id.hex}",
+        sequence=2,
+        event_type="execution.awaiting_action",
+        payload=payload,
+        payload_digest=digest_payload(payload),
+    )
+    ExecutionEvent.objects.filter(pk=event.pk).update(created_at=created_at)
+    event.refresh_from_db()
+
+    envelope = build_event_envelope(event.attempt.execution, event.attempt, event)
+    assert envelope is not None
+    encoded = event_envelope_bytes(envelope)
+    delivery = ExecutionEventDelivery.objects.create(
+        event=event,
+        envelope_bytes=encoded,
+        byte_length=len(encoded),
+        fingerprint=envelope.fingerprint,
+        next_attempt_at=timezone.now(),
+    )
+
+    assert event_delivery._rebuild_delivery_envelope(delivery) == encoded
+
+
 def test_invalid_service_bearer_is_privacy_safe(binding, contract, configured):
     response = Client().post(
         "/api/v1/internal/executions",
@@ -497,6 +691,24 @@ def test_event_delivery_requires_bounded_strict_cloud_receipt(
     assert (status, code) == (503, "delivery_receipt_invalid")
 
 
+@pytest.mark.parametrize("envelope", [b"[]", b"null", b'"text"', b"1"])
+def test_event_delivery_rejects_non_object_persisted_envelopes(
+    settings, monkeypatch, envelope
+):
+    _configure_delivery(settings)
+    called = []
+    monkeypatch.setattr(
+        event_delivery,
+        "build_opener",
+        lambda *_: called.append(True),
+    )
+
+    status, code = event_delivery._post_to_cloud(envelope)
+
+    assert (status, code) == (503, "delivery_envelope_invalid")
+    assert called == []
+
+
 def test_event_delivery_rejects_mismatched_cloud_receipt(
     delivery, settings, monkeypatch
 ):
@@ -566,6 +778,25 @@ def test_event_delivery_allows_only_the_debug_proof_cloud_http_host(
     status, code = event_delivery._post_to_cloud(bytes(delivery.envelope_bytes))
 
     assert (status, code) == (202, "")
+
+
+def test_slow_delivery_post_logs_event_identity(
+    delivery, settings, monkeypatch, caplog
+):
+    _configure_delivery(settings)
+    body = json.dumps(
+        {"event_id": str(delivery.event.event_id), "status": "applied"}
+    ).encode()
+    opener = _DeliveryOpener(_DeliveryResponse(202, body))
+    monkeypatch.setattr(event_delivery, "build_opener", lambda *_: opener)
+    ticks = iter([10.0, 15.0])
+    monkeypatch.setattr(event_delivery, "monotonic", lambda: next(ticks))
+
+    with caplog.at_level("WARNING", logger="runtime.services.event_delivery"):
+        status, code = event_delivery._post_to_cloud(bytes(delivery.envelope_bytes))
+
+    assert (status, code) == (202, "")
+    assert str(delivery.event.event_id) in caplog.text
 
 
 def test_event_delivery_disables_redirects_before_sending_bearer(
@@ -782,9 +1013,25 @@ def test_event_delivery_manual_redrive_is_dry_run_then_fences_old_claim(
         stdout=output,
     )
     assert "dry-run: validated 1" in output.getvalue()
+    output = StringIO()
+    call_command(
+        "redrive_event_deliveries",
+        "--attempt-id",
+        str(delivery.event.attempt_id),
+        stdout=output,
+    )
+    assert "dry-run: validated 1" in output.getvalue()
+    output = StringIO()
+    call_command(
+        "redrive_event_deliveries", "--attempt-id", str(uuid4()), stdout=output
+    )
+    assert "no exhausted deliveries" in output.getvalue()
     delivery.refresh_from_db()
     assert delivery.state == "exhausted"
     assert delivery.envelope_bytes == b""
+    ExecutionEventDelivery.objects.filter(pk=delivery.pk).update(
+        sequence_gap_since=timezone.now() - timedelta(hours=1)
+    )
 
     output = StringIO()
     call_command(
@@ -792,6 +1039,7 @@ def test_event_delivery_manual_redrive_is_dry_run_then_fences_old_claim(
     )
     assert "redriven 1" in output.getvalue()
     delivery.refresh_from_db()
+    assert delivery.sequence_gap_since is None
     assert delivery.state == "pending"
     assert delivery.repair_cycle == 1
     assert delivery.delivery_attempts == 0
@@ -963,6 +1211,13 @@ def test_event_delivery_command_bounds_power_work_around_delivery(monkeypatch):
     calls = []
     command_path = "runtime.management.commands.publish_event_deliveries"
     monkeypatch.setattr(
+        f"{command_path}.wake_due_publications",
+        lambda *, limit, cursor: (
+            calls.append(("publication", limit, cursor))
+            or type("Publication", (), {"woken": 0, "next_cursor": None})()
+        ),
+    )
+    monkeypatch.setattr(
         f"{command_path}.process_runtime_wakes",
         lambda *, limit: (
             calls.append(("wake", limit))
@@ -992,6 +1247,7 @@ def test_event_delivery_command_bounds_power_work_around_delivery(monkeypatch):
     call_command("publish_event_deliveries", stdout=output)
 
     assert calls == [
+        ("publication", 20, None),
         ("wake", 1),
         ("delivery", 1),
         ("cleanup", None),
@@ -999,3 +1255,181 @@ def test_event_delivery_command_bounds_power_work_around_delivery(monkeypatch):
     ]
     assert "wake unavailable 1" in output.getvalue()
     assert "idle unavailable 2" in output.getvalue()
+
+
+def test_event_delivery_command_keeps_publication_wake_cursor_across_watch_passes(
+    monkeypatch,
+):
+    command_path = "runtime.management.commands.publish_event_deliveries"
+    cursors = []
+
+    def wake_publications(*, limit, cursor):
+        cursors.append((limit, cursor))
+        return type(
+            "Publication",
+            (),
+            {"woken": 1, "next_cursor": "second-page" if cursor is None else None},
+        )()
+
+    monkeypatch.setattr(f"{command_path}.wake_due_publications", wake_publications)
+    monkeypatch.setattr(
+        f"{command_path}.process_runtime_wakes",
+        lambda *, limit: type(
+            "Wake", (), {"started": 0, "failed": 0, "unavailable": 0}
+        )(),
+    )
+    monkeypatch.setattr(
+        f"{command_path}.publish_pending_event_deliveries",
+        lambda *, limit: event_delivery.DeliveryReport(delivered=0),
+    )
+    monkeypatch.setattr(f"{command_path}.cleanup_runtime_intents", lambda: 0)
+    monkeypatch.setattr(
+        f"{command_path}.stop_idle_workspaces",
+        lambda *, limit: type("Idle", (), {"stopped": 0, "unavailable": 0})(),
+    )
+
+    call_command("publish_event_deliveries", "--watch", "--max-runs", "2")
+
+    assert cursors == [(20, None), (20, "second-page")]
+
+
+@pytest.fixture
+def ordered_deliveries(binding, contract):
+    workspace, _profile = binding
+    create_execution_intent(ExecutionCommand.model_validate(contract["command"]))
+    issued = issue_runtime_credential(workspace.id, "runtime-contract-token")
+    context = authenticate_runtime_token(issued.raw_token)
+    claim = claim_next_execution(context, uuid4(), 1)
+    assert claim is not None
+    events = [
+        append_runtime_event(
+            context,
+            claim.attempt_id,
+            claim.lease_token,
+            uuid4(),
+            claim.stream_id,
+            sequence,
+            "execution.dispatched" if sequence == 1 else "message.delta",
+            {"status": "dispatched"} if sequence == 1 else {"text": "hi"},
+        )
+        for sequence in (1, 2)
+    ]
+    return [ExecutionEventDelivery.objects.get(event=event) for event in events]
+
+
+def test_sequence_gap_defers_without_consuming_attempts(
+    ordered_deliveries, settings, monkeypatch
+):
+    settings.ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = True
+    _first, second = ordered_deliveries
+    second_body = bytes(second.envelope_bytes)
+    monkeypatch.setattr(
+        event_delivery,
+        "_post_to_cloud",
+        lambda body: (409, "sequence_gap") if body == second_body else (503, ""),
+    )
+
+    for _ in range(event_delivery.MAX_DELIVERY_ATTEMPTS + 2):
+        ExecutionEventDelivery.objects.filter(pk=second.pk).update(
+            next_attempt_at=timezone.now()
+        )
+        publish_pending_event_deliveries()
+
+    second.refresh_from_db()
+    assert second.state == "pending"
+    assert second.delivery_attempts == 0
+    assert second.repair_cycle == 0
+    assert second.safe_error_code == "sequence_gap"
+    assert second.next_attempt_at > timezone.now()
+
+
+def test_delivered_event_wakes_backed_off_successors(
+    ordered_deliveries, settings, monkeypatch
+):
+    settings.ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = True
+    first, second = ordered_deliveries
+    later = timezone.now() + timedelta(minutes=5)
+    ExecutionEventDelivery.objects.filter(pk=second.pk).update(
+        next_attempt_at=later, safe_error_code="sequence_gap"
+    )
+    first_body = bytes(first.envelope_bytes)
+    monkeypatch.setattr(
+        event_delivery,
+        "_post_to_cloud",
+        lambda body: (202, "") if body == first_body else (503, ""),
+    )
+
+    publish_pending_event_deliveries()
+
+    first.refresh_from_db()
+    second.refresh_from_db()
+    assert first.state == "delivered"
+    assert second.next_attempt_at <= timezone.now()
+
+
+def test_delivered_event_leaves_other_backoffs_alone(
+    ordered_deliveries, settings, monkeypatch
+):
+    settings.ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = True
+    first, second = ordered_deliveries
+    later = timezone.now() + timedelta(minutes=5)
+    ExecutionEventDelivery.objects.filter(pk=second.pk).update(
+        next_attempt_at=later, safe_error_code="delivery_unavailable"
+    )
+    first_body = bytes(first.envelope_bytes)
+    monkeypatch.setattr(
+        event_delivery,
+        "_post_to_cloud",
+        lambda body: (202, "") if body == first_body else (503, ""),
+    )
+
+    publish_pending_event_deliveries()
+
+    second.refresh_from_db()
+    assert second.next_attempt_at == later
+
+
+def test_stale_sequence_gap_consumes_attempts(
+    ordered_deliveries, settings, monkeypatch
+):
+    settings.ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = True
+    _first, second = ordered_deliveries
+    ExecutionEventDelivery.objects.filter(pk=second.pk).update(
+        sequence_gap_since=timezone.now()
+        - timedelta(seconds=event_delivery.SEQUENCE_GAP_PATIENCE_SECONDS + 1)
+    )
+    second_body = bytes(second.envelope_bytes)
+    monkeypatch.setattr(
+        event_delivery,
+        "_post_to_cloud",
+        lambda body: (409, "sequence_gap") if body == second_body else (503, ""),
+    )
+
+    publish_pending_event_deliveries()
+
+    second.refresh_from_db()
+    assert second.delivery_attempts == 1
+    assert second.state == "pending"
+
+
+def test_backlog_row_gets_sequence_gap_deferral(
+    ordered_deliveries, settings, monkeypatch
+):
+    settings.ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = True
+    _first, second = ordered_deliveries
+    ExecutionEventDelivery.objects.filter(pk=second.pk).update(
+        created_at=timezone.now() - timedelta(hours=6)
+    )
+    second_body = bytes(second.envelope_bytes)
+    monkeypatch.setattr(
+        event_delivery,
+        "_post_to_cloud",
+        lambda body: (409, "sequence_gap") if body == second_body else (503, ""),
+    )
+
+    publish_pending_event_deliveries()
+
+    second.refresh_from_db()
+    assert second.delivery_attempts == 0
+    assert second.safe_error_code == "sequence_gap"
+    assert second.sequence_gap_since is not None

@@ -17,10 +17,11 @@ print(settings.SECURE_PROXY_SSL_HEADER)
 print(settings.SECURE_SSL_REDIRECT)
 print(settings.SECURE_HSTS_SECONDS)
 print(settings.PROFILE_PROVISIONING_PROVIDER)
+print(settings.ALLIES_RUNTIME_REASONING_EFFORT)
 """
 
 
-def run_settings_probe(**overrides):
+def run_settings_probe(*, probe=None, **overrides):
     environment = os.environ.copy()
     for name in (
         "DATABASE_URL",
@@ -29,6 +30,7 @@ def run_settings_probe(**overrides):
         "DJANGO_SECRET_KEY",
         "DJANGO_TRUST_PROXY_HEADERS",
         "DJANGO_TRUSTED_PROXY_IPS",
+        "DJANGO_HEALTHCHECK_ALLOW_HTTP",
         "ALLIES_CLOUD_SERVICE_TOKEN",
         "ALLIES_CLOUD_EVENT_DELIVERY_ENABLED",
         "ALLIES_CLOUD_URL",
@@ -36,6 +38,28 @@ def run_settings_probe(**overrides):
         "ALLIES_FLY_API_BASE_URL",
         "ALLIES_RUNTIME_IDLE_STOP_ENABLED",
         "ALLIES_RUNTIME_POWER_PROOF_ENABLED",
+        "ALLIES_RUNTIME_READINESS_HINT_ENABLED",
+        "ALLIES_RUNTIME_FILE_INPUT_ENABLED",
+        "ALLIES_RUNTIME_FILE_PUBLICATION_ENABLED",
+        "ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED",
+        "ALLIES_RICH_APPROVALS_ENABLED",
+        "ALLIES_RUNTIME_REASONING_EFFORT",
+        "ALLIES_RUNTIME_ACTIVITY_WAIT_SECONDS",
+        "ALLIES_RUNTIME_ACTIVITY_WAIT_MAX_WAITERS",
+        "READY_WORKSPACE_POOL_TARGET",
+        "READY_WORKSPACE_POOL_SLEEP_ENABLED",
+        "WORKSPACE_CPU_KIND",
+        "WORKSPACE_CPUS",
+        "WORKSPACE_MEMORY_MB",
+        "WORKSPACE_VOLUME_SIZE_GB",
+        "READY_WORKSPACE_POOL_REGION",
+        "READY_WORKSPACE_POOL_RELEASE_FINGERPRINT",
+        "READY_WORKSPACE_POOL_CONFIG_VERSION",
+        "READY_WORKSPACE_POOL_MAX_PREPARING",
+        "READY_WORKSPACE_POOL_MAX_ATTEMPTS",
+        "READY_WORKSPACE_POOL_READY_TTL_SECONDS",
+        "READY_WORKSPACE_POOL_HEALTH_FRESHNESS_SECONDS",
+        "READY_WORKSPACE_POOL_PHASE_CLAIM_SECONDS",
         "ALLIES_RUNTIME_KEEP_WARM_SECONDS",
         "ALLIES_RUNTIME_INTENT_TTL_SECONDS",
         "ALLIES_RUNTIME_INTENT_RETENTION_SECONDS",
@@ -49,15 +73,29 @@ def run_settings_probe(**overrides):
     ):
         environment.pop(name, None)
     environment["ALLIES_CLOUD_SERVICE_TOKEN"] = "s" * 32
+    if overrides.get("DJANGO_DEBUG") == "false":
+        environment["ALLIES_CLOUD_URL"] = "https://cloud.example.test"
+        environment["ALLIES_CLOUD_EVENT_SERVICE_TOKEN"] = "c" * 32
     environment.update(overrides)
     return subprocess.run(
-        [sys.executable, "-c", PROBE],
+        [sys.executable, "-c", PROBE if probe is None else probe],
         cwd=BACKEND_ROOT,
         env=environment,
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+@pytest.mark.parametrize("enabled, expected", [("false", "[]"), ("true", "['^healthz$']")])
+def test_http_healthcheck_exemption_is_explicit(enabled, expected):
+    result = run_settings_probe(
+        probe="import config.settings as s; print(s.SECURE_REDIRECT_EXEMPT)",
+        DJANGO_DEBUG="true",
+        DJANGO_HEALTHCHECK_ALLOW_HTTP=enabled,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
 
 
 def test_development_mode_keeps_sqlite_fallback():
@@ -69,11 +107,83 @@ def test_development_mode_keeps_sqlite_fallback():
     assert "django.db.backends.sqlite3" in result.stdout
 
 
+@pytest.mark.parametrize("disabled", [False, True])
+def test_file_features_default_on_with_explicit_shutdown(monkeypatch, disabled):
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "PROBE",
+        "import config.settings as s; "
+        f"assert s.ALLIES_RUNTIME_FILE_INPUT_ENABLED is {not disabled}; "
+        f"assert s.ALLIES_RUNTIME_FILE_PUBLICATION_ENABLED is {not disabled}",
+    )
+    overrides = {"DJANGO_DEBUG": "true"}
+    if disabled:
+        overrides.update(
+            ALLIES_RUNTIME_FILE_INPUT_ENABLED="false",
+            ALLIES_RUNTIME_FILE_PUBLICATION_ENABLED="false",
+        )
+    result = run_settings_probe(**overrides)
+    assert result.returncode == 0, result.stderr
+
+
+def test_production_file_features_require_cloud_connection():
+    result = run_settings_probe(
+        DJANGO_DEBUG="false",
+        DJANGO_SECRET_KEY="synthetic-test-secret",
+        DJANGO_ALLOWED_HOSTS="localhost",
+        DATABASE_URL="sqlite:///test-production.sqlite3",
+        ALLIES_CLOUD_URL="",
+        ALLIES_CLOUD_EVENT_SERVICE_TOKEN="",
+    )
+    assert result.returncode != 0
+    assert (
+        "ALLIES_CLOUD_URL and ALLIES_CLOUD_EVENT_SERVICE_TOKEN are required"
+        in result.stderr
+    )
+
+
 def test_profile_provisioning_defaults_to_hermes_openai_api_provider():
     result = run_settings_probe(DJANGO_DEBUG="true")
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[-1] == "openai-api"
+    assert result.stdout.splitlines()[-2] == "openai-api"
+
+
+def test_profile_provisioning_defaults_to_openrouter_gpt6():
+    result = run_settings_probe(
+        DJANGO_DEBUG="true",
+        probe=(
+            "import config.settings as settings\n"
+            "print(settings.PROFILE_PROVISIONING_MODEL)\n"
+            "print(settings.PROFILE_PROVISIONING_BASE_URL)\n"
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-2] == "openai/gpt-6-luna"
+    assert result.stdout.splitlines()[-1] == "https://openrouter.ai/api/v1"
+
+
+def test_runtime_reasoning_effort_defaults_to_xhigh_and_accepts_high():
+    default = run_settings_probe(DJANGO_DEBUG="true")
+    high = run_settings_probe(
+        DJANGO_DEBUG="true", ALLIES_RUNTIME_REASONING_EFFORT="high"
+    )
+
+    assert default.returncode == 0, default.stderr
+    assert default.stdout.splitlines()[-1] == "xhigh"
+    assert high.returncode == 0, high.stderr
+    assert high.stdout.splitlines()[-1] == "high"
+
+
+@pytest.mark.parametrize("value", ["", "medium", "xhigh\ninvalid", "none"])
+def test_runtime_reasoning_effort_rejects_unsupported_values(value):
+    result = run_settings_probe(
+        DJANGO_DEBUG="true", ALLIES_RUNTIME_REASONING_EFFORT=value
+    )
+
+    assert result.returncode != 0
+    assert "ALLIES_RUNTIME_REASONING_EFFORT" in result.stderr
 
 
 def test_readiness_freshness_must_exceed_twice_the_runtime_heartbeat():
@@ -246,6 +356,37 @@ def test_runtime_intent_retention_cannot_end_before_eligibility():
     assert "ALLIES_RUNTIME_INTENT_RETENTION_SECONDS" in result.stderr
 
 
+def test_ready_workspace_pool_is_disabled_by_target_zero():
+    result = run_settings_probe(DJANGO_DEBUG="true", READY_WORKSPACE_POOL_TARGET="0")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_ready_workspace_pool_requires_region_and_release_when_enabled():
+    missing_region = run_settings_probe(
+        DJANGO_DEBUG="true",
+        READY_WORKSPACE_POOL_TARGET="1",
+        READY_WORKSPACE_POOL_RELEASE_FINGERPRINT="release-v1",
+    )
+    missing_release = run_settings_probe(
+        DJANGO_DEBUG="true",
+        READY_WORKSPACE_POOL_TARGET="1",
+        READY_WORKSPACE_POOL_REGION="ams",
+    )
+    valid = run_settings_probe(
+        DJANGO_DEBUG="true",
+        READY_WORKSPACE_POOL_TARGET="1",
+        READY_WORKSPACE_POOL_REGION="ams",
+        READY_WORKSPACE_POOL_RELEASE_FINGERPRINT="release-v1",
+    )
+
+    assert missing_region.returncode != 0
+    assert "READY_WORKSPACE_POOL_REGION" in missing_region.stderr
+    assert missing_release.returncode != 0
+    assert "READY_WORKSPACE_POOL_RELEASE_FINGERPRINT" in missing_release.stderr
+    assert valid.returncode == 0, valid.stderr
+
+
 @pytest.mark.parametrize(
     ("setting", "value"),
     [
@@ -353,3 +494,115 @@ def test_production_mode_accepts_explicit_database(database_url, engine):
         assert "31536000" in result.stdout
     else:
         assert "'transaction_mode': 'IMMEDIATE'" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, [True, False, False, 0]),
+        (
+            {
+                "ALLIES_CLOUD_URL": "https://cloud.example.com",
+                "ALLIES_CLOUD_EVENT_SERVICE_TOKEN": "x" * 32,
+            },
+            [True, True, False, 0],
+        ),
+        ({"ALLIES_CLOUD_URL": "https://cloud.example.com"}, [True, False, False, 0]),
+        ({"ALLIES_CLOUD_EVENT_SERVICE_TOKEN": "x" * 32}, [True, False, False, 0]),
+        (
+            {
+                "ALLIES_CLOUD_URL": "https://cloud.example.com",
+                "ALLIES_CLOUD_EVENT_SERVICE_TOKEN": "x" * 32,
+                "ALLIES_RUNTIME_READINESS_HINT_ENABLED": "false",
+                "ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED": "false",
+            },
+            [False, False, False, 0],
+        ),
+    ],
+)
+def test_readiness_defaults_and_rollback(monkeypatch, overrides, expected):
+    import json
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "PROBE",
+        "import json; import config.settings as s; print(json.dumps([s.ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED, s.ALLIES_RUNTIME_READINESS_HINT_ENABLED, s.ALLIES_RUNTIME_IDLE_STOP_ENABLED, s.READY_WORKSPACE_POOL_TARGET]))",
+    )
+    result = run_settings_probe(
+        DJANGO_DEBUG="true",
+        ALLIES_RUNTIME_FILE_INPUT_ENABLED="false",
+        ALLIES_RUNTIME_FILE_PUBLICATION_ENABLED="false",
+        **overrides,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected
+
+
+def test_explicit_hint_enable_requires_delivery_credentials():
+    result = run_settings_probe(
+        DJANGO_DEBUG="true", ALLIES_RUNTIME_READINESS_HINT_ENABLED="true"
+    )
+    assert result.returncode != 0
+    assert (
+        "ALLIES_CLOUD_URL and ALLIES_CLOUD_EVENT_SERVICE_TOKEN are required"
+        in result.stderr
+    )
+
+
+def test_workspace_capacity_defaults_and_idle_window(monkeypatch):
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "PROBE",
+        "import config.settings as s; print(s.WORKSPACE_CPU_KIND, s.WORKSPACE_CPUS, "
+        "s.WORKSPACE_MEMORY_MB, s.WORKSPACE_VOLUME_SIZE_GB, "
+        "s.WORKSPACE_VOLUME_SIZE_LIMIT_GB, s.ALLIES_RUNTIME_KEEP_WARM_SECONDS)",
+    )
+    result = run_settings_probe(DJANGO_DEBUG="true")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "shared 2 2048 3 20 1800"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"WORKSPACE_CPUS": "0"},
+        {"WORKSPACE_CPUS": "17"},
+        {"WORKSPACE_MEMORY_MB": "-1"},
+        {"WORKSPACE_VOLUME_SIZE_GB": "0"},
+        {"WORKSPACE_VOLUME_SIZE_LIMIT_GB": "0"},
+        {"WORKSPACE_VOLUME_SIZE_GB": "30", "WORKSPACE_VOLUME_SIZE_LIMIT_GB": "20"},
+        {"WORKSPACE_CPU_KIND": "unknown"},
+    ],
+)
+def test_invalid_workspace_capacity_fails_at_startup(overrides):
+    result = run_settings_probe(DJANGO_DEBUG="true", **overrides)
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [(None, True), ("false", False), ("true", True)],
+)
+def test_rich_approval_setting_is_explicit_and_environment_scoped(
+    monkeypatch, override, expected
+):
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "PROBE",
+        "import config.settings as s; print(s.ALLIES_RICH_APPROVALS_ENABLED)",
+    )
+    overrides = {} if override is None else {"ALLIES_RICH_APPROVALS_ENABLED": override}
+    result = run_settings_probe(DJANGO_DEBUG="true", **overrides)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(expected)
+
+
+def test_sleeping_ready_pool_defaults_off(monkeypatch):
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "PROBE",
+        "import config.settings as s; print(s.READY_WORKSPACE_POOL_SLEEP_ENABLED)",
+    )
+    result = run_settings_probe(DJANGO_DEBUG="true")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"

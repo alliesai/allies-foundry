@@ -1,6 +1,10 @@
 import json
 import os
 import shutil
+import stat
+import subprocess
+import sys
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -10,11 +14,15 @@ from pathlib import Path
 from threading import Event, Lock
 
 import pytest
+import yaml
 
 import allies_runtime.profile_store as profile_store_module
 from allies_runtime.profile_store import (
+    CONTEXT_ONLY_MEMORY_MODE,
+    DEFAULT_MEMORY_TOOL_ALLOWLIST,
     HERMES_PROFILE_DIRECTORIES,
     MANIFEST_NAME,
+    BindingApplyStatus,
     ProfileCleanupStatus,
     ProfileInputError,
     ProfileProvisionStatus,
@@ -23,6 +31,8 @@ from allies_runtime.profile_store import (
     ProfileStoreError,
     _process_is_alive,
     _read_lock_metadata,
+    _replace_legacy_compression_config,
+    _replace_legacy_model_config,
     derive_profile_key,
     inspect_profile,
     validate_profile_key,
@@ -74,8 +84,120 @@ def profile_path(store: ProfileStore, seed: ProfileSeed) -> Path:
     return store.volume_root / "profiles" / (seed.hermes_profile_key or "")
 
 
-def test_memory_policy_is_bounded_and_changes_seed_fingerprint():
-    context_only = make_seed()
+def test_skill_catalog_upgrade_preserves_private_state(tmp_path):
+    store, seed = make_store(tmp_path), make_seed()
+    store.materialize(seed)
+    profile = profile_path(store, seed)
+    config = profile / "config.yaml"
+    assert yaml.safe_load(config.read_text())["skills"]["external_dirs"] == [
+        profile_store_module.SKILLS_CATALOG
+    ]
+    old = config.read_bytes().replace(profile_store_module.SKILLS_CONFIG.encode(), b"")
+    custom = old + b"# User configuration\ncustom:\n  skills: nested-value\n"
+    config.write_bytes(custom)
+    learned = profile / "skills" / "weekly-report" / "SKILL.md"
+    learned.parent.mkdir()
+    learned.write_text("A learned procedure", encoding="utf-8")
+    preserved = {
+        path: path.read_bytes()
+        for path in (learned, profile / ".env", profile / "SOUL.md")
+    }
+    assert store.materialize(seed).status is ProfileProvisionStatus.EXISTING
+    assert config.read_bytes() == custom + profile_store_module.SKILLS_CONFIG.encode()
+    assert (
+        make_store(tmp_path).materialize(seed).status is ProfileProvisionStatus.EXISTING
+    )
+    assert all(path.read_bytes() == value for path, value in preserved.items())
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"skills: {}\n",
+        b"skills: false\n",
+        b"model: [broken\n",
+        b"model: a\n---\nmodel: b\n",
+        b"model: a\nmodel: b\n",
+        b"custom:\n  value: a\n  value: b\n",
+        b"[]\n",
+        b"{model: example}\n",
+        b"model: a\n...\n",
+        b"custom: &a [*a]\n",
+        b"1: invalid-key\n",
+        b"custom: !!python/object:example {}\n",
+        b"\xff",
+        b"#" * (profile_store_module.MAX_PROFILE_TEXT_BYTES + 1),
+    ],
+    ids=[f"case-{index}" for index in range(14)],
+)
+def test_ambiguous_skill_config_is_preserved_for_repair(tmp_path, content):
+    store, seed = make_store(tmp_path), make_seed()
+    store.materialize(seed)
+    path = profile_path(store, seed) / "config.yaml"
+    path.write_bytes(content)
+    result = store.materialize(seed)
+    assert result.status is ProfileProvisionStatus.REPAIR_REQUIRED
+    assert result.repair_code == "skills_config_requires_repair"
+    assert path.read_bytes() == content
+
+
+@pytest.mark.parametrize("dirs", ['["/opt/allies/skills"]', '"/opt/allies/skills"'])
+def test_custom_skill_settings_with_catalog_are_not_rewritten(tmp_path, dirs):
+    store, seed = make_store(tmp_path), make_seed()
+    store.materialize(seed)
+    path = profile_path(store, seed) / "config.yaml"
+    custom = (
+        f"skills: {{external_dirs: {dirs}, creation_nudge_interval: 15}}\n".encode()
+    )
+    path.write_bytes(custom)
+    assert store.materialize(seed).status is ProfileProvisionStatus.EXISTING
+    assert path.read_bytes() == custom
+
+
+def test_catalog_migration_preserves_concurrent_edit(tmp_path, monkeypatch):
+    store, seed = make_store(tmp_path), make_seed()
+    store.materialize(seed)
+    path = profile_path(store, seed) / "config.yaml"
+    path.write_text("model: original\n", encoding="utf-8")
+    parse_config = profile_store_module._config_with_catalog
+
+    def edit_while_parsing(content):
+        path.write_text("model: user-edit\n", encoding="utf-8")
+        return parse_config(content)
+
+    monkeypatch.setattr(
+        profile_store_module, "_config_with_catalog", edit_while_parsing
+    )
+    result = store.materialize(seed)
+    assert result.repair_code == "skills_config_requires_repair"
+    assert path.read_text() == "model: user-edit\n"
+
+
+def test_failed_catalog_config_write_preserves_old_config(tmp_path, monkeypatch):
+    store, seed = make_store(tmp_path), make_seed()
+    store.materialize(seed)
+    path = profile_path(store, seed) / "config.yaml"
+    old = path.read_bytes().replace(profile_store_module.SKILLS_CONFIG.encode(), b"")
+    path.write_bytes(old)
+    original_write = store._write_bytes_atomic
+
+    def fail_config(target, content, *, mode):
+        if target == path:
+            raise ProfileStoreError("write failed")
+        return original_write(target, content, mode=mode)
+
+    monkeypatch.setattr(store, "_write_bytes_atomic", fail_config)
+    assert store.materialize(seed).status is ProfileProvisionStatus.REPAIR_REQUIRED
+    assert path.read_bytes() == old
+
+
+def test_memory_policy_defaults_to_reviewed_tools_and_keeps_context_only_explicit():
+    default = make_seed()
+    context_only = replace(
+        default,
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
     narrow = ProfileSeed(
         foundry_profile_id=PROFILE_ID,
         ally_name="Aster",
@@ -87,12 +209,13 @@ def test_memory_policy_is_bounded_and_changes_seed_fingerprint():
         memory_mode="narrow_tools",
         memory_tool_allowlist=("mnemosyne_recall", "mnemosyne_remember"),
     )
+    assert default.memory_tool_allowlist == DEFAULT_MEMORY_TOOL_ALLOWLIST
     assert context_only.memory_tool_allowlist == ()
     assert narrow.memory_tool_allowlist == (
         "mnemosyne_recall",
         "mnemosyne_remember",
     )
-    assert context_only.fingerprint != narrow.fingerprint
+    assert default.fingerprint != context_only.fingerprint
     contract_seed = ProfileSeed(
         foundry_profile_id="00000000-0000-0000-0000-000000000001",
         ally_name="ally-a",
@@ -102,9 +225,8 @@ def test_memory_policy_is_bounded_and_changes_seed_fingerprint():
         first_chat_instruction="i",
         credential_refs={"PROVIDER_API": "vault://p"},
     )
-    assert contract_seed.fingerprint == (
-        "cd995ea7543b218b8380d61d6b051548da09af3a13a9bfcc529b33fca9a95db9"
-    )
+    assert contract_seed.memory_mode == "narrow_tools"
+    assert contract_seed.memory_tool_allowlist == DEFAULT_MEMORY_TOOL_ALLOWLIST
     with pytest.raises(ProfileInputError):
         ProfileSeed(
             foundry_profile_id=PROFILE_ID,
@@ -136,8 +258,11 @@ def test_memory_policy_is_bounded_and_changes_seed_fingerprint():
         {"memory_mode": "broad_tools"},
         {"memory_sync_roles": ("push",)},
         {"memory_profile_isolation": False},
-        {"memory_tool_allowlist": ("mnemosyne_recall",)},
         {"memory_tool_allowlist": {"mnemosyne_recall"}},
+        {
+            "memory_mode": CONTEXT_ONLY_MEMORY_MODE,
+            "memory_tool_allowlist": ("mnemosyne_recall",),
+        },
         {
             "memory_mode": "narrow_tools",
             "memory_tool_allowlist": (
@@ -184,7 +309,7 @@ def test_first_publish_exact_layout_manifest_and_secret_permissions(tmp_path):
     config = (profile / "config.yaml").read_text(encoding="utf-8")
     assert 'model:\n  provider: "openai"\n  default: "gpt-test"\n' in config
     assert 'memory:\n  provider: "allies_mnemosyne"' in config
-    assert '  mode: "context_only"' in config
+    assert '  mode: "narrow_tools"' in config
     assert "    shared_surface_read: false" in config
     assert PROFILE_SECRET in (profile / ".env").read_text(encoding="utf-8")
     if os.name != "nt":
@@ -197,8 +322,8 @@ def test_first_publish_exact_layout_manifest_and_secret_permissions(tmp_path):
     assert manifest["seed_fingerprint"] == seed.fingerprint
     assert manifest["completion_state"] == "complete"
     assert manifest["memory_provider"] == "allies_mnemosyne"
-    assert manifest["memory_mode"] == "context_only"
-    assert manifest["memory_tools"] == []
+    assert manifest["memory_mode"] == "narrow_tools"
+    assert manifest["memory_tools"] == list(DEFAULT_MEMORY_TOOL_ALLOWLIST)
     assert PROFILE_SECRET not in json.dumps(manifest)
     assert PROFILE_SECRET not in json.dumps(receipt.to_dict())
 
@@ -499,7 +624,11 @@ def test_partial_and_incompatible_state_fail_closed(tmp_path):
 
 def test_legacy_manifest_is_upgraded_without_replacing_profile_state(tmp_path):
     store = make_store(tmp_path)
-    seed = make_seed()
+    seed = replace(
+        make_seed(),
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
     assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
     manifest_path = profile_path(store, seed) / MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -519,6 +648,367 @@ def test_legacy_manifest_is_upgraded_without_replacing_profile_state(tmp_path):
     assert "memory:\n" in (profile_path(store, seed) / "config.yaml").read_text(
         encoding="utf-8"
     )
+
+
+def test_legacy_memory_default_is_upgraded_without_replacing_profile_state(tmp_path):
+    store = make_store(tmp_path)
+    legacy_seed = replace(
+        make_seed(),
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
+    assert store.materialize(legacy_seed).status is ProfileProvisionStatus.CREATED
+    marker = profile_path(store, legacy_seed) / "sessions" / "preserved"
+    marker.write_text("keep", encoding="utf-8")
+    config_path = profile_path(store, legacy_seed) / "config.yaml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8") + "custom: retained\n",
+        encoding="utf-8",
+    )
+
+    receipt = store.materialize(make_seed())
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    assert marker.read_text(encoding="utf-8") == "keep"
+    profile = profile_path(store, legacy_seed)
+    manifest = json.loads((profile / MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert manifest["seed_fingerprint"] == make_seed().fingerprint
+    assert manifest["memory_mode"] == "narrow_tools"
+    assert manifest["memory_tools"] == list(DEFAULT_MEMORY_TOOL_ALLOWLIST)
+    config = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert config["memory"]["mode"] == "narrow_tools"
+    assert config["custom"] == "retained"
+
+
+def test_compression_threshold_is_provisioned_with_default(tmp_path):
+    store, seed = make_store(tmp_path), make_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    config = yaml.safe_load(
+        (profile_path(store, seed) / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert config["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+    assert profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS == 100_000
+
+
+def test_seed_fingerprint_matches_backend_mirror():
+    seed = ProfileSeed(
+        foundry_profile_id="00000000-0000-0000-0000-000000000001",
+        ally_name="ally-a",
+        personality="p",
+        provider="openai",
+        model="gpt-test",
+        first_chat_instruction="i",
+        credential_refs={"PROVIDER_API": "vault://p"},
+        hermes_profile_key="ally-v1-00000000000000000000000000000001",
+        identity={"ally_name": "ally-a"},
+    )
+    # Pinned against the backend mirror (services.profiles): both sides must
+    # hash the identical canonical payload, compression block included.
+    assert seed.fingerprint == (
+        "dc579a4739785ecdd41a3bc82ca11ed55eae79e178cd3206f47d37f4e624945d"
+    )
+
+
+def test_legacy_compression_default_is_upgraded_without_replacing_profile_state(
+    tmp_path,
+):
+    store, seed = make_store(tmp_path), make_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = seed.legacy_compression_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del config["compression"]
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    marker = profile_path(store, seed) / "sessions" / "preserved"
+    marker.write_text("keep", encoding="utf-8")
+
+    receipt = store.materialize(seed)
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    assert marker.read_text(encoding="utf-8") == "keep"
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == seed.fingerprint
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+
+
+def test_replace_legacy_compression_config_edge_cases():
+    seed = make_seed()
+    upgraded = _replace_legacy_compression_config(b"model: {}\n", seed)
+    assert yaml.safe_load(upgraded)["compression"] == {"threshold_tokens": 100_000}
+    already = (
+        b"model: {}\n"
+        b"compression:\n"
+        b"  threshold_tokens: 100000\n"
+    )
+    assert yaml.safe_load(_replace_legacy_compression_config(already, seed))[
+        "compression"
+    ] == {"threshold_tokens": 100_000}
+    with pytest.raises(ValueError):
+        _replace_legacy_compression_config(b"compression:\n  threshold_tokens: 1\n", seed)
+
+
+def _openrouter_seed(**overrides):
+    return replace(
+        make_seed(),
+        provider="openai-api",
+        model="openai/gpt-6-luna",
+        base_url="https://openrouter.ai/api/v1",
+        **overrides,
+    )
+
+
+def test_legacy_model_default_is_upgraded_without_replacing_profile_state(tmp_path):
+    store, seed = make_store(tmp_path), _openrouter_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = seed.legacy_model_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["model"] = {
+        "provider": "openai-api",
+        "default": "gpt-5.6-luna",
+        "base_url": "https://api.openai.com/v1",
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    marker = profile_path(store, seed) / "sessions" / "preserved"
+    marker.write_text("keep", encoding="utf-8")
+
+    receipt = store.materialize(seed)
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    assert marker.read_text(encoding="utf-8") == "keep"
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == seed.fingerprint
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["model"] == {
+        "provider": "openai-api",
+        "default": "openai/gpt-6-luna",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+
+
+def test_memory_era_volume_upgrades_compression_and_model_together(tmp_path):
+    store, seed = make_store(tmp_path), _openrouter_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = seed.legacy_compression_model_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del config["compression"]
+    config["model"] = {
+        "provider": "openai-api",
+        "default": "gpt-5.6-luna",
+        "base_url": "https://api.openai.com/v1",
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    marker = profile_path(store, seed) / "sessions" / "preserved"
+    marker.write_text("keep", encoding="utf-8")
+
+    receipt = store.materialize(seed)
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    assert marker.read_text(encoding="utf-8") == "keep"
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == seed.fingerprint
+    final = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert final["model"]["default"] == "openai/gpt-6-luna"
+    assert final["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+
+
+def test_legacy_memory_and_model_defaults_upgrade_together(tmp_path):
+    store = make_store(tmp_path)
+    legacy_seed = replace(
+        make_seed(),
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
+    assert store.materialize(legacy_seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, legacy_seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = _openrouter_seed().legacy_memory_model_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, legacy_seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del config["compression"]
+    config["model"] = {
+        "provider": "openai-api",
+        "default": "gpt-5.6-luna",
+        "base_url": "https://api.openai.com/v1",
+    }
+    config["memory"] = {
+        "provider": "allies_mnemosyne",
+        "mode": "context_only",
+        "policy_version": "allies-mnemosyne-v1",
+        "tools": [],
+        "profile_isolation": True,
+        "sync_roles": [],
+        "mnemosyne": {
+            "profile_isolation": True,
+            "shared_surface_read": False,
+            "storage": "mnemosyne",
+        },
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    receipt = store.materialize(_openrouter_seed())
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == _openrouter_seed().fingerprint
+    final = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert final["memory"]["mode"] == "narrow_tools"
+    assert final["model"]["default"] == "openai/gpt-6-luna"
+    assert final["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+
+
+def test_replace_legacy_model_config_edge_cases():
+    seed = _openrouter_seed()
+    legacy = (
+        b"model:\n"
+        b"  provider: openai-api\n"
+        b"  default: gpt-5.6-luna\n"
+        b"  base_url: https://api.openai.com/v1\n"
+    )
+    upgraded = _replace_legacy_model_config(legacy, seed)
+    assert yaml.safe_load(upgraded)["model"] == {
+        "provider": "openai-api",
+        "default": "openai/gpt-6-luna",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    already = (
+        b"model:\n"
+        b"  provider: openai-api\n"
+        b"  default: openai/gpt-6-luna\n"
+        b"  base_url: https://openrouter.ai/api/v1\n"
+    )
+    assert yaml.safe_load(_replace_legacy_model_config(already, seed))[
+        "model"
+    ]["default"] == "openai/gpt-6-luna"
+    with pytest.raises(ValueError):
+        _replace_legacy_model_config(
+            b"model:\n  provider: custom\n  default: custom-model\n", seed
+        )
+
+
+def test_legacy_memory_upgrade_also_adds_compression_section(tmp_path):
+    store = make_store(tmp_path)
+    legacy_seed = replace(
+        make_seed(),
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
+    assert store.materialize(legacy_seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, legacy_seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = legacy_seed.legacy_memory_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, legacy_seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del config["compression"]
+    config["memory"] = {
+        "provider": "allies_mnemosyne",
+        "mode": "context_only",
+        "policy_version": "allies-mnemosyne-v1",
+        "tools": [],
+        "profile_isolation": True,
+        "sync_roles": [],
+        "mnemosyne": {
+            "profile_isolation": True,
+            "shared_surface_read": False,
+            "storage": "mnemosyne",
+        },
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    receipt = store.materialize(make_seed())
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == make_seed().fingerprint
+    final = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert final["memory"]["mode"] == "narrow_tools"
+    assert final["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+
+
+def test_legacy_memory_upgrade_retries_after_manifest_write_failure(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    legacy_seed = replace(
+        make_seed(),
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
+    assert store.materialize(legacy_seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, legacy_seed) / MANIFEST_NAME
+    original_write = store._write_json_atomic
+    failed = False
+
+    def fail_once(path, value, *, mode):
+        nonlocal failed
+        if path == manifest_path and not failed:
+            failed = True
+            raise ProfileStoreError("write failed")
+        return original_write(path, value, mode=mode)
+
+    monkeypatch.setattr(store, "_write_json_atomic", fail_once)
+    assert store.materialize(make_seed()).status is ProfileProvisionStatus.REPAIR_REQUIRED
+    assert store.materialize(make_seed()).status is ProfileProvisionStatus.EXISTING
+
+
+def test_legacy_memory_upgrade_preserves_concurrent_config_edit(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    legacy_seed = replace(
+        make_seed(),
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
+    assert store.materialize(legacy_seed).status is ProfileProvisionStatus.CREATED
+    path = profile_path(store, legacy_seed) / "config.yaml"
+    parse_config = profile_store_module._config_with_catalog
+
+    def edit_while_parsing(content):
+        path.write_text("model: user-edit\n", encoding="utf-8")
+        return parse_config(content)
+
+    monkeypatch.setattr(
+        profile_store_module, "_config_with_catalog", edit_while_parsing
+    )
+
+    result = store.materialize(make_seed())
+
+    assert result.status is ProfileProvisionStatus.REPAIR_REQUIRED
+    assert result.repair_code == "skills_config_requires_repair"
+    assert path.read_text(encoding="utf-8") == "model: user-edit\n"
 
 
 def test_legacy_manifest_with_an_unverified_fingerprint_requires_repair(tmp_path):
@@ -1048,6 +1538,109 @@ def test_profile_store_rejects_namespace_files(tmp_path, namespace):
     assert receipt.repair_code == "profile_store_unavailable"
 
 
+def test_tombstone_namespace_allows_hermes_read_without_write():
+    if os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        pytest.skip("requires POSIX root to exercise the Hermes UID")
+
+    volume = Path(tempfile.mkdtemp(prefix="allies-profile-mode-"))
+    try:
+        os.chmod(volume, 0o755)
+        profiles = volume / "profiles"
+        profiles.mkdir(mode=0o755)
+        tombstones = profiles / ".allies-profile-tombstones"
+        tombstones.mkdir(mode=0o700)
+        store = ProfileStore(
+            volume,
+            api_key_factory=lambda: "profile-local-key-0123456789",
+            credential_resolver={"vault://tenant/openai": PROFILE_SECRET},
+        )
+        seed = make_seed()
+        receipt = store.fence_deletion(
+            seed.profile_key,
+            "cleanup-hermes-mode",
+            seed.lifecycle_epoch,
+            time.time() + 30,
+            attempt_id=uuid.uuid4(),
+            request_digest="a" * 64,
+        )
+        assert receipt.status is ProfileCleanupStatus.FENCED
+        assert stat.S_IMODE(tombstones.stat().st_mode) == 0o755
+
+        marker = tombstones / f"{seed.profile_key}.json"
+        assert stat.S_IMODE(marker.stat().st_mode) == 0o644
+        other_key = derive_profile_key(OTHER_PROFILE_ID)
+        script = """
+import sys
+import types
+from pathlib import Path
+
+profiles_root = Path(sys.argv[1])
+marker_path = Path(sys.argv[2])
+profile_key = sys.argv[3]
+other_key = sys.argv[4]
+hermes_cli = types.ModuleType("hermes_cli")
+profiles = types.ModuleType("hermes_cli.profiles")
+profiles._get_profiles_root = lambda: profiles_root
+hermes_cli.profiles = profiles
+sys.modules["hermes_cli"] = hermes_cli
+sys.modules["hermes_cli.profiles"] = profiles
+
+from allies_profile_deletion import ProfileDeletionManager
+
+manager = ProfileDeletionManager(object())
+fence = manager.marker(profile_key)
+if not isinstance(fence, dict) or fence.get("profile_key") != profile_key:
+    raise SystemExit("Hermes could not read the tombstone")
+if manager.marker(other_key) is not None:
+    raise SystemExit("Hermes misread an absent tombstone")
+try:
+    marker_path.write_text(
+        marker_path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+except PermissionError:
+    pass
+else:
+    raise SystemExit("Hermes could write the tombstone")
+try:
+    marker_path.unlink()
+except PermissionError:
+    pass
+else:
+    raise SystemExit("Hermes could delete the tombstone")
+try:
+    marker_path.with_name(f"{other_key}.json").write_text("{}", encoding="utf-8")
+except PermissionError:
+    pass
+else:
+    raise SystemExit("Hermes could create a tombstone")
+"""
+        hermes_image = Path(__file__).parents[1] / "hermes-image"
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            part
+            for part in (str(hermes_image), environment.get("PYTHONPATH", ""))
+            if part
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(profiles),
+                str(marker),
+                seed.profile_key,
+                other_key,
+            ],
+            check=True,
+            capture_output=True,
+            env=environment,
+            group=10000,
+            user=10000,
+        )
+    finally:
+        shutil.rmtree(volume, ignore_errors=True)
+
+
 @pytest.mark.parametrize("symlinked_component", [False, True])
 def test_profile_store_rejects_symlinked_volume_root_and_components(
     tmp_path, symlinked_component
@@ -1472,3 +2065,115 @@ def test_opencode_tenant_ref_is_shared_across_profiles_without_leaking(tmp_path)
     assert store.read_api_key(first.hermes_profile_key or "") == (
         "profile-local-key-0123456789"
     )
+
+
+def test_apply_binding_rewrites_live_keys_with_generation_fence(tmp_path):
+    store = ProfileStore(
+        tmp_path / "volume",
+        api_key_factory=lambda: "profile-local-key-0123456789",
+        credential_resolver={
+            "vault://tenant/openai": PROFILE_SECRET,
+            "vault://tenant/zen": "zen-secret",
+        },
+    )
+    seed = make_seed()
+    store.materialize(seed)
+    key = seed.hermes_profile_key or ""
+    profile = profile_path(store, seed)
+
+    applied = store.apply_binding(
+        key,
+        generation=1,
+        key_refs={"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    )
+    assert applied.status is BindingApplyStatus.APPLIED
+    env_text = (profile / ".env").read_text(encoding="utf-8")
+    assert "API_SERVER_KEY=profile-local-key-0123456789\n" in env_text
+    assert "OPENCODE_ZEN_API_KEY=zen-secret\n" in env_text
+    assert "OPENAI_API_KEY" not in env_text
+    assert "zen-secret" not in json.dumps(applied.to_dict())
+    if os.name != "nt":
+        assert (profile / ".env").stat().st_mode & 0o777 == 0o600
+
+    replay = store.apply_binding(
+        key,
+        generation=1,
+        key_refs={"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"},
+    )
+    assert replay.status is BindingApplyStatus.CURRENT
+
+    assert store.read_api_key(key) == "profile-local-key-0123456789"
+
+
+def test_apply_binding_fails_closed_without_touching_live_files(tmp_path):
+    store = make_store(tmp_path)
+    seed = make_seed()
+    store.materialize(seed)
+    key = seed.hermes_profile_key or ""
+    profile = profile_path(store, seed)
+    before = (profile / ".env").read_bytes()
+
+    missing = store.apply_binding(
+        key, generation=1, key_refs={"MISSING": "vault://tenant/absent"}
+    )
+    assert missing.status is BindingApplyStatus.REPAIR_REQUIRED
+    assert (profile / ".env").read_bytes() == before
+
+    unknown = store.apply_binding("ally-v1-" + "0" * 32, generation=1, key_refs={})
+    assert unknown.status is BindingApplyStatus.REPAIR_REQUIRED
+
+    with pytest.raises(ProfileInputError):
+        store.apply_binding(key, generation=0, key_refs={})
+    with pytest.raises(ProfileInputError):
+        store.apply_binding("bad/key", generation=1, key_refs={})
+    with pytest.raises(ProfileInputError):
+        store.apply_binding(key, generation=1, key_refs=["not-a-mapping"])
+    invalid_name = store.apply_binding(
+        key, generation=2, key_refs={"bad-name!": "vault://tenant/zen"}
+    )
+    assert invalid_name.status is BindingApplyStatus.REPAIR_REQUIRED
+    assert (profile / ".env").read_bytes() == before
+
+    (profile / ".allies-binding.json").write_text('{"generation": "x"}')
+    corrupt = store.apply_binding(
+        key, generation=3, key_refs={"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"}
+    )
+    assert corrupt.status is BindingApplyStatus.REPAIR_REQUIRED
+    assert (profile / ".env").read_bytes() == before
+
+    (profile / ".allies-binding.json").unlink()
+    (profile / ".allies-profile.json").unlink()
+    incomplete = store.apply_binding(
+        key, generation=3, key_refs={"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"}
+    )
+    assert incomplete.status is BindingApplyStatus.REPAIR_REQUIRED
+
+
+def test_existing_profile_picks_up_a_rotated_provider_key(tmp_path):
+    secrets = {"vault://tenant/openai": PROFILE_SECRET}
+    store, seed = make_store(tmp_path, resolver=secrets), make_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    env = profile_path(store, seed) / ".env"
+    secrets["vault://tenant/openai"] = "sk-or-rotated-provider-key"
+
+    assert store.materialize(seed).status is ProfileProvisionStatus.EXISTING
+
+    lines = env.read_text(encoding="utf-8").splitlines()
+    assert "OPENAI_API_KEY=sk-or-rotated-provider-key" in lines
+    assert lines[0] == "API_SERVER_KEY=profile-local-key-0123456789"
+    assert env.stat().st_mode & 0o777 == 0o600 or os.name == "nt"
+
+
+def test_bound_profile_env_is_left_to_the_binding(tmp_path):
+    secrets = {"vault://tenant/openai": PROFILE_SECRET}
+    store, seed = make_store(tmp_path, resolver=secrets), make_seed()
+    store.materialize(seed)
+    profile = profile_path(store, seed)
+    (profile / profile_store_module.BINDING_SIDECAR_NAME).write_text(
+        '{"generation": 1}', encoding="utf-8"
+    )
+    before = (profile / ".env").read_bytes()
+    secrets["vault://tenant/openai"] = "sk-or-rotated-provider-key"
+
+    assert store.materialize(seed).status is ProfileProvisionStatus.EXISTING
+    assert (profile / ".env").read_bytes() == before

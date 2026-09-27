@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 from django.db import transaction
-from django.test import override_settings
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from runtime.exceptions import (
@@ -16,6 +16,8 @@ from runtime.exceptions import (
 from runtime.models import (
     Execution,
     ExecutionStatus,
+    ReadyWorkspaceBundle,
+    ReadyWorkspaceBundleState,
     RuntimeIntentOutcome,
     RuntimeOperationState,
     RuntimeOperationTrigger,
@@ -32,6 +34,7 @@ from runtime.providers import (
     ProviderOwnershipError,
     ProviderTimeoutError,
 )
+from runtime.services import runtime_intents as runtime_intent_service
 from runtime.services import runtime_power
 from runtime.services.claims import claim_next_execution
 from runtime.services.executions import create_execution
@@ -42,6 +45,7 @@ from runtime.services.runtime_auth import (
 from runtime.services.runtime_intents import (
     request_activation_recovery_wake,
     request_execution_wake_locked,
+    request_onboarding_wake_locked,
     request_runtime_intent,
 )
 from runtime.services.runtime_power import (
@@ -127,6 +131,22 @@ def workspace(db):
     )
 
 
+def create_assigned_sleeping_bundle(workspace, now):
+    return ReadyWorkspaceBundle.objects.create(
+        workspace=workspace,
+        state=ReadyWorkspaceBundleState.ASSIGNED,
+        region="ams",
+        release_fingerprint="release",
+        blank_volume_ref=workspace.volume_ref,
+        config_version=1,
+        next_attempt_at=now,
+        ready_at=now,
+        expires_at=now + timedelta(minutes=15),
+        last_health_at=now,
+        assigned_at=now,
+    )
+
+
 def test_intent_is_durable_and_wakes_only_the_recorded_machine(workspace):
     now = timezone.now()
     provider = FakePowerProvider(workspace)
@@ -150,6 +170,320 @@ def test_intent_is_durable_and_wakes_only_the_recorded_machine(workspace):
     assert workspace.runtime_start_epoch == 1
 
 
+def test_onboarding_wake_retries_without_execution_or_runtime_intent_and_exhausts(
+    workspace,
+):
+    now = timezone.now()
+    bundle = create_assigned_sleeping_bundle(workspace, now)
+    with transaction.atomic():
+        locked = Workspace.objects.select_for_update().get(pk=workspace.id)
+        request_onboarding_wake_locked(locked, now=now)
+
+    provider = FakePowerProvider(workspace)
+    provider.start_error = ProviderCapacityError("temporary provider capacity")
+    expected_delays = (5, 10, 20, 40)
+    observed_at = now
+    for retry_count, delay in enumerate(expected_delays, start=1):
+        report = process_runtime_wakes(provider=provider, now=observed_at)
+        workspace.refresh_from_db()
+        bundle.refresh_from_db()
+        assert report.failed == 1
+        assert workspace.runtime_operation_state == RuntimeOperationState.REQUESTED
+        assert workspace.runtime_operation_trigger == RuntimeOperationTrigger.ONBOARDING
+        assert workspace.runtime_operation_retry_count == retry_count
+        assert workspace.runtime_operation_requested_at == observed_at + timedelta(
+            seconds=delay
+        )
+        assert bundle.state == ReadyWorkspaceBundleState.ASSIGNED
+        assert bundle.safe_error_code == "onboarding_wake_failed"
+        observed_at = workspace.runtime_operation_requested_at
+
+    final = process_runtime_wakes(provider=provider, now=observed_at)
+    workspace.refresh_from_db()
+    bundle.refresh_from_db()
+    assert final.failed == 1
+    assert workspace.runtime_operation_state == RuntimeOperationState.IDLE
+    assert workspace.runtime_operation_retry_count == 4
+    assert bundle.state == ReadyWorkspaceBundleState.ASSIGNED
+    assert bundle.safe_error_code == "onboarding_wake_exhausted"
+
+    with transaction.atomic():
+        locked = Workspace.objects.select_for_update().get(pk=workspace.id)
+        request_onboarding_wake_locked(locked, now=observed_at + timedelta(minutes=1))
+    workspace.refresh_from_db()
+    assert workspace.runtime_operation_state == RuntimeOperationState.IDLE
+    assert workspace.runtime_operation_retry_count == 4
+    assert provider.start_calls == 5
+
+
+@override_settings(
+    ALLIES_RUNTIME_IDLE_STOP_ENABLED=True,
+    ALLIES_RUNTIME_KEEP_WARM_SECONDS=1800,
+)
+def test_onboarding_retry_then_current_readiness_clears_error(workspace):
+    now = timezone.now()
+    bundle = create_assigned_sleeping_bundle(workspace, now)
+    with transaction.atomic():
+        locked = Workspace.objects.select_for_update().get(pk=workspace.id)
+        request_onboarding_wake_locked(locked, now=now)
+
+    workspace.refresh_from_db()
+    keep_warm_until = workspace.speculative_keep_warm_until
+    assert keep_warm_until == now + timedelta(seconds=1800)
+
+    provider = FakePowerProvider(workspace)
+    provider.start_error = ProviderCapacityError("temporary provider capacity")
+    first = process_runtime_wakes(provider=provider, now=now)
+    workspace.refresh_from_db()
+    bundle.refresh_from_db()
+    assert first.failed == 1
+    assert bundle.safe_error_code == "onboarding_wake_failed"
+    assert workspace.speculative_keep_warm_until == keep_warm_until
+
+    provider.start_error = None
+    retry_at = workspace.runtime_operation_requested_at
+    assert retry_at is not None
+    second = process_runtime_wakes(provider=provider, now=retry_at)
+    workspace.refresh_from_db()
+    assert second.started == 1
+    assert workspace.runtime_operation_state == RuntimeOperationState.AWAITING_READINESS
+
+    issued = issue_runtime_credential(workspace.id, "onboarding-retry-secret")
+    context = authenticate_runtime_token(issued.raw_token)
+    accept_runtime_readiness(
+        context,
+        uuid4(),
+        workspace.machine_generation,
+        workspace.runtime_start_epoch,
+        now=retry_at,
+    )
+
+    bundle.refresh_from_db()
+    assert bundle.safe_error_code is None
+    workspace.refresh_from_db()
+    assert workspace.runtime_operation_state == RuntimeOperationState.IDLE
+    assert workspace.speculative_keep_warm_until == keep_warm_until
+
+    before_expiry = stop_idle_workspaces(
+        provider=provider,
+        now=keep_warm_until - timedelta(seconds=1),
+    )
+    assert before_expiry.stopped == 0
+    assert provider.stop_calls == 0
+
+    at_expiry = stop_idle_workspaces(provider=provider, now=keep_warm_until)
+    assert at_expiry.stopped == 1
+    assert provider.stop_calls == 1
+
+
+def test_onboarding_wake_rejects_receipt_from_before_current_start_epoch(workspace):
+    now = timezone.now()
+    create_assigned_sleeping_bundle(workspace, now)
+    with transaction.atomic():
+        locked = Workspace.objects.select_for_update().get(pk=workspace.id)
+        request_onboarding_wake_locked(locked, now=now)
+
+    old_epoch = workspace.runtime_start_epoch
+    provider = FakePowerProvider(workspace)
+    report = process_runtime_wakes(provider=provider, now=now)
+
+    assert report.started == 1
+    workspace.refresh_from_db()
+    assert workspace.runtime_operation_state == RuntimeOperationState.AWAITING_READINESS
+    assert workspace.runtime_start_epoch == old_epoch + 1
+    issued = issue_runtime_credential(workspace.id, "onboarding-secret")
+    context = authenticate_runtime_token(issued.raw_token)
+    with pytest.raises(RuntimeFencedError):
+        accept_runtime_readiness(
+            context,
+            uuid4(),
+            workspace.machine_generation,
+            old_epoch,
+            now=now,
+        )
+
+
+def test_explicit_activation_recovery_restarts_exhausted_onboarding(workspace):
+    now = timezone.now()
+    bundle = create_assigned_sleeping_bundle(workspace, now)
+    bundle.safe_error_code = "onboarding_wake_exhausted"
+    bundle.save(update_fields=["safe_error_code", "updated_at"])
+    workspace.activation_claim_token = "activation-claim"
+    workspace.activation_claim_expires_at = now + timedelta(minutes=5)
+    workspace.save(
+        update_fields=[
+            "activation_claim_token",
+            "activation_claim_expires_at",
+            "updated_at",
+        ]
+    )
+    provider = FakePowerProvider(workspace)
+    observation = _activation_observation(workspace, provider)
+
+    operation_id = request_activation_recovery_wake(
+        workspace.id,
+        "activation-claim",
+        **observation,
+        now=now,
+    )
+    replayed_operation_id = request_activation_recovery_wake(
+        workspace.id,
+        "activation-claim",
+        **observation,
+        now=now + timedelta(seconds=1),
+    )
+
+    workspace.refresh_from_db()
+    bundle.refresh_from_db()
+    assert operation_id is not None
+    assert replayed_operation_id == operation_id
+    assert workspace.runtime_operation_state == RuntimeOperationState.REQUESTED
+    assert workspace.runtime_operation_trigger == RuntimeOperationTrigger.ONBOARDING
+    assert workspace.runtime_operation_retry_count == 0
+    assert bundle.state == ReadyWorkspaceBundleState.ASSIGNED
+    assert bundle.safe_error_code is None
+
+
+def test_queued_execution_supersedes_onboarding_wake(workspace):
+    now = timezone.now()
+    bundle = create_assigned_sleeping_bundle(workspace, now)
+    bundle.safe_error_code = "onboarding_wake_failed"
+    bundle.save(update_fields=["safe_error_code", "updated_at"])
+    with transaction.atomic():
+        locked = Workspace.objects.select_for_update().get(pk=workspace.id)
+        request_onboarding_wake_locked(locked, now=now)
+    profile = RuntimeProfile.objects.create(
+        workspace=workspace,
+        ally_ref="onboarding-execution-ally",
+        hermes_profile_key="onboarding-execution-ally",
+        lifecycle_state=RuntimeProfileLifecycleState.ACTIVE,
+        materialized_generation=workspace.machine_generation,
+    )
+
+    execution = create_execution(
+        workspace.id,
+        profile.id,
+        "onboarding-execution",
+        {"message": "hello", "cloud_conversation_ref": "onboarding-cloud"},
+    )
+
+    workspace.refresh_from_db()
+    assert execution.status == ExecutionStatus.QUEUED
+    assert workspace.runtime_operation_state == RuntimeOperationState.REQUESTED
+    assert workspace.runtime_operation_trigger == RuntimeOperationTrigger.EXECUTION
+
+    provider = FakePowerProvider(workspace)
+    wake_at = timezone.now() + timedelta(seconds=1)
+    report = process_runtime_wakes(provider=provider, now=wake_at)
+    assert report.started == 1
+    workspace.refresh_from_db()
+    issued = issue_runtime_credential(workspace.id, "superseded-onboarding-secret")
+    context = authenticate_runtime_token(issued.raw_token)
+    accept_runtime_readiness(
+        context,
+        uuid4(),
+        workspace.machine_generation,
+        workspace.runtime_start_epoch,
+        now=wake_at,
+    )
+
+    bundle.refresh_from_db()
+    assert bundle.safe_error_code is None
+
+
+@override_settings(ALLIES_RUNTIME_IDLE_STOP_ENABLED=True)
+def test_idle_maintenance_excludes_unassigned_pool_workspace(workspace):
+    now = timezone.now()
+    Workspace.objects.filter(pk=workspace.pk).update(
+        tenant_ref=f"pool:{uuid4()}",
+        speculative_keep_warm_until=now - timedelta(seconds=1),
+    )
+    workspace.refresh_from_db()
+    provider = FakePowerProvider(workspace)
+
+    report = stop_idle_workspaces(provider=provider, now=now)
+
+    assert report.examined == 0
+    assert provider.stop_calls == 0
+
+
+def test_runtime_intent_timing_bridges_idempotency_to_wake_operation(
+    workspace, monkeypatch
+):
+    captured = []
+    monkeypatch.setattr(
+        runtime_intent_service,
+        "emit_event",
+        lambda event, **_kwargs: captured.append(event),
+    )
+    now = timezone.now()
+    key = uuid4()
+
+    with TestCase.captureOnCommitCallbacks(execute=True):
+        receipt = request_runtime_intent(
+            workspace.id,
+            "composing_started",
+            key,
+            now,
+            now=now,
+        )
+
+    started = [
+        event
+        for event in captured
+        if event["event"] == "runtime.operation.started"
+        and event["operation"] == "runtime.intent"
+    ][-1]
+    terminal = [
+        event for event in captured if event["event"] == "runtime.operation.succeeded"
+    ][-1]
+    assert started["request_id"] == str(key)
+    assert terminal["operation"] == "runtime.intent"
+    assert terminal["request_id"] == str(key)
+    assert terminal["correlation_id"] == str(receipt.operation_id)
+
+
+def test_wake_timing_distinguishes_provider_ack_from_attempt_end(
+    workspace, monkeypatch
+):
+    captured = []
+    monkeypatch.setattr(
+        runtime_power,
+        "emit_event",
+        lambda event, **_kwargs: captured.append(event),
+    )
+    now = timezone.now()
+    request_runtime_intent(
+        workspace.id,
+        "composing_started",
+        uuid4(),
+        now,
+        now=now,
+    )
+    captured.clear()
+
+    report = process_runtime_wakes(
+        provider=FakePowerProvider(workspace),
+        now=now,
+    )
+
+    assert report.awaiting_readiness == 1
+    operations = {event.get("operation") for event in captured}
+    assert "runtime.wake.queue_wait_wall" in operations
+    assert "runtime.wake.machine_state_observation" in operations
+    assert "runtime.wake.machine_start_request" in operations
+    assert "runtime.wake.request_to_attempt_end_wall" in operations
+    assert "runtime.wake.request_to_commit_wall" not in operations
+    terminal = [
+        event
+        for event in captured
+        if event["operation"] == "runtime.wake"
+        and event["event"] == "runtime.operation.succeeded"
+    ][-1]
+    assert terminal["reason_code"] == "provider_start_acknowledged"
+    assert terminal["runtime_start_epoch"] == 1
+
+
 def test_workspace_limit_applies_while_intents_coalesce(workspace):
     now = timezone.now()
 
@@ -164,7 +498,9 @@ def test_workspace_limit_applies_while_intents_coalesce(workspace):
         for _ in range(31)
     ]
 
-    assert all(receipt.status == RuntimeIntentOutcome.WAKING for receipt in receipts[:30])
+    assert all(
+        receipt.status == RuntimeIntentOutcome.WAKING for receipt in receipts[:30]
+    )
     assert receipts[30].status == RuntimeIntentOutcome.RATE_LIMITED
     assert len({receipt.operation_id for receipt in receipts[:30]}) == 1
 
@@ -522,9 +858,7 @@ def test_execution_wake_retries_transitional_machine_state(workspace, state):
 
 
 @pytest.mark.parametrize("state", [MachineState.CREATED, MachineState.UNKNOWN])
-def test_expired_execution_wake_retries_transitional_machine_state(
-    workspace, state
-):
+def test_expired_execution_wake_retries_transitional_machine_state(workspace, state):
     profile = RuntimeProfile.objects.create(
         workspace=workspace,
         ally_ref=f"recovered-{state}",
@@ -572,7 +906,11 @@ def test_expired_execution_wake_retries_transitional_machine_state(
             MachineState.STARTED,
             RuntimeOperationState.AWAITING_READINESS,
         ),
-        (RuntimeOperationState.STOPPING, MachineState.STARTED, RuntimeOperationState.IDLE),
+        (
+            RuntimeOperationState.STOPPING,
+            MachineState.STARTED,
+            RuntimeOperationState.IDLE,
+        ),
     ],
 )
 def test_publisher_recovers_expired_power_claim(
@@ -654,9 +992,12 @@ def test_expired_speculative_operation_does_not_start_machine(workspace):
     assert provider.start_calls == 0
     workspace.refresh_from_db()
     assert workspace.runtime_operation_state == RuntimeOperationState.IDLE
-    assert workspace.runtime_intents.get(
-        coalesced_operation_id=receipt.operation_id
-    ).outcome == RuntimeIntentOutcome.FAILED
+    assert (
+        workspace.runtime_intents.get(
+            coalesced_operation_id=receipt.operation_id
+        ).outcome
+        == RuntimeIntentOutcome.FAILED
+    )
 
 
 @pytest.mark.parametrize("missing", ["volume", "ownership"])
@@ -704,7 +1045,7 @@ def test_wake_rejects_machine_from_another_provisioning_operation(workspace):
     assert provider.start_calls == 0
 
 
-def test_retryable_execution_wake_uses_durable_backoff(workspace):
+def test_retryable_execution_wake_uses_durable_backoff(workspace, monkeypatch):
     profile = RuntimeProfile.objects.create(
         workspace=workspace,
         ally_ref="retry-ally",
@@ -721,18 +1062,39 @@ def test_retryable_execution_wake_uses_durable_backoff(workspace):
     provider = FakePowerProvider(workspace)
     provider.start_error = ProviderCapacityError("temporary provider capacity")
     now = timezone.now()
+    captured = []
+    monkeypatch.setattr(
+        runtime_power,
+        "emit_event",
+        lambda event, **_kwargs: captured.append(event),
+    )
+    workspace.refresh_from_db()
+    previous_operation_id = workspace.runtime_operation_id
 
-    first = process_runtime_wakes(provider=provider, now=now)
+    with TestCase.captureOnCommitCallbacks(execute=True):
+        first = process_runtime_wakes(provider=provider, now=now)
     workspace.refresh_from_db()
     assert first.failed == 1
     assert workspace.runtime_operation_state == RuntimeOperationState.REQUESTED
     assert workspace.runtime_operation_trigger == RuntimeOperationTrigger.EXECUTION
+    retry_event = next(
+        event
+        for event in captured
+        if event.get("operation") == "runtime.wake.retry_scheduled"
+    )
+    assert retry_event["event"] == "runtime.operation.retried"
+    assert retry_event["request_id"] == str(previous_operation_id)
+    assert retry_event["correlation_id"] == str(workspace.runtime_operation_id)
+    assert retry_event["retry_count"] == 1
 
     provider.start_error = None
-    assert process_runtime_wakes(
-        provider=provider,
-        now=now + timedelta(seconds=4),
-    ).examined == 0
+    assert (
+        process_runtime_wakes(
+            provider=provider,
+            now=now + timedelta(seconds=4),
+        ).examined
+        == 0
+    )
     second = process_runtime_wakes(
         provider=provider,
         now=now + timedelta(seconds=5),
@@ -766,10 +1128,13 @@ def test_terminal_execution_wake_failure_is_parked(workspace):
     assert workspace.runtime_operation_state == RuntimeOperationState.IDLE
     assert workspace.runtime_operation_id is None
     assert execution.status == ExecutionStatus.QUEUED
-    assert process_runtime_wakes(
-        provider=provider,
-        now=now + timedelta(minutes=1),
-    ).examined == 0
+    assert (
+        process_runtime_wakes(
+            provider=provider,
+            now=now + timedelta(minutes=1),
+        ).examined
+        == 0
+    )
 
 
 def test_retryable_execution_wake_stops_after_bounded_backoff(workspace):
@@ -810,7 +1175,7 @@ def test_retryable_execution_wake_stops_after_bounded_backoff(workspace):
 
 
 @override_settings(ALLIES_RUNTIME_READINESS_TIMEOUT_SECONDS=10)
-def test_execution_readiness_timeout_remains_durably_retryable(workspace):
+def test_execution_readiness_timeout_remains_durably_retryable(workspace, monkeypatch):
     profile = RuntimeProfile.objects.create(
         workspace=workspace,
         ally_ref="timeout-ally",
@@ -826,6 +1191,7 @@ def test_execution_readiness_timeout_remains_durably_retryable(workspace):
         {"message": "hello", "cloud_conversation_ref": "timeout-cloud"},
     )
     workspace.refresh_from_db()
+    previous_operation_id = workspace.runtime_operation_id
     workspace.runtime_operation_state = RuntimeOperationState.AWAITING_READINESS
     workspace.runtime_operation_requested_at = now - timedelta(seconds=10)
     workspace.save(
@@ -836,15 +1202,29 @@ def test_execution_readiness_timeout_remains_durably_retryable(workspace):
         ]
     )
 
-    timed_out = process_runtime_wakes(
-        provider=FakePowerProvider(workspace),
-        now=now,
+    captured = []
+    monkeypatch.setattr(
+        runtime_power,
+        "emit_event",
+        lambda event, **_kwargs: captured.append(event),
     )
+    with TestCase.captureOnCommitCallbacks(execute=True):
+        timed_out = process_runtime_wakes(
+            provider=FakePowerProvider(workspace),
+            now=now,
+        )
 
     workspace.refresh_from_db()
     assert timed_out.failed == 1
     assert workspace.runtime_operation_state == RuntimeOperationState.REQUESTED
     assert workspace.runtime_operation_requested_at == now + timedelta(seconds=5)
+    retry_event = next(
+        event
+        for event in captured
+        if event.get("operation") == "runtime.wake.retry_scheduled"
+    )
+    assert retry_event["request_id"] == str(previous_operation_id)
+    assert retry_event["correlation_id"] == str(workspace.runtime_operation_id)
 
 
 def test_prompt_upgrades_speculative_wake_and_refreshes_deadline(workspace):
@@ -901,9 +1281,9 @@ def test_execution_wake_consumes_bounded_slot_before_recovery(monkeypatch):
     monkeypatch.setattr(
         runtime_power,
         "_requested_workspace_ids",
-        lambda _now, _limit, *, trigger=None: [workspace_id]
-        if trigger == RuntimeOperationTrigger.EXECUTION
-        else [],
+        lambda _now, _limit, *, trigger=None: (
+            [workspace_id] if trigger == RuntimeOperationTrigger.EXECUTION else []
+        ),
     )
     monkeypatch.setattr(
         runtime_power,
@@ -913,8 +1293,9 @@ def test_execution_wake_consumes_bounded_slot_before_recovery(monkeypatch):
     monkeypatch.setattr(
         runtime_power,
         "_process_wake_claim",
-        lambda selected, _provider, _now: calls.append(selected)
-        or runtime_power.RuntimePowerReport(started=1),
+        lambda selected, _provider, _now: (
+            calls.append(selected) or runtime_power.RuntimePowerReport(started=1)
+        ),
     )
     monkeypatch.setattr(
         runtime_power,

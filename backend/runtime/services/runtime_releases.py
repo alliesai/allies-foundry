@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
 import os
 import re
+from collections.abc import Mapping
 from datetime import timedelta
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -32,12 +37,47 @@ from .continuity_proof import (
     ProofDependencyCredentialHandle,
     proof_workspace_spec,
 )
+from .release_targets import is_pending_release_target
 from .runtime_readiness import advance_runtime_start_epoch_locked
 from .workspaces import WorkspaceLifecycle, WorkspaceSpec
 
 # Covers bounded lifecycle retries and secret staging, without a second worker.
 RELEASE_CLAIM_SECONDS = 1200
+_RELEASE_IMAGE_KEYS = frozenset({"allies-runtime", "hermes"})
+_IMMUTABLE_IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$", re.IGNORECASE)
 logger = logging.getLogger(__name__)
+
+
+def runtime_release_digest(images: Mapping[str, str]) -> str | None:
+    """Return the stable identity of one exact two-container release."""
+
+    if set(images) != _RELEASE_IMAGE_KEYS or any(
+        not isinstance(image, str) or not _IMMUTABLE_IMAGE.fullmatch(image)
+        for image in images.values()
+    ):
+        return None
+    payload = json.dumps(
+        {"images": sorted((str(name), image) for name, image in images.items())},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def current_runtime_release_digest(workspace: Workspace) -> str | None:
+    """Derive the release identity from the provider-proven image pair."""
+
+    applied_images = workspace.applied_images
+    if not isinstance(applied_images, Mapping):
+        return None
+    target = workspace.release_target
+    if isinstance(target, Mapping) and "images" in target:
+        target_images = target.get("images")
+        if not isinstance(target_images, Mapping) or dict(target_images) != dict(
+            applied_images
+        ):
+            return None
+    return runtime_release_digest(applied_images)
 
 
 def resume_runtime_releases(provider, *, limit):
@@ -52,6 +92,7 @@ def resume_runtime_releases(provider, *, limit):
         .filter(
             Q(activation_claim_expires_at__isnull=True)
             | Q(activation_claim_expires_at__lte=timezone.now()),
+            release_target__has_key="attempts",
             release_target__attempts__lt=5,
         )
         .order_by("updated_at", "id")
@@ -95,7 +136,12 @@ def release_on_wake(workspace, machine, claim, provider) -> bool:
         == "false"
     ):
         return False
-    images = workspace.release_target.get("images") or desired_images()
+    target = (
+        workspace.release_target
+        if is_pending_release_target(workspace.release_target)
+        else {}
+    )
+    images = target.get("images") or desired_images()
     if not images or machine.state is not MachineState.STOPPED:
         return False
     if dict(machine.images) == images:
@@ -125,11 +171,16 @@ def reconcile_workspace_release(
     from .runtime_power import _inspect_machine, _verify_machine_binding
 
     workspace = Workspace.objects.get(pk=workspace_id)
-    images = workspace.release_target.get("images") or desired_images()
-    if not images and not workspace.release_target:
+    target = (
+        workspace.release_target
+        if is_pending_release_target(workspace.release_target)
+        else {}
+    )
+    images = target.get("images") or desired_images()
+    if not images and not target:
         raise ValueError("No desired runtime release is configured")
     machine = None
-    if not workspace.release_target:
+    if not target:
         machine = _inspect_machine(provider, workspace)
         _verify_machine_binding(workspace, machine)
         if dict(machine.images) == images:
@@ -144,6 +195,7 @@ def reconcile_workspace_release(
     target = workspace.release_target
     try:
         store = secret_store or FlyCliSecretStore()
+        _restage_provider_key(store, workspace.fly_app_ref)
         operation_id = UUID(target["credential_id"])
         generation = target["source_generation"] + 1
         credential = RuntimeCredential.objects.filter(pk=operation_id).first()
@@ -172,6 +224,11 @@ def reconcile_workspace_release(
                 raw_token="",
             )
         base = WorkspaceSpec(
+            cpu_kind=settings.WORKSPACE_CPU_KIND,
+            cpus=settings.WORKSPACE_CPUS,
+            memory_mb=settings.WORKSPACE_MEMORY_MB,
+            volume_size_gb=settings.WORKSPACE_VOLUME_SIZE_GB,
+            volume_size_limit_gb=settings.WORKSPACE_VOLUME_SIZE_LIMIT_GB,
             organization=target["organization"],
             region=target["region"],
             runtime_image=target["images"]["allies-runtime"],
@@ -186,6 +243,8 @@ def reconcile_workspace_release(
                 hermes_key_secret_name="ALLIES_FND008_HERMES_KEY",
                 provider_key_secret_name="ALLIES_FND008_OPENAI_KEY",
             ),
+            activity_wait_enabled=settings.ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED,
+            rich_approvals_enabled=settings.ALLIES_RICH_APPROVALS_ENABLED,
         )
         WorkspaceLifecycle(provider, jitter=False).replace_machine(
             workspace.id,
@@ -200,6 +259,20 @@ def reconcile_workspace_release(
             activation_claim_expires_at=None,
         )
         raise
+
+
+def _restage_provider_key(store, app_ref: str) -> None:
+    """Re-stage the provider key from the current environment, when present.
+
+    Fly app secrets persist across wakes and machine replacements, so a
+    rotated provider key only reaches workspaces when explicitly
+    re-staged. Absent in local dev: keep the existing secret untouched.
+    """
+    key = os.environ.get("PROFILE_PROVISIONING_API_KEY", "").strip()
+    if not key:
+        return
+    encoded = base64.b64encode(key.encode("utf-8")).decode("ascii")
+    store.stage(app_ref, "ALLIES_FND008_OPENAI_KEY", encoded)
 
 
 @transaction.atomic
@@ -223,7 +296,7 @@ def _claim_release(workspace_id, machine, images, wake_claim):
         and workspace.activation_claim_expires_at > now
     ):
         return None
-    if not workspace.release_target:
+    if not is_pending_release_target(workspace.release_target):
         if workspace.provisioning_phase != WorkspaceProvisioningPhase.IDLE:
             return None
         if (
@@ -272,7 +345,13 @@ def _claim_release(workspace_id, machine, images, wake_claim):
             or parsed.fragment
         ):
             raise ValueError("FOUNDRY_ORIGIN is required for image updates")
+        admission = {
+            key: value
+            for key, value in (workspace.release_target or {}).items()
+            if key == "routine_admission"
+        }
         workspace.release_target = {
+            **admission,
             "images": images,
             "source_generation": workspace.machine_generation,
             "credential_id": str(uuid4()),

@@ -6,6 +6,9 @@ from typing import ClassVar
 
 from django.db import models, transaction
 from django.db.models import Q
+from django.db.models.functions import Length
+from django.db.models.lookups import LessThanOrEqual
+from django.utils import timezone
 
 from runtime.contracts import MAX_TERMINAL_SEQUENCE
 from runtime.exceptions import RuntimeConflictError, RuntimeValidationError
@@ -36,10 +39,20 @@ class AttemptStatus(models.TextChoices):
     QUEUED = "queued", "Queued"
     LEASED = "leased", "Leased"
     RUNNING = "running", "Running"
+    APPROVAL_WAITING = "approval_waiting", "Approval waiting"
     SUCCEEDED = "succeeded", "Succeeded"
     FAILED = "failed", "Failed"
     CANCELLED = "cancelled", "Cancelled"
     UNKNOWN = "unknown", "Unknown"
+
+
+class ApprovalRequestStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    DECISION_RECORDED = "decision_recorded", "Decision recorded"
+    APPLIED = "applied", "Applied"
+    EXPIRED = "expired", "Expired"
+    CANCELLED = "cancelled", "Cancelled"
+    OUTCOME_UNKNOWN = "outcome_unknown", "Outcome unknown"
 
 
 class LeaseState(models.TextChoices):
@@ -96,10 +109,12 @@ class RuntimeOperationState(models.TextChoices):
 class RuntimeOperationTrigger(models.TextChoices):
     SPECULATIVE = "speculative", "Speculative"
     EXECUTION = "execution", "Execution"
+    ONBOARDING = "onboarding", "Onboarding"
 
 
 class RuntimeIntentType(models.TextChoices):
     COMPOSING_STARTED = "composing_started", "Composing started"
+    ALLY_CREATION_STARTED = "ally_creation_started", "Ally creation started"
 
 
 class RuntimeIntentOutcome(models.TextChoices):
@@ -135,6 +150,8 @@ class Workspace(models.Model):
     runtime_operation_requested_at = models.DateTimeField(null=True, blank=True)
     runtime_operation_retry_count = models.PositiveSmallIntegerField(default=0)
     runtime_start_epoch = models.PositiveBigIntegerField(default=0)
+    # Monotonic durable wake signal for already-running runtime workers.
+    activity_revision = models.PositiveBigIntegerField(default=0)
     ready_generation = models.PositiveIntegerField(null=True, blank=True)
     ready_start_epoch = models.PositiveBigIntegerField(null=True, blank=True)
     ready_boot_id = models.UUIDField(null=True, blank=True)
@@ -210,6 +227,10 @@ class Workspace(models.Model):
                 name="runtime_workspace_operation_state_valid",
             ),
             models.CheckConstraint(
+                condition=Q(activity_revision__gte=0),
+                name="runtime_workspace_activity_revision_nonnegative",
+            ),
+            models.CheckConstraint(
                 condition=(
                     Q(runtime_operation_trigger__isnull=True)
                     | Q(runtime_operation_trigger__in=RuntimeOperationTrigger.values)
@@ -248,6 +269,170 @@ class Workspace(models.Model):
 
     def __str__(self) -> str:
         return self.tenant_ref
+
+
+class ReadyWorkspaceBundleState(models.TextChoices):
+    PREPARING = "preparing", "Preparing"
+    READY = "ready", "Ready"
+    PARKING = "parking", "Parking"
+    SLEEPING = "sleeping", "Sleeping"
+    ASSIGNED = "assigned", "Assigned"
+    EVICTING = "evicting", "Evicting"
+    EVICTED = "evicted", "Evicted"
+    FAILED = "failed", "Failed"
+
+
+READY_POOL_MAX_ATTEMPTS = 5
+
+
+class ReadyWorkspaceBundle(models.Model):
+    """A complete, unassigned runtime bundle reserved for permanent transfer."""
+
+    MAX_ATTEMPTS = READY_POOL_MAX_ATTEMPTS
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.OneToOneField(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="ready_workspace_bundle",
+    )
+    state = models.CharField(
+        max_length=16,
+        choices=ReadyWorkspaceBundleState,
+        default=ReadyWorkspaceBundleState.PREPARING,
+    )
+    region = models.CharField(max_length=64)
+    release_fingerprint = models.CharField(max_length=255)
+    blank_volume_ref = models.CharField(max_length=255, null=True, blank=True)
+    config_version = models.PositiveIntegerField(default=1)
+    attempt_count = models.PositiveSmallIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    phase_claim_owner = models.CharField(max_length=128, null=True, blank=True)
+    phase_claim_until = models.DateTimeField(null=True, blank=True)
+    ready_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    last_health_at = models.DateTimeField(null=True, blank=True)
+    assigned_at = models.DateTimeField(null=True, blank=True)
+    safe_error_code = models.CharField(max_length=64, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.CheckConstraint(
+                condition=Q(state__in=ReadyWorkspaceBundleState.values),
+                name="ready_pool_bundle_state_valid",
+            ),
+            models.CheckConstraint(
+                condition=~Q(region=""),
+                name="ready_pool_bundle_region_nonempty",
+            ),
+            models.CheckConstraint(
+                condition=~Q(release_fingerprint=""),
+                name="ready_pool_bundle_release_nonempty",
+            ),
+            models.CheckConstraint(
+                condition=Q(config_version__gt=0),
+                name="ready_pool_bundle_config_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(attempt_count__gte=0)
+                & Q(attempt_count__lte=READY_POOL_MAX_ATTEMPTS),
+                name="ready_pool_bundle_attempts_bounded",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(phase_claim_owner__isnull=True, phase_claim_until__isnull=True)
+                    | Q(
+                        phase_claim_owner__isnull=False, phase_claim_until__isnull=False
+                    )
+                ),
+                name="ready_pool_bundle_claim_consistent",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        state=ReadyWorkspaceBundleState.ASSIGNED,
+                        assigned_at__isnull=False,
+                    )
+                    | (
+                        ~Q(state=ReadyWorkspaceBundleState.ASSIGNED)
+                        & Q(assigned_at__isnull=True)
+                    )
+                ),
+                name="ready_pool_bundle_assignment_timestamp",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(state=ReadyWorkspaceBundleState.READY)
+                    | (
+                        Q(ready_at__isnull=False)
+                        & Q(expires_at__isnull=False)
+                        & Q(last_health_at__isnull=False)
+                    )
+                ),
+                name="ready_pool_bundle_ready_evidence",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(
+                        state__in=[
+                            ReadyWorkspaceBundleState.PARKING,
+                            ReadyWorkspaceBundleState.SLEEPING,
+                        ]
+                    )
+                    | (
+                        Q(blank_volume_ref__isnull=False)
+                        & Q(ready_at__isnull=False)
+                        & Q(expires_at__isnull=False)
+                        & Q(last_health_at__isnull=False)
+                    )
+                ),
+                name="ready_pool_bundle_sleep_evidence",
+            ),
+        ]
+        indexes: ClassVar = [
+            models.Index(
+                fields=["state", "region", "release_fingerprint"],
+                name="ready_pool_bundle_ready_idx",
+            ),
+            models.Index(
+                fields=["state", "next_attempt_at"],
+                name="ready_pool_bundle_due_idx",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.region or not self.region.strip():
+            raise RuntimeValidationError("pool bundle region is required")
+        if not self.release_fingerprint or not self.release_fingerprint.strip():
+            raise RuntimeValidationError("pool bundle release fingerprint is required")
+        if self.config_version <= 0:
+            raise RuntimeValidationError("pool bundle config version must be positive")
+        if not 0 <= self.attempt_count <= self.MAX_ATTEMPTS:
+            raise RuntimeValidationError(
+                "pool bundle attempts exceed the bounded budget"
+            )
+        if (
+            self.state == ReadyWorkspaceBundleState.ASSIGNED
+            and self.assigned_at is None
+        ):
+            raise RuntimeValidationError("assigned pool bundle requires assigned_at")
+        if self.safe_error_code and not re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,63}", self.safe_error_code
+        ):
+            raise RuntimeValidationError("pool bundle error code is invalid")
+        if not self._state.adding:
+            try:
+                previous_state = type(self).objects.only("state").get(pk=self.pk).state
+            except type(self).DoesNotExist:
+                previous_state = None
+            if (
+                previous_state == ReadyWorkspaceBundleState.ASSIGNED
+                and self.state != ReadyWorkspaceBundleState.ASSIGNED
+            ):
+                raise RuntimeConflictError("assigned pool bundles are terminal")
+        return super().save(*args, **kwargs)
 
 
 class RuntimeIntent(models.Model):
@@ -392,6 +577,11 @@ class RuntimeProfile(models.Model):
     # resolved provider values.
     seed_payload = models.JSONField(default=dict, blank=True)
     seed_fingerprint = models.CharField(max_length=64, default="", blank=True)
+    # Mutable model selection, deliberately outside the immutable seed payload:
+    # null/empty means the deployment default; otherwise
+    # {provider, model, reasoning?, key_refs?} plus a monotonic generation the
+    # runtime uses to apply each change exactly once to the live volume.
+    model_override = models.JSONField(default=dict, blank=True)
     materialized_generation = models.PositiveIntegerField(default=0)
     materialization_operation_id = models.UUIDField(null=True, blank=True)
     materialization_request_digest = models.CharField(
@@ -406,6 +596,9 @@ class RuntimeProfile(models.Model):
         blank=True,
     )
     cleanup_operation_id = models.UUIDField(null=True, blank=True)
+    cleanup_requires_quiescence = models.BooleanField(default=False)
+    cleanup_attempt_id = models.UUIDField(null=True, blank=True)
+    cleanup_previous_attempt_id = models.UUIDField(null=True, blank=True)
     cleanup_context_digest = models.CharField(max_length=64, default="", blank=True)
     cleanup_request_digest = models.CharField(max_length=64, default="", blank=True)
     cleanup_expires_at = models.DateTimeField(null=True, blank=True)
@@ -522,6 +715,93 @@ class RuntimeProfile(models.Model):
         return super().save(*args, **kwargs)
 
 
+class DeletedProfile(models.Model):
+    workspace = models.ForeignKey(Workspace, on_delete=models.CASCADE)
+    profile_id = models.UUIDField(primary_key=True)
+
+
+class ProvisioningHintDeliveryState(models.TextChoices):
+    PENDING = "pending", "Pending"
+    DELIVERING = "delivering", "Delivering"
+    DELIVERED = "delivered", "Delivered"
+    EXHAUSTED = "exhausted", "Exhausted"
+
+
+class ProvisioningHintDelivery(models.Model):
+    """Durable, content-free nudge from profile materialization to Cloud."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="provisioning_hint_deliveries",
+    )
+    runtime_profile = models.ForeignKey(
+        RuntimeProfile,
+        on_delete=models.CASCADE,
+        related_name="provisioning_hint_deliveries",
+    )
+    ally_ref = models.CharField(max_length=255)
+    generation = models.PositiveIntegerField()
+    receipt_id = models.UUIDField()
+    occurred_at = models.DateTimeField()
+    state = models.CharField(
+        max_length=16,
+        choices=ProvisioningHintDeliveryState,
+        default=ProvisioningHintDeliveryState.PENDING,
+    )
+    delivery_attempts = models.PositiveSmallIntegerField(default=0)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    next_attempt_at = models.DateTimeField()
+    safe_error_code = models.CharField(max_length=64, default="", blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["runtime_profile", "receipt_id"],
+                name="runtime_hint_profile_receipt_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(state__in=ProvisioningHintDeliveryState.values),
+                name="runtime_hint_state_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(generation__gt=0),
+                name="runtime_hint_generation_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(delivery_attempts__gte=0) & Q(delivery_attempts__lte=8),
+                name="runtime_hint_attempts_bounded",
+            ),
+        ]
+        indexes: ClassVar = [
+            models.Index(
+                fields=["state", "next_attempt_at", "lease_expires_at"],
+                name="rt_hint_due_idx",
+            ),
+            models.Index(
+                fields=["workspace", "generation", "receipt_id"],
+                name="rt_hint_workspace_receipt_idx",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.generation <= 0:
+            raise RuntimeValidationError("hint generation must be positive")
+        if not 0 <= self.delivery_attempts <= 8:
+            raise RuntimeValidationError(
+                "hint delivery attempts exceed the bounded budget"
+            )
+        if self.safe_error_code and not re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,63}", self.safe_error_code
+        ):
+            raise RuntimeValidationError("hint delivery error code is invalid")
+        return super().save(*args, **kwargs)
+
+
 class ConversationBinding(models.Model):
     profile = models.OneToOneField(
         RuntimeProfile,
@@ -609,6 +889,132 @@ class Execution(models.Model):
         ]
 
 
+class PublicationIntentState(models.TextChoices):
+    PREPARING = "preparing", "Preparing"
+    FROZEN = "frozen", "Frozen"
+    REGISTERED = "registered", "Registered"
+    READY = "ready", "Ready"
+    FAILED = "failed", "Failed"
+
+
+class PublicationIntent(models.Model):
+    """Durable authority for one frozen model-returned file publication."""
+
+    MAX_ATTEMPTS = 5
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="publication_intents",
+    )
+    profile = models.ForeignKey(
+        RuntimeProfile,
+        on_delete=models.CASCADE,
+        related_name="publication_intents",
+    )
+    execution = models.ForeignKey(
+        Execution,
+        on_delete=models.CASCADE,
+        related_name="publication_intents",
+    )
+    source_attempt = models.ForeignKey(
+        "Attempt",
+        on_delete=models.PROTECT,
+        related_name="publication_intents",
+    )
+    cloud_binding_id = models.UUIDField()
+    cloud_message_id = models.UUIDField()
+    tool_call_digest = models.CharField(max_length=64)
+    request_digest = models.CharField(max_length=64)
+    manifest_digest = models.CharField(max_length=64, null=True, blank=True)
+    state = models.CharField(
+        max_length=16,
+        choices=PublicationIntentState,
+        default=PublicationIntentState.PREPARING,
+    )
+    next_due_at = models.DateTimeField(default=timezone.now)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    safe_error_code = models.CharField(max_length=64, default="", blank=True)
+    cloud_revision = models.PositiveBigIntegerField(null=True, blank=True)
+    cloud_retry_revision = models.PositiveBigIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["execution", "tool_call_digest"],
+                name="runtime_publication_execution_tool_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(state__in=PublicationIntentState.values),
+                name="runtime_publication_state_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(attempts__gte=0) & Q(attempts__lte=5),
+                name="runtime_publication_attempts_bounded",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(manifest_digest__isnull=True)
+                    | Q(manifest_digest__regex=r"^[0-9a-f]{64}$")
+                ),
+                name="runtime_publication_manifest_digest_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(tool_call_digest__regex=r"^[0-9a-f]{64}$")
+                & Q(request_digest__regex=r"^[0-9a-f]{64}$"),
+                name="runtime_publication_request_digests_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        state=PublicationIntentState.PREPARING,
+                        manifest_digest__isnull=True,
+                    )
+                    | Q(
+                        state__in=[
+                            PublicationIntentState.FROZEN,
+                            PublicationIntentState.REGISTERED,
+                            PublicationIntentState.READY,
+                            PublicationIntentState.FAILED,
+                        ],
+                        manifest_digest__isnull=False,
+                    )
+                ),
+                name="runtime_publication_state_manifest_contract",
+            ),
+        ]
+        indexes: ClassVar = [
+            models.Index(
+                fields=["profile", "state", "next_due_at", "id"],
+                name="rt_publication_due_idx",
+            ),
+            models.Index(
+                fields=["workspace", "state", "next_due_at", "id"],
+                name="rt_publication_wake_idx",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not 0 <= self.attempts <= self.MAX_ATTEMPTS:
+            raise RuntimeValidationError(
+                "publication attempts exceed the bounded budget"
+            )
+        for field_name in ("tool_call_digest", "request_digest", "manifest_digest"):
+            value = getattr(self, field_name)
+            if value is not None and not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise RuntimeValidationError(
+                    f"{field_name} must be a SHA-256 hex digest"
+                )
+        if self.safe_error_code and not re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,63}", self.safe_error_code
+        ):
+            raise RuntimeValidationError("publication error code is invalid")
+        return super().save(*args, **kwargs)
+
+
 class Attempt(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     execution = models.ForeignKey(
@@ -657,6 +1063,375 @@ class Attempt(models.Model):
         ]
 
 
+class ApprovalRequest(models.Model):
+    """Foundry's private mirror of one live Hermes approval request."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="approval_requests",
+    )
+    profile = models.ForeignKey(
+        RuntimeProfile,
+        on_delete=models.CASCADE,
+        related_name="approval_requests",
+    )
+    execution = models.ForeignKey(
+        Execution,
+        on_delete=models.CASCADE,
+        related_name="approval_requests",
+    )
+    attempt = models.ForeignKey(
+        Attempt,
+        on_delete=models.CASCADE,
+        related_name="approval_requests",
+    )
+    generation = models.PositiveIntegerField()
+    hermes_run_id = models.CharField(max_length=255)
+    hermes_approval_id = models.CharField(max_length=255)
+    action_kind = models.CharField(max_length=64)
+    action_label = models.CharField(max_length=120)
+    action_preview = models.TextField(max_length=16 * 1024)
+    expires_at = models.DateTimeField()
+    status = models.CharField(
+        max_length=24,
+        choices=ApprovalRequestStatus,
+        default=ApprovalRequestStatus.PENDING,
+    )
+    decision = models.CharField(max_length=7, null=True, blank=True)
+    decision_command_id = models.UUIDField(null=True, blank=True)
+    decision_idempotency_key = models.UUIDField(null=True, blank=True)
+    decision_fingerprint = models.CharField(max_length=100, default="", blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    acknowledgement_deadline_at = models.DateTimeField(null=True, blank=True)
+    outcome = models.CharField(max_length=9, null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["attempt", "hermes_approval_id"],
+                name="runtime_approval_attempt_hermes_id_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=ApprovalRequestStatus.values),
+                name="runtime_approval_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(generation__gte=0),
+                name="runtime_approval_generation_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(decision__isnull=True) | Q(decision__in=["approve", "reject"])
+                ),
+                name="runtime_approval_decision_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(outcome__isnull=True)
+                    | Q(outcome__in=["approved", "rejected", "expired", "cancelled"])
+                ),
+                name="runtime_approval_outcome_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(decision_fingerprint="")
+                    | Q(
+                        decision_fingerprint__regex=r"^canonical-json-sha256:v1:[0-9a-f]{64}$"
+                    )
+                ),
+                name="runtime_approval_decision_fingerprint_valid",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~Q(action_label="")
+                    & ~Q(action_preview="")
+                    & LessThanOrEqual(Length("action_label"), 120)
+                    & LessThanOrEqual(Length("action_preview"), 16 * 1024)
+                ),
+                name="runtime_approval_material_bounded",
+            ),
+        ]
+        indexes: ClassVar = [
+            models.Index(
+                fields=["attempt", "status", "expires_at"],
+                name="rt_approval_attempt_state_idx",
+            ),
+            models.Index(
+                fields=["workspace", "status", "expires_at"],
+                name="rt_approval_ws_state_idx",
+            ),
+        ]
+
+
+class RoutineRunStatus(models.TextChoices):
+    QUEUED = "queued", "Queued"
+    WORKING = "working", "Working"
+    APPROVAL_WAITING = "approval_waiting", "Approval waiting"
+    SUCCEEDED = "succeeded", "Succeeded"
+    FAILED = "failed", "Failed"
+    CANCELLED = "cancelled", "Cancelled"
+    EXPIRED = "expired", "Expired"
+
+
+class RoutineApprovalStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    AUTHORIZING = "authorizing", "Authorizing"
+    REJECTED = "rejected", "Rejected"
+    EXPIRED = "expired", "Expired"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class RoutineActionState(models.TextChoices):
+    PRE_DISPATCH = "pre_dispatch", "Pre-dispatch"
+    DISPATCHING = "dispatching", "Dispatching"
+    COMPLETED = "completed", "Completed"
+    UNKNOWN = "unknown", "Unknown"
+    MANUAL_RECONCILIATION = "manual_reconciliation", "Manual reconciliation"
+
+
+class RoutineExecution(models.Model):
+    """Immutable Cloud dispatch snapshot plus Foundry-owned run state."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    execution = models.OneToOneField(
+        Execution,
+        on_delete=models.CASCADE,
+        related_name="routine_execution",
+    )
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="routine_executions",
+    )
+    profile = models.ForeignKey(
+        RuntimeProfile,
+        on_delete=models.CASCADE,
+        related_name="routine_executions",
+    )
+    routine_id = models.UUIDField()
+    routine_revision = models.PositiveIntegerField()
+    schedule_generation = models.PositiveIntegerField()
+    occurrence_id = models.UUIDField()
+    run_id = models.UUIDField()
+    scheduled_at = models.DateTimeField()
+    delayed = models.BooleanField(default=False)
+    occurrence_disposition = models.CharField(max_length=24, default="admitted")
+    main_conversation_id = models.UUIDField()
+    run_conversation_id = models.UUIDField()
+    hermes_session_id = models.CharField(max_length=255, null=True, blank=True)
+    cloud_binding_id = models.UUIDField()
+    owner_user_id = models.UUIDField()
+    ally_id = models.UUIDField()
+    title_snapshot = models.CharField(max_length=255)
+    execution_prompt = models.TextField()
+    generation = models.PositiveBigIntegerField(default=0)
+    fence = models.PositiveBigIntegerField(default=0)
+    status = models.CharField(
+        max_length=24,
+        choices=RoutineRunStatus,
+        default=RoutineRunStatus.QUEUED,
+    )
+    current_attempt = models.ForeignKey(
+        Attempt,
+        on_delete=models.PROTECT,
+        related_name="current_routine_executions",
+        null=True,
+        blank=True,
+    )
+    dispatch_receipt = models.JSONField(default=dict, blank=True)
+    terminal_receipt = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["workspace", "occurrence_id"],
+                name="runtime_routine_workspace_occurrence_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["workspace", "run_id"],
+                name="runtime_routine_workspace_run_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["workspace", "run_conversation_id"],
+                name="runtime_routine_workspace_run_conversation_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["profile", "routine_id"],
+                condition=Q(
+                    status__in=[
+                        RoutineRunStatus.QUEUED,
+                        RoutineRunStatus.WORKING,
+                        RoutineRunStatus.APPROVAL_WAITING,
+                    ]
+                ),
+                name="runtime_routine_profile_active_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(routine_revision__gt=0) & Q(schedule_generation__gt=0),
+                name="runtime_routine_revision_generation_positive",
+            ),
+            models.CheckConstraint(
+                condition=~Q(main_conversation_id=models.F("run_conversation_id")),
+                name="runtime_routine_conversations_distinct",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=RoutineRunStatus.values),
+                name="runtime_routine_status_valid",
+            ),
+        ]
+        indexes: ClassVar = [
+            models.Index(
+                fields=["profile", "status", "created_at"],
+                name="rt_routine_profile_status_idx",
+            ),
+            models.Index(
+                fields=["status", "created_at"],
+                name="rt_routine_status_created_idx",
+            ),
+        ]
+
+
+class RoutineLeaseAcquisition(models.Model):
+    """Rotatable authority for one Lease without creating a second Lease."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    lease = models.ForeignKey(
+        "Lease",
+        on_delete=models.CASCADE,
+        related_name="acquisitions",
+    )
+    ordinal = models.PositiveIntegerField()
+    claim_id = models.UUIDField(unique=True)
+    token_digest = models.CharField(max_length=64, unique=True)
+    machine_generation = models.PositiveIntegerField()
+    current = models.BooleanField(default=True)
+    issued_at = models.DateTimeField(auto_now_add=True)
+    retired_at = models.DateTimeField(null=True, blank=True)
+    claim_receipt = models.JSONField(default=dict, blank=True)
+    session_request_digest = models.CharField(max_length=64, null=True, blank=True)
+    stop_request_digest = models.CharField(max_length=64, null=True, blank=True)
+    terminal_request_digest = models.CharField(max_length=64, null=True, blank=True)
+    session_receipt = models.JSONField(null=True, blank=True)
+    stop_receipt = models.JSONField(null=True, blank=True)
+    terminal_receipt = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["lease", "ordinal"],
+                name="runtime_routine_lease_acquisition_ordinal_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["lease"],
+                condition=Q(current=True),
+                name="runtime_routine_lease_current_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(ordinal__gt=0),
+                name="runtime_routine_lease_ordinal_positive",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not re.fullmatch(r"[0-9a-f]{64}", self.token_digest):
+            raise RuntimeValidationError(
+                "routine acquisition token_digest must be a SHA-256 hex digest"
+            )
+        return super().save(*args, **kwargs)
+
+
+class RoutineApprovalAction(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    routine_execution = models.ForeignKey(
+        RoutineExecution,
+        on_delete=models.CASCADE,
+        related_name="approval_actions",
+    )
+    attempt = models.ForeignKey(
+        Attempt,
+        on_delete=models.PROTECT,
+        related_name="routine_approval_actions",
+    )
+    approval_request_id = models.UUIDField(unique=True)
+    action_attempt_id = models.UUIDField(unique=True)
+    generation = models.PositiveBigIntegerField()
+    status = models.CharField(
+        max_length=24,
+        choices=RoutineApprovalStatus,
+        default=RoutineApprovalStatus.PENDING,
+    )
+    permission_consumed = models.BooleanField(default=False)
+    action_digest = models.CharField(max_length=64)
+    provider_idempotency_key = models.CharField(max_length=255)
+    created_at = models.DateTimeField()
+    expires_at = models.DateTimeField()
+    action_state = models.CharField(
+        max_length=32,
+        choices=RoutineActionState,
+        null=True,
+        blank=True,
+    )
+    continuation = models.JSONField(default=dict, blank=True)
+    provider_receipt = models.JSONField(null=True, blank=True)
+    decision = models.CharField(max_length=16, null=True, blank=True)
+    decision_digest = models.CharField(max_length=64, null=True, blank=True)
+    created_event_id = models.UUIDField(null=True, blank=True)
+    created_event_sequence = models.PositiveIntegerField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["routine_execution", "action_attempt_id"],
+                name="runtime_routine_action_attempt_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["routine_execution"],
+                condition=Q(status=RoutineApprovalStatus.PENDING),
+                name="runtime_routine_pending_approval_unique",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=RoutineApprovalStatus.values),
+                name="runtime_routine_approval_status_valid",
+            ),
+            models.CheckConstraint(
+                condition=Q(action_state__isnull=True)
+                | Q(action_state__in=RoutineActionState.values),
+                name="runtime_routine_action_state_valid",
+            ),
+        ]
+
+
+class RoutineCommandReceipt(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey(
+        Workspace,
+        on_delete=models.CASCADE,
+        related_name="routine_command_receipts",
+    )
+    command_id = models.UUIDField(unique=True)
+    idempotency_key = models.UUIDField()
+    kind = models.CharField(max_length=64)
+    fingerprint = models.CharField(max_length=100)
+    response = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints: ClassVar = [
+            models.UniqueConstraint(
+                fields=["workspace", "idempotency_key"],
+                name="runtime_routine_command_receipt_key_unique",
+            ),
+        ]
+
+
 class Lease(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     attempt = models.OneToOneField(
@@ -669,6 +1444,7 @@ class Lease(models.Model):
         on_delete=models.CASCADE,
         related_name="leases",
     )
+    scope_key = models.CharField(max_length=100, default="main")
     token_digest = models.CharField(max_length=64, unique=True)
     claim_id = models.UUIDField(null=True, blank=True)
     expires_at = models.DateTimeField()
@@ -678,15 +1454,22 @@ class Lease(models.Model):
         choices=LeaseState,
         default=LeaseState.ACTIVE,
     )
+    current_acquisition = models.ForeignKey(
+        "RoutineLeaseAcquisition",
+        on_delete=models.SET_NULL,
+        related_name="current_for_leases",
+        null=True,
+        blank=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         constraints: ClassVar = [
             models.UniqueConstraint(
-                fields=["profile"],
+                fields=["profile", "scope_key"],
                 condition=Q(state__in=[LeaseState.ACTIVE, LeaseState.STOPPING]),
-                name="runtime_lease_profile_unresolved_unique",
+                name="runtime_lease_profile_scope_unresolved_unique",
             ),
             models.CheckConstraint(
                 condition=Q(state__in=LeaseState.values),
@@ -765,6 +1548,8 @@ class ExecutionEventDelivery(models.Model):
     next_attempt_at = models.DateTimeField()
     safe_error_code = models.CharField(max_length=64, default="", blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
+    # First time Cloud reported this delivery waiting on a missing predecessor.
+    sequence_gap_since = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -816,8 +1601,12 @@ class ExecutionEventDelivery(models.Model):
             previous = (
                 type(self)
                 .objects.only(
-                    "event_id", "envelope_bytes", "byte_length", "fingerprint",
-                    "state", "repair_cycle"
+                    "event_id",
+                    "envelope_bytes",
+                    "byte_length",
+                    "fingerprint",
+                    "state",
+                    "repair_cycle",
                 )
                 .get(pk=self.pk)
             )
@@ -842,8 +1631,10 @@ class ExecutionEventDelivery(models.Model):
                 and self.byte_length > 0
                 and self.repair_cycle > previous.repair_cycle
             )
-            if identity_changed or payload_changed and not (
-                terminal_erasure or repair_rehydration
+            if (
+                identity_changed
+                or payload_changed
+                and not (terminal_erasure or repair_rehydration)
             ):
                 raise RuntimeConflictError("event delivery envelope is immutable")
         if not isinstance(self.envelope_bytes, bytes):

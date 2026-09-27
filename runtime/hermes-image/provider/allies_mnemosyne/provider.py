@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -33,7 +35,8 @@ logger = logging.getLogger(__name__)
 POLICY_VERSION = "allies-mnemosyne-v1"
 PROVIDER_VERSION = "0.1.0"
 MNEMOSYNE_HERMES_VERSION = "0.5.0"
-DEFAULT_MODE = "context_only"
+CONTEXT_ONLY_MODE = "context_only"
+DEFAULT_MODE = "narrow_tools"
 MODES = frozenset({"context_only", "narrow_tools"})
 
 ALLOWED_TOOLS = (
@@ -46,6 +49,7 @@ ALLOWED_TOOLS = (
     "mnemosyne_remember_canonical",
     "mnemosyne_update",
 )
+DEFAULT_TOOLS = ALLOWED_TOOLS
 _ALLOWED_TOOL_SET = frozenset(ALLOWED_TOOLS)
 _WRITE_TOOLS = frozenset(
     {
@@ -125,6 +129,9 @@ _FORBIDDEN_ARGUMENT_KEYS = frozenset(
 )
 
 _INIT_ENV_LOCK = threading.RLock()
+_OPERATION_LOCKS: dict[str, threading.RLock] = {}
+_OPERATION_LOCKS_GUARD = threading.Lock()
+MEMORY_OPERATION_TIMEOUT_SECONDS = 5.0
 
 
 class _ProviderInvariantError(RuntimeError):
@@ -271,11 +278,41 @@ def _invoke(
         return _safe_reason(exc), None
 
 
+def _operation_lock(db_path: Path | None) -> threading.RLock | None:
+    if db_path is None:
+        return None
+    key = str(db_path.resolve(strict=False))
+    with _OPERATION_LOCKS_GUARD:
+        lock = _OPERATION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _OPERATION_LOCKS[key] = lock
+        return lock
+
+
+def _invoke_profile_operation(
+    db_path: Path | None,
+    callback: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[str, Any]:
+    lock = _operation_lock(db_path)
+    if lock is None:
+        return "database_unavailable", None
+    if not lock.acquire(timeout=MEMORY_OPERATION_TIMEOUT_SECONDS):
+        return "memory_operation_timeout", None
+    try:
+        return _invoke(callback, *args, **kwargs)
+    finally:
+        lock.release()
+
+
 class AlliesMnemosyneProvider(MemoryProvider):
     """Allies' fail-soft, profile-local wrapper around Mnemosyne for Hermes."""
 
     def __init__(self) -> None:
         self._delegate: Any = None
+        self._owned_connections: list[Any] = []
         self._available = False
         self._reason = "not_initialized"
         self._mode = DEFAULT_MODE
@@ -393,7 +430,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
                 return None, None, None, "shared_surface_forbidden"
             requested = kwargs.get(
                 "memory_tool_allowlist",
-                kwargs.get("tools", memory_config.get("tools", [])),
+                kwargs.get("tools", memory_config.get("tools", DEFAULT_TOOLS)),
             )
             if requested is None:
                 requested = []
@@ -402,7 +439,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
             selected_tools = tuple(sorted({str(item) for item in requested}))
             if not set(selected_tools).issubset(_ALLOWED_TOOL_SET):
                 return None, None, None, "memory_tool_not_approved"
-            if mode == DEFAULT_MODE:
+            if mode == CONTEXT_ONLY_MODE:
                 selected_tools = ()
             self._mode = mode
             self._tools = selected_tools
@@ -411,7 +448,10 @@ class AlliesMnemosyneProvider(MemoryProvider):
             return None, None, None, _safe_reason(exc)
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
-        self.shutdown()
+        try:
+            self.shutdown_checked()
+        except RuntimeError:
+            return
         self._session_id = str(session_id or "")
         self._correlation_id = str(kwargs.get("correlation_id") or uuid.uuid4().hex)
         self._mode = DEFAULT_MODE
@@ -447,11 +487,16 @@ class AlliesMnemosyneProvider(MemoryProvider):
                 os.environ["MNEMOSYNE_DATA_DIR"] = str(memory_data)
                 os.environ["MNEMOSYNE_AUTO_SLEEP_ENABLED"] = "0"
                 os.environ["MNEMOSYNE_SYNC_ROLES"] = ""
-                os.environ["MNEMOSYNE_BUSY_TIMEOUT_MS"] = str(
-                    SQLITE_BUSY_TIMEOUT_MS
-                )
+                os.environ["MNEMOSYNE_BUSY_TIMEOUT_MS"] = str(SQLITE_BUSY_TIMEOUT_MS)
                 try:
                     module = importlib.import_module("mnemosyne_hermes")
+                    memory_module = importlib.import_module("mnemosyne.core.memory")
+                    cached = getattr(memory_module._thread_local, "conn", None)
+                    if cached is not None:
+                        try:
+                            cached.execute("SELECT 1")
+                        except sqlite3.ProgrammingError:
+                            memory_module._thread_local.conn = None
                     provider_class = module.MnemosyneMemoryProvider
                     delegate = provider_class()
                     delegate.initialize(
@@ -469,6 +514,19 @@ class AlliesMnemosyneProvider(MemoryProvider):
                         tools=[],
                     )
                 finally:
+                    for module_name in ("mnemosyne.core.memory", "mnemosyne.core.beam"):
+                        local = getattr(
+                            sys.modules.get(module_name), "_thread_local", None
+                        )
+                        connection = getattr(local, "conn", None)
+                        path = getattr(local, "db_path", None)
+                        if (
+                            connection is not None
+                            and path
+                            and _under(Path(path).resolve(), root.resolve())
+                        ):
+                            self._owned_connections.append(connection)
+                            local.conn = None
                     for key, value in previous.items():
                         if value is None:
                             os.environ.pop(key, None)
@@ -506,6 +564,14 @@ class AlliesMnemosyneProvider(MemoryProvider):
             if getattr(delegate, "_surface_beam", None) is not None:
                 raise _ProviderInvariantError("shared_surface_initialized")
             self._db_path = db_path
+            audit = getattr(delegate, "_audit", None)
+            audit_connection = getattr(audit, "_conn", None)
+            if audit_connection is not None:
+                # Operations already serialize per profile; allow checked teardown off the init thread.
+                audit_connection.close()
+                audit._conn = sqlite3.connect(
+                    str(db_path), timeout=5, check_same_thread=False
+                )
             if self._mode == "narrow_tools" and not self._discover_schemas():
                 raise _ProviderInvariantError(
                     self._schema_error or "reviewed_schema_drift"
@@ -514,17 +580,19 @@ class AlliesMnemosyneProvider(MemoryProvider):
             self._reason = "ready"
         except BaseException as exc:  # noqa: BLE001 - lifecycle faults fail soft
             if delegate is not None:
-                _invoke(delegate.shutdown)
+                self._delegate = delegate
+                try:
+                    self.shutdown_checked()
+                except RuntimeError:
+                    pass
             self._available = False
             self._reason = _safe_reason(exc)
-            self._delegate = None
-            self._db_path = None
             logger.warning("Mnemosyne provider unavailable: %s", self._reason)
 
     def system_prompt_block(self) -> str:
         if not self._available:
             return "# Allies Memory\nStatus: temporarily unavailable; continue without durable memory."
-        if self._mode == DEFAULT_MODE:
+        if self._mode == CONTEXT_ONLY_MODE:
             return (
                 "# Allies Memory\n"
                 "Relevant durable context may be supplied silently. Automatic conversation capture "
@@ -532,7 +600,8 @@ class AlliesMnemosyneProvider(MemoryProvider):
             )
         return (
             "# Allies Memory\n"
-            "Use the approved durable-memory tools only for explicit, policy-approved facts. "
+            "Use mnemosyne_recall and mnemosyne_remember for explicit, policy-approved "
+            "durable profile memory in ordinary and routine sessions. "
             "Automatic conversation capture and consolidation are disabled."
         )
 
@@ -545,7 +614,8 @@ class AlliesMnemosyneProvider(MemoryProvider):
             or _text_bytes(query) > MAX_QUERY_BYTES
         ):
             return ""
-        status, value = _invoke(
+        status, value = _invoke_profile_operation(
+            self._db_path,
             self._delegate.prefetch,
             query,
             session_id=session_id or self._session_id,
@@ -572,7 +642,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
         return None
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        if not self._available or self._mode == DEFAULT_MODE:
+        if not self._available or self._mode == CONTEXT_ONLY_MODE:
             return []
         schemas = self._discover_schemas()
         return [schemas[name] for name in self._tools if name in schemas]
@@ -581,7 +651,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
         return bool(tool_name in self._tools and tool_name in self.get_tool_names())
 
     def get_tool_names(self) -> tuple[str, ...]:
-        if not self._available or self._mode == DEFAULT_MODE:
+        if not self._available or self._mode == CONTEXT_ONLY_MODE:
             return ()
         schemas = self._discover_schemas()
         return tuple(name for name in self._tools if name in schemas)
@@ -631,7 +701,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
     ) -> str:
         if not self._available or self._delegate is None:
             return _json_result("memory_unavailable", self._reason)
-        if self._mode == DEFAULT_MODE or not self.has_tool(tool_name):
+        if self._mode == CONTEXT_ONLY_MODE or not self.has_tool(tool_name):
             return _json_result("tool_rejected", "tool_not_advertised")
         schema = self._schemas.get(tool_name)
         if schema is None:
@@ -649,7 +719,8 @@ class AlliesMnemosyneProvider(MemoryProvider):
         delegated_args = dict(args)
         if tool_name == "mnemosyne_remember":
             delegated_args["scope"] = "global"
-        status, value = _invoke(
+        status, value = _invoke_profile_operation(
+            self._db_path,
             self._delegate.handle_tool_call,
             tool_name,
             delegated_args,
@@ -699,7 +770,7 @@ class AlliesMnemosyneProvider(MemoryProvider):
             {
                 "key": "tools",
                 "description": "Explicit approved tools for narrow_tools mode.",
-                "default": [],
+                "default": list(DEFAULT_TOOLS),
             },
         ]
 
@@ -722,11 +793,61 @@ class AlliesMnemosyneProvider(MemoryProvider):
         }
 
     def shutdown(self) -> None:
-        delegate, self._delegate = self._delegate, None
+        try:
+            self.shutdown_checked()
+        except RuntimeError:
+            logger.warning("Mnemosyne shutdown remains unresolved")
+
+    def shutdown_checked(self) -> None:
+        self._available = False
+        self._reason = "shutdown_pending"
+        delegate = self._delegate
         if delegate is not None:
-            status, _ = _invoke(delegate.shutdown)
+
+            def close_owned_resources() -> None:
+                thread = getattr(delegate, "_session_end_thread", None)
+                if thread is not None and thread.is_alive():
+                    raise RuntimeError("mnemosyne_worker_pending")
+                beam = getattr(delegate, "_beam", None)
+                connection = getattr(beam, "conn", None)
+                if connection is not None:
+                    connection.close()
+                memory_owner = getattr(
+                    getattr(beam, "_event_emitter", None), "__self__", None
+                )
+                memory_connection = getattr(memory_owner, "conn", None)
+                if memory_connection is not None:
+                    memory_connection.close()
+                audit = getattr(delegate, "_audit", None)
+                audit_connection = getattr(audit, "_conn", None)
+                if audit_connection is not None:
+                    audit_connection.close()
+                    audit._conn = None
+                for owned_connection in self._owned_connections:
+                    owned_connection.close()
+                self._owned_connections.clear()
+                with _INIT_ENV_LOCK:
+                    module = sys.modules.get("mnemosyne_hermes")
+                    skip_contexts = getattr(delegate, "_skip_contexts", None)
+                    preserve_backend = (
+                        getattr(module, "_active_provider_count", 0) > 1
+                        and skip_contexts is not None
+                    )
+                    if preserve_backend:
+                        delegate._skip_contexts = {
+                            *skip_contexts,
+                            delegate._agent_context,
+                        }
+                    try:
+                        delegate.shutdown()
+                    finally:
+                        if preserve_backend:
+                            delegate._skip_contexts = skip_contexts
+
+            status, _ = _invoke_profile_operation(self._db_path, close_owned_resources)
             if status != "ok":
-                logger.warning("Mnemosyne shutdown fault: %s", status)
+                raise RuntimeError("mnemosyne_shutdown_failed")
+        self._delegate = None
         self._available = False
         self._db_path = None
         self._schemas = {}

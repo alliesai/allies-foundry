@@ -44,6 +44,7 @@ class ImageProvider(FakeProvider):
     wrong_image = False
 
     def ensure_machine(self, spec):
+        self.last_machine_spec = spec
         if self.fail_create and spec.ownership.generation > 1:
             raise ProviderRetryableError("image pull unavailable")
         machine = super().ensure_machine(spec)
@@ -85,7 +86,9 @@ def release_setup(db, monkeypatch):
     provider = ImageProvider()
     workspace = Workspace.objects.create(tenant_ref=str(uuid4()))
     spec = WorkspaceSpec(
-        hermes_image=OLD["hermes"], runtime_image=OLD["allies-runtime"]
+        hermes_image=OLD["hermes"],
+        runtime_image=OLD["allies-runtime"],
+        volume_size_gb=10,
     )
     WorkspaceLifecycle(provider, sleep=lambda _: None, jitter=False).ensure_workspace(
         workspace.id, spec
@@ -108,6 +111,38 @@ def ready(workspace):
         workspace.machine_generation,
         workspace.runtime_start_epoch,
     )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_release_propagates_optional_activity_wait_setting(
+    release_setup, settings, enabled
+):
+    workspace, provider, _ = release_setup
+    settings.ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED = enabled
+    assert wake(workspace, provider).awaiting_readiness == 1
+    assert (
+        provider.last_machine_spec.cpu_kind,
+        provider.last_machine_spec.cpus,
+        provider.last_machine_spec.memory_mb,
+    ) == ("shared", 2, 2048)
+    runtime = next(
+        c for c in provider.last_machine_spec.containers if c.name == "allies-runtime"
+    )
+    assert (
+        runtime.environment["ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED"]
+        == str(enabled).lower()
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_release_propagates_rich_approval_setting(release_setup, settings, enabled):
+    workspace, provider, _ = release_setup
+    settings.ALLIES_RICH_APPROVALS_ENABLED = enabled
+    assert wake(workspace, provider).awaiting_readiness == 1
+    runtime = next(
+        c for c in provider.last_machine_spec.containers if c.name == "allies-runtime"
+    )
+    assert runtime.environment["ALLIES_RICH_APPROVALS_ENABLED"] == str(enabled).lower()
 
 
 def wake(workspace, provider):
@@ -135,6 +170,27 @@ def test_wake_replaces_both_images_preserves_volume_and_gates_readiness(release_
     ready(workspace)
     workspace.refresh_from_db()
     assert is_runtime_ready(workspace)
+
+
+def test_wake_replacement_restages_provider_key_from_env(
+    release_setup, monkeypatch
+):
+    workspace, provider, store = release_setup
+    monkeypatch.setenv("PROFILE_PROVISIONING_API_KEY", "rotated-provider-key")
+    assert wake(workspace, provider).awaiting_readiness == 1
+    key_stages = [
+        (app, name)
+        for app, name in store.staged
+        if name == "ALLIES_FND008_OPENAI_KEY"
+    ]
+    assert key_stages == [(workspace.fly_app_ref, "ALLIES_FND008_OPENAI_KEY")]
+
+
+def test_wake_replacement_skips_provider_key_without_env(release_setup, monkeypatch):
+    workspace, provider, store = release_setup
+    monkeypatch.delenv("PROFILE_PROVISIONING_API_KEY", raising=False)
+    assert wake(workspace, provider).awaiting_readiness == 1
+    assert all(name != "ALLIES_FND008_OPENAI_KEY" for _, name in store.staged)
 
 
 @pytest.mark.parametrize("container", ["hermes", "allies-runtime"])
@@ -166,6 +222,46 @@ def test_current_machine_only_starts_and_backfills_legacy_images(
     assert workspace.machine_generation == 1 and not store.staged
     assert "destroy_machine" not in provider.calls
     assert workspace.applied_images == OLD
+
+
+def test_routine_admission_gate_does_not_become_pending_release(
+    release_setup, monkeypatch
+):
+    workspace, provider, _ = release_setup
+    monkeypatch.setenv("HERMES_IMAGE", OLD["hermes"])
+    monkeypatch.setenv("RUNTIME_IMAGE", OLD["allies-runtime"])
+    gate = {"routine_admission": {"enabled": True}}
+    workspace.release_target = gate
+    workspace.save()
+
+    assert reconcile_workspace_release(workspace.id, provider=provider) == "current"
+
+    workspace.refresh_from_db()
+    assert workspace.release_target == gate
+    assert workspace.applied_images == OLD
+
+
+def test_explicit_routine_pause_survives_image_upgrade_and_readiness(release_setup):
+    from runtime.exceptions import RuntimeNotReadyError
+    from runtime.services.routines import (
+        _require_routine_admission,
+        disable_routine_admission,
+    )
+
+    workspace, provider, _ = release_setup
+    disable_routine_admission(workspace.id)
+    workspace.refresh_from_db()
+    gate = workspace.release_target.copy()
+
+    assert wake(workspace, provider).awaiting_readiness == 1
+    workspace.refresh_from_db()
+    assert workspace.applied_images == NEW
+    assert workspace.release_target == gate
+    ready(workspace)
+    workspace.refresh_from_db()
+    assert is_runtime_ready(workspace)
+    with pytest.raises(RuntimeNotReadyError, match="routine admission is disabled"):
+        _require_routine_admission(workspace)
 
 
 def test_active_workspace_is_not_replaced_until_keep_warm_expires(release_setup):

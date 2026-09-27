@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
 from runtime.exceptions import RuntimeValidationError
 
@@ -29,6 +29,62 @@ MAX_CONTRACT_LIFETIME_SECONDS = 60
 # runtime exhausts its ordinary event budget.
 MAX_RUNTIME_EVENT_SEQUENCE = 100000
 MAX_TERMINAL_SEQUENCE = 100001
+MAX_APPROVAL_LIFETIME_SECONDS = 300
+MAX_APPROVAL_LABEL_CHARS = 120
+MAX_APPROVAL_PREVIEW_BYTES = 16 * 1024
+MAX_APPROVAL_ACKNOWLEDGEMENT_SECONDS = 30
+APPROVAL_ACTION_KINDS = frozenset({"terminal", "execute_code", "plugin_tool"})
+
+ACTIVITY_KINDS = frozenset(
+    {
+        "web_search",
+        "web_extract",
+        "browser_navigate",
+        "browser_interact",
+        "search_files",
+        "read_file",
+        "write_file",
+        "publish_files",
+        "patch",
+        "terminal",
+        "execute_code",
+        "image_generate",
+        "video_generate",
+        "text_to_speech",
+        "vision_analyze",
+        "session_search",
+        "memory_remember",
+        "memory_recall",
+        "memory",
+        "skills_list",
+        "skill_view",
+        "skill_manage",
+        "todo",
+        "cronjob",
+        "routine_create",
+        "routine_list",
+        "routine_inspect",
+        "routine_update",
+        "routine_pause",
+        "routine_resume",
+        "routine_request_delete",
+        "routine_delete",
+        "routine_result",
+        "delegate_task",
+        "browser_view",
+        "process",
+        "smart_home",
+        "tool_lookup",
+        "gmail_read",
+        "gmail_send",
+        "gmail_organise",
+        "safe_input_check",
+        "safe_input_request",
+        "safe_input_fill",
+        "approval_request",
+        "unknown",
+    }
+)
 
 _FINGERPRINT_RE = f"^{FINGERPRINT_PREFIX}[0-9a-f]{{64}}$"
 
@@ -55,10 +111,31 @@ class FirstTurnBootstrap(ContractModel):
     text: StrictStr = Field(..., min_length=1, max_length=MAX_COMMAND_TEXT_BYTES)
 
 
+class FileInputV1(ContractModel):
+    file_id: UUID
+    name: StrictStr = Field(..., min_length=1, max_length=255)
+    media_type: StrictStr = Field(
+        ..., min_length=1, max_length=127, pattern=r"^[\x20-\x7e]+/[\x20-\x7e]+$"
+    )
+    size: StrictInt = Field(..., ge=1, le=25_000_000)
+    sha256: StrictStr = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
 class ExecutionInput(ContractModel):
     kind: Literal["execution_input"]
-    text: StrictStr = Field(..., min_length=1, max_length=16_000)
+    text: StrictStr = Field(..., min_length=0, max_length=MAX_COMMAND_TEXT_BYTES)
     bootstrap: FirstTurnBootstrap | None = None
+    files: list[FileInputV1] | None = Field(default=None, min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def requires_text_or_files(self) -> ExecutionInput:
+        if "files" in self.model_fields_set and self.files is None:
+            raise ValueError("files must be omitted or a nonempty manifest")
+        if self.files and sum(file.size for file in self.files) > 50_000_000:
+            raise ValueError("file manifest exceeds the aggregate size limit")
+        if not self.text and not self.files:
+            raise ValueError("execution input requires text or files")
+        return self
 
 
 class FoundryCorrelation(ContractModel):
@@ -90,6 +167,53 @@ class ExecutionCommand(ContractModel):
     )
 
 
+class ApprovalFoundryIdentity(ContractModel):
+    execution_id: UUID
+    attempt_id: UUID
+    generation: StrictInt = Field(..., ge=0, le=2_147_483_647)
+
+
+class ApprovalDecisionCommand(ContractModel):
+    """Canonical Cloud command that delivers one recorded approval choice."""
+
+    schema_version: Literal[CONTRACT_VERSION]
+    kind: Literal["approval.decision"]
+    producer: Literal["cloud"]
+    service_identity: Literal["cloud-service"]
+    command_id: UUID
+    idempotency_key: UUID
+    scope: ExecutionScope
+    cloud: CloudCorrelation
+    foundry: ApprovalFoundryIdentity
+    approval_request_id: UUID
+    decision: Literal["approve", "reject"]
+    decided_at: datetime
+    acknowledgement_deadline_at: datetime
+    issued_at: datetime
+    deadline_at: datetime
+    fingerprint: StrictStr = Field(
+        ...,
+        min_length=FINGERPRINT_LENGTH,
+        max_length=FINGERPRINT_LENGTH,
+        pattern=_FINGERPRINT_RE,
+    )
+
+
+class ApprovalDecisionReceipt(ContractModel):
+    schema_version: Literal[CONTRACT_VERSION]
+    kind: Literal["approval.receipt"]
+    status: Literal["accepted", "duplicate"]
+    command_id: UUID
+    idempotency_key: UUID
+    approval_request_id: UUID
+    fingerprint: StrictStr = Field(
+        ...,
+        min_length=FINGERPRINT_LENGTH,
+        max_length=FINGERPRINT_LENGTH,
+        pattern=_FINGERPRINT_RE,
+    )
+
+
 class FoundryEventEnvelope(ContractModel):
     schema_version: Literal[CONTRACT_VERSION]
     kind: Literal[EVENT_KIND]
@@ -112,6 +236,7 @@ class FoundryEventEnvelope(ContractModel):
         "execution.completed",
         "execution.stopped",
         "execution.failed",
+        "execution.approval_resolved",
     ]
     payload: dict[str, Any]
     issued_at: datetime
@@ -201,14 +326,55 @@ def validate_command(command: ExecutionCommand) -> ExecutionCommand:
     if command.fingerprint != expected:
         raise RuntimeValidationError("command fingerprint does not match its envelope")
     _validate_utf8_size(command.payload.text, MAX_COMMAND_TEXT_BYTES, "command text")
+    if "files" in command.payload.model_fields_set and command.payload.files is None:
+        raise RuntimeValidationError("files must be omitted or a nonempty manifest")
+    if (
+        command.payload.files
+        and sum(file.size for file in command.payload.files) > 50_000_000
+    ):
+        raise RuntimeValidationError("file manifest exceeds the aggregate size limit")
+    if not command.payload.text and not command.payload.files:
+        raise RuntimeValidationError("execution input requires text or files")
     bootstrap = command.payload.bootstrap
     if bootstrap is not None:
         if command.conversation_turn_ordinal < 2:
             raise RuntimeValidationError(
                 "bootstrap is invalid before the second conversation turn"
             )
-        _validate_utf8_size(
-            bootstrap.text, MAX_COMMAND_TEXT_BYTES, "bootstrap text"
+        _validate_utf8_size(bootstrap.text, MAX_COMMAND_TEXT_BYTES, "bootstrap text")
+    return command
+
+
+def validate_approval_decision(
+    command: ApprovalDecisionCommand,
+) -> ApprovalDecisionCommand:
+    timestamps = (
+        command.decided_at,
+        command.acknowledgement_deadline_at,
+        command.issued_at,
+        command.deadline_at,
+    )
+    if any(value.tzinfo is None for value in timestamps):
+        raise RuntimeValidationError("approval timestamps must include a timezone")
+    if command.acknowledgement_deadline_at <= command.decided_at:
+        raise RuntimeValidationError("approval acknowledgement deadline is invalid")
+    if (
+        command.acknowledgement_deadline_at - command.decided_at
+    ).total_seconds() != MAX_APPROVAL_ACKNOWLEDGEMENT_SECONDS:
+        raise RuntimeValidationError("approval acknowledgement window is invalid")
+    lifetime = (command.deadline_at - command.issued_at).total_seconds()
+    if lifetime <= 0 or lifetime > MAX_CONTRACT_LIFETIME_SECONDS:
+        raise RuntimeValidationError(
+            "approval command deadline is outside the bounded window"
+        )
+    expected = canonical_fingerprint(
+        command.model_dump(
+            mode="json", exclude={"issued_at", "deadline_at", "fingerprint"}
+        )
+    )
+    if command.fingerprint != expected:
+        raise RuntimeValidationError(
+            "approval command fingerprint does not match its envelope"
         )
     return command
 
@@ -227,7 +393,7 @@ def validate_event(event: FoundryEventEnvelope) -> FoundryEventEnvelope:
     expected = event_fingerprint(event)
     if event.fingerprint != expected:
         raise RuntimeValidationError("event fingerprint does not match its envelope")
-    _validate_event_payload(event.event_type, event.payload)
+    _validate_event_payload(event.event_type, event.payload, issued_at=event.issued_at)
     return event
 
 
@@ -241,6 +407,11 @@ def event_envelope_bytes(event: FoundryEventEnvelope) -> bytes:
 def build_event_envelope(execution, attempt, event) -> FoundryEventEnvelope | None:
     """Translate one internal FND-007 event into a safe wire envelope."""
 
+    if event.event_type in {"routine.result", "routine.approval_requested"}:
+        from runtime.routine_contracts import build_routine_event_envelope
+
+        return build_routine_event_envelope(execution, attempt, event)
+
     event_type = {
         "execution.dispatched": "execution.accepted",
     }.get(event.event_type, event.event_type)
@@ -253,6 +424,7 @@ def build_event_envelope(execution, attempt, event) -> FoundryEventEnvelope | No
         "execution.completed",
         "execution.stopped",
         "execution.failed",
+        "execution.approval_resolved",
     }
     if event_type not in allowed:
         return None
@@ -273,7 +445,7 @@ def build_event_envelope(execution, attempt, event) -> FoundryEventEnvelope | No
         raise RuntimeValidationError(
             "event exceeds the bounded Cloud projection budget"
         )
-    payload = _wire_event_payload(event_type, event.payload)
+    payload = _wire_event_payload(event_type, event.payload, issued_at=event.created_at)
     envelope = FoundryEventEnvelope(
         schema_version=CONTRACT_VERSION,
         kind=EVENT_KIND,
@@ -331,16 +503,26 @@ def _validate_utf8_size(value: str, limit: int, name: str) -> None:
         raise RuntimeValidationError(f"{name} is too large")
 
 
-def _validate_event_payload(event_type: str, payload: Mapping[str, Any]) -> None:
+def _validate_event_payload(
+    event_type: str,
+    payload: Mapping[str, Any],
+    *,
+    issued_at: datetime | None = None,
+) -> None:
     if type(payload) is not dict:
         raise RuntimeValidationError("event payload must be an object")
     if event_type == "execution.accepted":
         if payload != {"status": "accepted"}:
             raise RuntimeValidationError("accepted event payload is invalid")
     elif event_type == "execution.awaiting_action":
-        action_kind = payload.get("action_kind")
-        if set(payload) != {"action_kind"} or not _safe_code(action_kind):
-            raise RuntimeValidationError("awaiting-action payload is invalid")
+        if set(payload) == {"action_kind"}:
+            if not _safe_code(payload.get("action_kind")):
+                raise RuntimeValidationError("awaiting-action payload is invalid")
+        else:
+            _validate_rich_approval(
+                payload,
+                issued_at=issued_at or datetime.now().astimezone(),
+            )
     elif event_type == "message.delta":
         if set(payload) != {"kind", "text"} or payload.get("kind") != "assistant_delta":
             raise RuntimeValidationError("message event payload is invalid")
@@ -349,11 +531,9 @@ def _validate_event_payload(event_type: str, payload: Mapping[str, Any]) -> None
             raise RuntimeValidationError("message event payload is invalid")
         _validate_utf8_size(text, MAX_EVENT_TEXT_BYTES, "event text")
     elif event_type == "activity.started":
-        if payload != {"kind": "tool"}:
-            raise RuntimeValidationError("activity start payload is invalid")
+        _validate_activity_payload(payload, completed=False)
     elif event_type == "activity.completed":
-        if payload != {"status": "completed"}:
-            raise RuntimeValidationError("activity completion payload is invalid")
+        _validate_activity_payload(payload, completed=True)
     elif event_type == "execution.completed":
         if payload != {"status": "completed"}:
             raise RuntimeValidationError("completion event payload is invalid")
@@ -366,9 +546,26 @@ def _validate_event_payload(event_type: str, payload: Mapping[str, Any]) -> None
             raise RuntimeValidationError("failure event payload is invalid")
         if type(payload.get("retryable")) is not bool:
             raise RuntimeValidationError("failure event payload is invalid")
+    elif event_type == "execution.approval_resolved":
+        if set(payload) != {"approval_request_id", "outcome"}:
+            raise RuntimeValidationError("approval resolution payload is invalid")
+        if _canonical_uuid_string(payload.get("approval_request_id")) is None:
+            raise RuntimeValidationError("approval resolution payload is invalid")
+        if payload.get("outcome") not in {
+            "approved",
+            "rejected",
+            "expired",
+            "cancelled",
+        }:
+            raise RuntimeValidationError("approval resolution payload is invalid")
 
 
-def _wire_event_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+def _wire_event_payload(
+    event_type: str,
+    payload: Mapping[str, Any],
+    *,
+    issued_at: datetime,
+) -> dict[str, Any]:
     if event_type == "execution.accepted":
         return {"status": "accepted"}
     if event_type == "message.delta":
@@ -377,9 +574,9 @@ def _wire_event_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str
             raise RuntimeValidationError("message event payload is invalid")
         return {"kind": "assistant_delta", "text": unicodedata.normalize("NFC", text)}
     if event_type == "activity.started":
-        return {"kind": "tool"}
+        return _activity_wire_payload(payload, completed=False)
     if event_type == "activity.completed":
-        return {"status": "completed"}
+        return _activity_wire_payload(payload, completed=True)
     if event_type == "execution.completed":
         return {"status": "completed"}
     if event_type == "execution.failed":
@@ -389,15 +586,19 @@ def _wire_event_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str
             raise RuntimeValidationError("failure event payload is invalid")
         return {"code": code, "retryable": retryable}
     if event_type == "execution.awaiting_action":
-        action_kind = payload.get("action_kind")
-        if not _safe_code(action_kind):
-            raise RuntimeValidationError("awaiting-action payload is invalid")
-        return {"action_kind": action_kind}
+        _validate_event_payload(event_type, payload, issued_at=issued_at)
+        return dict(payload)
     if event_type == "execution.stopped":
         reason = payload.get("reason")
         if not _safe_code(reason):
             raise RuntimeValidationError("stopped event payload is invalid")
         return {"reason": reason}
+    if event_type == "execution.approval_resolved":
+        _validate_event_payload(event_type, payload)
+        return {
+            "approval_request_id": payload["approval_request_id"],
+            "outcome": payload["outcome"],
+        }
     raise RuntimeValidationError("event type is not allowed for publication")
 
 
@@ -405,6 +606,131 @@ def _safe_code(value: Any) -> bool:
     return isinstance(value, str) and bool(
         re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value)
     )
+
+
+def _canonical_uuid_string(value: Any) -> UUID | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = UUID(value)
+    except ValueError:
+        return None
+    return parsed if str(parsed) == value else None
+
+
+def _validate_rich_approval(payload: Mapping[str, Any], *, issued_at: datetime) -> None:
+    required = {
+        "approval_request_id",
+        "action_kind",
+        "action_label",
+        "action_preview",
+        "expires_at",
+    }
+    if set(payload) != required:
+        raise RuntimeValidationError("rich awaiting-action payload is invalid")
+    if _canonical_uuid_string(payload.get("approval_request_id")) is None:
+        raise RuntimeValidationError("approval request identity is invalid")
+    if payload.get("action_kind") not in APPROVAL_ACTION_KINDS:
+        raise RuntimeValidationError("approval action kind is invalid")
+    label = payload.get("action_label")
+    if (
+        not isinstance(label, str)
+        or not 1 <= len(label) <= MAX_APPROVAL_LABEL_CHARS
+        or "\x00" in label
+    ):
+        raise RuntimeValidationError("approval action label is invalid")
+    preview = payload.get("action_preview")
+    if (
+        not isinstance(preview, str)
+        or not preview
+        or "\x00" in preview
+        or len(preview.encode("utf-8")) > MAX_APPROVAL_PREVIEW_BYTES
+    ):
+        raise RuntimeValidationError("approval action preview is invalid")
+    expires_at = payload.get("expires_at")
+    if not isinstance(expires_at, str):
+        raise RuntimeValidationError("approval expiry is invalid")
+    try:
+        parsed_expiry = datetime.fromisoformat(expires_at)
+    except ValueError as exc:
+        raise RuntimeValidationError("approval expiry is invalid") from exc
+    if parsed_expiry.tzinfo is None or issued_at.tzinfo is None:
+        raise RuntimeValidationError("approval timestamps must include a timezone")
+    lifetime = (parsed_expiry - issued_at).total_seconds()
+    if lifetime <= 0 or lifetime > MAX_APPROVAL_LIFETIME_SECONDS:
+        raise RuntimeValidationError("approval expiry is outside the bounded window")
+
+
+def _validate_activity_payload(payload: Mapping[str, Any], *, completed: bool) -> None:
+    """Validate the exact legacy-or-rich activity payload union."""
+
+    legacy = {"status": "completed"} if completed else {"kind": "tool"}
+    if payload == legacy:
+        return
+    required = {"activity_id", "activity_kind"}
+    if completed:
+        required.add("status")
+    allowed = required | {"activity_subject"}
+    if completed:
+        allowed.add("duration_ms")
+    if not required <= set(payload) <= allowed:
+        raise RuntimeValidationError(
+            "activity completion payload is invalid"
+            if completed
+            else "activity start payload is invalid"
+        )
+    subject = payload.get("activity_subject")
+    if subject is not None and (
+        not isinstance(subject, str)
+        or not 0 < len(subject) <= 80
+        or subject != subject.strip()
+        or not subject.isprintable()
+    ):
+        raise RuntimeValidationError("activity subject is invalid")
+    activity_id = payload.get("activity_id")
+    activity_kind = payload.get("activity_kind")
+    if (
+        not isinstance(activity_id, str)
+        or re.fullmatch(r"activity-[0-9a-f]{32}", activity_id) is None
+        or not isinstance(activity_kind, str)
+        or activity_kind not in ACTIVITY_KINDS
+    ):
+        raise RuntimeValidationError("activity identity or kind is invalid")
+    if completed and payload.get("status") not in {
+        "completed",
+        "failed",
+        "stopped",
+    }:
+        raise RuntimeValidationError("activity outcome is invalid")
+    if "duration_ms" in payload and (
+        type(payload["duration_ms"]) is not int
+        or not 0 <= payload["duration_ms"] <= 86_400_000
+    ):
+        raise RuntimeValidationError("activity duration is invalid")
+
+
+def _activity_wire_payload(
+    payload: Mapping[str, Any], *, completed: bool
+) -> dict[str, Any]:
+    legacy = {"status": "completed"} if completed else {"kind": "tool"}
+    if (
+        set(payload) == {"activity_id", *legacy}
+        and isinstance(payload["activity_id"], str)
+        and 0 < len(payload["activity_id"]) <= 128
+        and all(payload[key] == value for key, value in legacy.items())
+    ):
+        return legacy
+    _validate_activity_payload(payload, completed=completed)
+    if payload == ({"status": "completed"} if completed else {"kind": "tool"}):
+        return dict(payload)
+    fields = ["activity_id", "activity_kind"]
+    if "activity_subject" in payload:
+        fields.append("activity_subject")
+    if completed:
+        fields.append("status")
+        if "duration_ms" in payload:
+            fields.append("duration_ms")
+    return {field: payload[field] for field in fields}
 
 
 def _normalize_json(value: Any) -> Any:
@@ -428,17 +754,27 @@ def _normalize_json(value: Any) -> Any:
 
 
 __all__ = [
+    "ACTIVITY_KINDS",
+    "APPROVAL_ACTION_KINDS",
     "COMMAND_KIND",
     "CONTRACT_VERSION",
     "EVENT_KIND",
+    "MAX_APPROVAL_ACKNOWLEDGEMENT_SECONDS",
+    "MAX_APPROVAL_LABEL_CHARS",
+    "MAX_APPROVAL_LIFETIME_SECONDS",
+    "MAX_APPROVAL_PREVIEW_BYTES",
     "MAX_RUNTIME_EVENT_SEQUENCE",
     "MAX_TERMINAL_SEQUENCE",
+    "ApprovalDecisionCommand",
+    "ApprovalDecisionReceipt",
+    "ApprovalFoundryIdentity",
     "CloudCorrelation",
     "EventDeliveryReceipt",
     "ExecutionCommand",
     "ExecutionInput",
     "ExecutionReceipt",
     "ExecutionScope",
+    "FileInputV1",
     "FirstTurnBootstrap",
     "FoundryCorrelation",
     "FoundryEventEnvelope",
@@ -449,6 +785,7 @@ __all__ = [
     "command_fingerprint",
     "event_envelope_bytes",
     "event_fingerprint",
+    "validate_approval_decision",
     "validate_command",
     "validate_event",
     "validate_fingerprint",

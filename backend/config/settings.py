@@ -78,6 +78,26 @@ def env_positive_int(name: str, default: int, *, maximum: int = 86400) -> int:
     return value
 
 
+def env_nonnegative_int(name: str, default: int, *, maximum: int = 86400) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ImproperlyConfigured(f"{name} must be a nonnegative integer") from exc
+    if not 0 <= value <= maximum:
+        raise ImproperlyConfigured(f"{name} must be between 0 and {maximum}")
+    return value
+
+
+def _required_pool_text(name: str, *, max_length: int) -> str:
+    value = os.getenv(name, "").strip()
+    if not value or len(value) > max_length or "\x00" in value or "\r" in value:
+        raise ImproperlyConfigured(f"{name} is required when the ready pool is enabled")
+    return value
+
+
 DEBUG = env_bool("DJANGO_DEBUG", default=False)
 database_url = os.getenv("DATABASE_URL")
 
@@ -86,6 +106,76 @@ ALLIES_RUNTIME_IDLE_STOP_ENABLED = env_bool(
 )
 ALLIES_RUNTIME_POWER_PROOF_ENABLED = env_bool(
     "ALLIES_RUNTIME_POWER_PROOF_ENABLED", default=False
+)
+ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED = env_bool(
+    "ALLIES_RUNTIME_ACTIVITY_WAIT_ENABLED", default=True
+)
+ALLIES_RICH_APPROVALS_ENABLED = env_bool("ALLIES_RICH_APPROVALS_ENABLED", default=True)
+ALLIES_RUNTIME_REASONING_EFFORT = (
+    os.getenv("ALLIES_RUNTIME_REASONING_EFFORT", "xhigh").strip().lower()
+)
+if ALLIES_RUNTIME_REASONING_EFFORT not in {"high", "xhigh"}:
+    raise ImproperlyConfigured(
+        "ALLIES_RUNTIME_REASONING_EFFORT must be one of: high, xhigh"
+    )
+ALLIES_RUNTIME_ACTIVITY_WAIT_SECONDS = env_positive_int(
+    "ALLIES_RUNTIME_ACTIVITY_WAIT_SECONDS", 5, maximum=5
+)
+ALLIES_RUNTIME_ACTIVITY_WAIT_MAX_WAITERS = env_positive_int(
+    "ALLIES_RUNTIME_ACTIVITY_WAIT_MAX_WAITERS", 8, maximum=8
+)
+
+READY_WORKSPACE_POOL_TARGET = env_nonnegative_int(
+    "READY_WORKSPACE_POOL_TARGET", 0, maximum=8
+)
+READY_WORKSPACE_POOL_SLEEP_ENABLED = env_bool(
+    "READY_WORKSPACE_POOL_SLEEP_ENABLED", default=False
+)
+WORKSPACE_CPU_KIND = os.getenv("WORKSPACE_CPU_KIND", "shared").strip()
+if WORKSPACE_CPU_KIND not in {"shared", "performance"}:
+    raise ImproperlyConfigured("WORKSPACE_CPU_KIND must be shared or performance")
+WORKSPACE_CPUS = env_positive_int("WORKSPACE_CPUS", 2, maximum=16)
+WORKSPACE_MEMORY_MB = env_positive_int("WORKSPACE_MEMORY_MB", 2048, maximum=131072)
+WORKSPACE_VOLUME_SIZE_GB = env_positive_int(
+    "WORKSPACE_VOLUME_SIZE_GB", 3, maximum=1000
+)
+WORKSPACE_VOLUME_SIZE_LIMIT_GB = env_positive_int(
+    "WORKSPACE_VOLUME_SIZE_LIMIT_GB", 20, maximum=1000
+)
+if WORKSPACE_VOLUME_SIZE_LIMIT_GB < WORKSPACE_VOLUME_SIZE_GB:
+    raise ImproperlyConfigured(
+        "WORKSPACE_VOLUME_SIZE_LIMIT_GB must be at least WORKSPACE_VOLUME_SIZE_GB"
+    )
+READY_WORKSPACE_POOL_REGION = os.getenv("READY_WORKSPACE_POOL_REGION", "").strip()
+READY_WORKSPACE_POOL_RELEASE_FINGERPRINT = os.getenv(
+    "READY_WORKSPACE_POOL_RELEASE_FINGERPRINT", ""
+).strip()
+READY_WORKSPACE_POOL_MAX_PREPARING = env_positive_int(
+    "READY_WORKSPACE_POOL_MAX_PREPARING", 1, maximum=1
+)
+READY_WORKSPACE_POOL_MAX_ATTEMPTS = env_positive_int(
+    "READY_WORKSPACE_POOL_MAX_ATTEMPTS", 5, maximum=5
+)
+READY_WORKSPACE_POOL_READY_TTL_SECONDS = env_positive_int(
+    "READY_WORKSPACE_POOL_READY_TTL_SECONDS", 900
+)
+READY_WORKSPACE_POOL_HEALTH_FRESHNESS_SECONDS = env_positive_int(
+    "READY_WORKSPACE_POOL_HEALTH_FRESHNESS_SECONDS", 60
+)
+READY_WORKSPACE_POOL_PHASE_CLAIM_SECONDS = env_positive_int(
+    "READY_WORKSPACE_POOL_PHASE_CLAIM_SECONDS", 60, maximum=3600
+)
+
+if READY_WORKSPACE_POOL_TARGET:
+    READY_WORKSPACE_POOL_REGION = _required_pool_text(
+        "READY_WORKSPACE_POOL_REGION", max_length=64
+    )
+    READY_WORKSPACE_POOL_RELEASE_FINGERPRINT = _required_pool_text(
+        "READY_WORKSPACE_POOL_RELEASE_FINGERPRINT", max_length=255
+    )
+
+READY_WORKSPACE_POOL_CONFIG_VERSION = env_positive_int(
+    "READY_WORKSPACE_POOL_CONFIG_VERSION", 1, maximum=2**31 - 1
 )
 ALLIES_FLY_API_BASE_URL = os.getenv("ALLIES_FLY_API_BASE_URL")
 if ALLIES_FLY_API_BASE_URL:
@@ -124,7 +214,7 @@ if ALLIES_FLY_API_BASE_URL:
         )
 
 ALLIES_RUNTIME_KEEP_WARM_SECONDS = env_positive_int(
-    "ALLIES_RUNTIME_KEEP_WARM_SECONDS", 600
+    "ALLIES_RUNTIME_KEEP_WARM_SECONDS", 1800
 )
 ALLIES_RUNTIME_INTENT_TTL_SECONDS = env_positive_int(
     "ALLIES_RUNTIME_INTENT_TTL_SECONDS", 120
@@ -165,13 +255,36 @@ if not DEBUG and (
 ALLIES_CLOUD_EVENT_DELIVERY_ENABLED = env_bool(
     "ALLIES_CLOUD_EVENT_DELIVERY_ENABLED", default=False
 )
+ALLIES_RUNTIME_FILE_INPUT_ENABLED = env_bool(
+    "ALLIES_RUNTIME_FILE_INPUT_ENABLED", default=True
+)
+ALLIES_RUNTIME_FILE_PUBLICATION_ENABLED = env_bool(
+    "ALLIES_RUNTIME_FILE_PUBLICATION_ENABLED", default=True
+)
 ALLIES_CLOUD_URL = os.getenv("ALLIES_CLOUD_URL")
 ALLIES_CLOUD_EVENT_SERVICE_TOKEN = os.getenv("ALLIES_CLOUD_EVENT_SERVICE_TOKEN")
-if ALLIES_CLOUD_EVENT_DELIVERY_ENABLED:
+ALLIES_CLOUD_CREDENTIAL_TOKEN = os.getenv("ALLIES_CLOUD_CREDENTIAL_TOKEN")
+if ALLIES_CLOUD_CREDENTIAL_TOKEN and (
+    len(ALLIES_CLOUD_CREDENTIAL_TOKEN) < 32
+    or any(character.isspace() for character in ALLIES_CLOUD_CREDENTIAL_TOKEN)
+):
+    raise ImproperlyConfigured("ALLIES_CLOUD_CREDENTIAL_TOKEN must be a strong token")
+ALLIES_RUNTIME_READINESS_HINT_ENABLED = env_bool(
+    "ALLIES_RUNTIME_READINESS_HINT_ENABLED",
+    default=bool(ALLIES_CLOUD_URL and ALLIES_CLOUD_EVENT_SERVICE_TOKEN),
+)
+if (
+    ALLIES_CLOUD_EVENT_DELIVERY_ENABLED
+    or ALLIES_RUNTIME_READINESS_HINT_ENABLED
+    or (
+        (ALLIES_RUNTIME_FILE_INPUT_ENABLED or ALLIES_RUNTIME_FILE_PUBLICATION_ENABLED)
+        and (not DEBUG or ALLIES_CLOUD_URL or ALLIES_CLOUD_EVENT_SERVICE_TOKEN)
+    )
+):
     if not ALLIES_CLOUD_URL or not ALLIES_CLOUD_EVENT_SERVICE_TOKEN:
         raise ImproperlyConfigured(
             "ALLIES_CLOUD_URL and ALLIES_CLOUD_EVENT_SERVICE_TOKEN are required "
-            "when event delivery is enabled"
+            "when Cloud delivery is enabled"
         )
     try:
         cloud_url = urlsplit(ALLIES_CLOUD_URL)
@@ -216,10 +329,10 @@ PROFILE_PROVISIONING_PROVIDER = env_profile_text(
     max_length=128,  # gitleaks:allow - provider identifier, not a credential
 )
 PROFILE_PROVISIONING_MODEL = env_profile_text(
-    "PROFILE_PROVISIONING_MODEL", "gpt-5.6-luna", max_length=255
+    "PROFILE_PROVISIONING_MODEL", "openai/gpt-6-luna", max_length=255
 )
 PROFILE_PROVISIONING_BASE_URL = env_profile_text(
-    "PROFILE_PROVISIONING_BASE_URL", "https://api.openai.com/v1", max_length=512
+    "PROFILE_PROVISIONING_BASE_URL", "https://openrouter.ai/api/v1", max_length=512
 )
 if not re.fullmatch(
     r"[a-z][a-z0-9+.-]{1,31}://[^\s]{1,507}",
@@ -422,6 +535,9 @@ SECURE_PROXY_SSL_HEADER = (
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
 SECURE_SSL_REDIRECT = not DEBUG and TRUST_PROXY_HEADERS
+SECURE_REDIRECT_EXEMPT = (
+    [r"^healthz$"] if env_bool("DJANGO_HEALTHCHECK_ALLOW_HTTP", default=False) else []
+)
 SECURE_HSTS_SECONDS = 31_536_000 if SECURE_SSL_REDIRECT else 0
 SECURE_HSTS_INCLUDE_SUBDOMAINS = SECURE_HSTS_SECONDS > 0
 SECURE_HSTS_PRELOAD = SECURE_HSTS_SECONDS > 0

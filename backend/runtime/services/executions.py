@@ -18,6 +18,7 @@ from runtime.exceptions import (
 )
 from runtime.models import ConversationBinding, Execution, RuntimeProfile, Workspace
 
+from .activity import advance_workspace_activity
 from .retry import run_with_sqlite_lock_retry
 from .runtime_intents import request_execution_wake_locked
 from .validation import (
@@ -45,7 +46,9 @@ def create_execution(
     )
     payload_digest = digest_payload(payload)
     try:
-        profile = RuntimeProfile.objects.select_related("workspace").get(pk=profile_id)
+        profile = run_with_sqlite_lock_retry(
+            lambda: RuntimeProfile.objects.only("workspace_id").get(pk=profile_id)
+        )
     except RuntimeProfile.DoesNotExist as exc:
         raise RuntimeValidationError("profile does not exist") from exc
     if profile.workspace_id != workspace_id:
@@ -154,6 +157,8 @@ def _create_contract_execution_once(
     profile = RuntimeProfile.objects.select_for_update().get(
         pk=profile_id, workspace_id=workspace.id
     )
+    if profile.cleanup_requires_quiescence:
+        raise RuntimeConflictError("profile deletion is in progress")
     if profile.ally_ref != str(command.cloud.ally_id):
         raise RuntimeNotFoundError("execution binding is unavailable")
     _ensure_conversation_binding(
@@ -183,6 +188,10 @@ def _create_contract_execution_once(
         "message": command.payload.text,
         "cloud_conversation_ref": str(command.cloud.conversation_id),
     }
+    if command.payload.files is not None:
+        payload["files"] = [
+            file.model_dump(mode="json") for file in command.payload.files
+        ]
     if command.payload.bootstrap is not None:
         payload["bootstrap"] = command.payload.bootstrap.model_dump(
             mode="json", exclude_none=True
@@ -208,6 +217,7 @@ def _create_contract_execution_once(
         raise RuntimeConflictError(
             "execution identity conflicts with existing state"
         ) from exc
+    advance_workspace_activity(workspace)
     request_execution_wake_locked(workspace)
     return execution, True
 
@@ -245,6 +255,8 @@ def _create_execution_once(
     profile = RuntimeProfile.objects.select_for_update().get(
         pk=profile_id, workspace_id=workspace.id
     )
+    if profile.cleanup_requires_quiescence:
+        raise RuntimeConflictError("profile deletion is in progress")
     conversation_ref = payload.get("cloud_conversation_ref")
     if conversation_ref is not None:
         validate_nonempty(
@@ -262,6 +274,7 @@ def _create_execution_once(
                 input_payload=payload,
                 payload_digest=payload_digest,
             )
+            advance_workspace_activity(workspace)
             request_execution_wake_locked(workspace)
             return execution
     except IntegrityError:

@@ -155,6 +155,8 @@ class VolumeMount:
     volume_id: str
     path: str = "/opt/data"
     read_only: bool = False
+    # When set, Fly grows the Volume in place up to this size as it fills.
+    size_limit_gb: int | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.volume_id, "mount volume id")
@@ -163,6 +165,10 @@ class VolumeMount:
             raise ValueError("mount path must be absolute")
         if type(self.read_only) is not bool:
             raise ValueError("mount read_only must be a boolean")
+        if self.size_limit_gb is not None and (
+            type(self.size_limit_gb) is not int or self.size_limit_gb <= 0
+        ):
+            raise ValueError("mount size_limit_gb must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,11 +250,20 @@ class MachineSpec:
     foundry_runtime_credential_ref: OpaqueReference | str | None = None
     foundry_runtime_credential_secret_name: str | None = None
     public_services: tuple[str, ...] = ()
+    cpu_kind: str = "shared"
+    cpus: int = 1
+    memory_mb: int = 1024
 
     def __post_init__(self) -> None:
         _identifier(self.app_name, "machine app name")
         _identifier(self.name, "machine name")
         _identifier(self.region, "machine region")
+        if self.cpu_kind not in {"shared", "performance"}:
+            raise ValueError("invalid machine CPU kind")
+        if type(self.cpus) is not int or not 1 <= self.cpus <= 16:
+            raise ValueError("machine CPUs must be between 1 and 16")
+        if type(self.memory_mb) is not int or not 1 <= self.memory_mb <= 131072:
+            raise ValueError("machine memory must be between 1 and 131072 MB")
         if not isinstance(self.containers, tuple):
             object.__setattr__(self, "containers", tuple(self.containers))
         if not self.containers:
@@ -364,6 +379,9 @@ class MachineRecord:
     ownership: OwnershipMetadata | None = None
     health: MachineHealth | None = None
     images: Mapping[str, str] = field(default_factory=dict)
+    cpu_kind: str | None = None
+    cpus: int | None = None
+    memory_mb: int | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.id, "machine id")

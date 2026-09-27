@@ -26,6 +26,7 @@ from runtime.models import (
     ExecutionStatus,
     Lease,
     LeaseState,
+    ProvisioningHintDelivery,
     RuntimeProfile,
     RuntimeProfileLifecycleState,
     Workspace,
@@ -34,6 +35,7 @@ from runtime.models import (
 from runtime.profile_keys import derive_hermes_profile_key
 from runtime.services.leases import acknowledge_stopped, create_lease
 from runtime.services.profiles import (
+    DEFAULT_COMPRESSION_THRESHOLD_TOKENS,
     ProfileSeed,
     accept_cleanup_receipt,
     accept_materialization_receipt,
@@ -42,6 +44,7 @@ from runtime.services.profiles import (
     list_profile_reconciliation,
     request_profile_cleanup,
 )
+from runtime.services.provisioning_hints import claim_provisioning_hint_deliveries
 from runtime.services.runtime_auth import (
     authenticate_runtime_token,
     issue_runtime_credential,
@@ -80,12 +83,71 @@ def test_profile_fingerprint_contract_includes_memory_policy(ready_workspace):
         ),
     )
 
-    assert receipt.seed_fingerprint == (
-        "cd995ea7543b218b8380d61d6b051548da09af3a13a9bfcc529b33fca9a95db9"
-    )
     desired = list_profile_reconciliation(_context(ready_workspace)[0])[0]
+    assert receipt.seed_fingerprint == desired.seed_fingerprint
     assert desired.seed_payload["memory_provider"] == "allies_mnemosyne"
     assert desired.seed_payload["memory_policy_version"] == "allies-mnemosyne-v1"
+
+
+def test_profile_fingerprint_contract_includes_compression_threshold(
+    ready_workspace,
+):
+    profile_id = UUID("00000000-0000-0000-0000-000000000001")
+    receipt = ensure_runtime_profile(
+        ready_workspace.id,
+        profile_id,
+        "ally-a",
+        ProfileSeed(
+            personality="p",
+            provider="openai",
+            model="gpt-test",
+            first_chat_instruction="i",
+            credential_refs={"PROVIDER_API": "vault://p"},
+        ),
+    )
+
+    desired = list_profile_reconciliation(_context(ready_workspace)[0])[0]
+    assert receipt.seed_fingerprint == desired.seed_fingerprint
+    assert desired.seed_payload["compression_threshold_tokens"] == 100_000
+    with pytest.raises(RuntimeValidationError):
+        ensure_runtime_profile(
+            ready_workspace.id,
+            uuid4(),
+            "ally-b",
+            ProfileSeed(
+                personality="p",
+                provider="openai",
+                model="gpt-test",
+                first_chat_instruction="i",
+                credential_refs={"PROVIDER_API": "vault://p"},
+                compression_threshold_tokens=50_000,
+            ),
+        )
+
+
+def test_seed_fingerprint_matches_runtime_mirror():
+    from runtime.services.profiles import _seed_fingerprint
+
+    profile_id = UUID("00000000-0000-0000-0000-000000000001")
+    key = derive_hermes_profile_key(profile_id)
+    backend_seed = ProfileSeed(
+        personality="p",
+        provider="openai",
+        model="gpt-test",
+        first_chat_instruction="i",
+        credential_refs={"PROVIDER_API": "vault://p"},
+    )
+    assert backend_seed.compression_threshold_tokens == (
+        DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    )
+    assert DEFAULT_COMPRESSION_THRESHOLD_TOKENS == 100_000
+    # Pinned against the runtime mirror (allies_runtime.profile_store):
+    # both sides must hash the identical canonical payload, compression
+    # block included. The runtime test pins the same digest.
+    assert (
+        _seed_fingerprint(profile_id, key, "ally-a", backend_seed.payload())
+        == "dc579a4739785ecdd41a3bc82ca11ed55eae79e178cd3206f47d37f4e624945d"
+    )
 
 
 @pytest.fixture
@@ -209,6 +271,37 @@ def test_reconciliation_receipt_is_stable_and_exposes_no_secret(ready_workspace,
             created.seed_fingerprint,
             "repair_required",
         )
+
+
+def test_readiness_hint_claim_routes_cloud_tenant_reference(ready_workspace, seed):
+    cloud_workspace_id = str(uuid4())
+    Workspace.objects.filter(pk=ready_workspace.id).update(
+        tenant_ref=cloud_workspace_id
+    )
+    ready_workspace.refresh_from_db()
+    profile_id = uuid4()
+    created = ensure_runtime_profile(ready_workspace.id, profile_id, "ally-a", seed)
+    context, _issued = _context(ready_workspace)
+
+    receipt = accept_materialization_receipt(
+        context,
+        profile_id,
+        uuid4(),
+        created.lifecycle_epoch,
+        1,
+        created.seed_fingerprint,
+        "created",
+    )
+    delivery = ProvisioningHintDelivery.objects.get(runtime_profile_id=profile_id)
+    claims = claim_provisioning_hint_deliveries(
+        now=timezone.now() + timedelta(seconds=1)
+    )
+
+    assert receipt.receipt_id == delivery.receipt_id
+    assert len(claims) == 1
+    assert str(ready_workspace.id) != cloud_workspace_id
+    assert claims[0].workspace_id == cloud_workspace_id
+    assert claims[0].payload()["workspace_id"] == cloud_workspace_id
 
 
 def test_pending_profile_blocks_claim_reconciliation_until_receipt(

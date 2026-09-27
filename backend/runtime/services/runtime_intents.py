@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
@@ -8,6 +9,7 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
+from observability.events import emit_event
 from runtime.exceptions import (
     RuntimeConflictError,
     RuntimeIdempotencyConflictError,
@@ -16,6 +18,9 @@ from runtime.exceptions import (
 )
 from runtime.models import (
     IN_FLIGHT_PROVISIONING_PHASES,
+    Execution,
+    ReadyWorkspaceBundle,
+    ReadyWorkspaceBundleState,
     RuntimeIntent,
     RuntimeIntentOutcome,
     RuntimeIntentType,
@@ -27,6 +32,7 @@ from runtime.models import (
 
 from .retry import run_with_sqlite_lock_retry
 from .runtime_readiness import is_runtime_ready
+from .timing import emit_timing_event
 
 WORKSPACE_INTENT_LIMIT = 30
 WORKSPACE_INTENT_PERIOD_SECONDS = 60
@@ -50,24 +56,63 @@ def request_runtime_intent(
 ) -> RuntimeIntentReceipt:
     workspace_uuid = _uuid(workspace_id, "workspace_id")
     key = _uuid(idempotency_key, "idempotency_key")
-    if intent != RuntimeIntentType.COMPOSING_STARTED:
-        raise RuntimeValidationError("intent is not supported")
-    if not isinstance(received_at, datetime) or timezone.is_naive(received_at):
-        raise RuntimeValidationError("received_at must include a timezone")
-    observed_at = now or timezone.now()
-    if timezone.is_naive(observed_at):
-        raise RuntimeValidationError("now must include a timezone")
-    return run_with_sqlite_lock_retry(
-        lambda: _request_runtime_intent_once(
-            workspace_uuid, key, received_at, observed_at
-        )
+    started_at = time.monotonic()
+    _emit_intent_timing(
+        "runtime.operation.started",
+        operation="runtime.intent",
+        workspace_id=workspace_uuid,
+        request_id=key,
+        outcome="started",
     )
+    try:
+        try:
+            intent_type = RuntimeIntentType(intent)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeValidationError("intent is not supported") from exc
+        if not isinstance(received_at, datetime) or timezone.is_naive(received_at):
+            raise RuntimeValidationError("received_at must include a timezone")
+        observed_at = now or timezone.now()
+        if timezone.is_naive(observed_at):
+            raise RuntimeValidationError("now must include a timezone")
+        receipt = run_with_sqlite_lock_retry(
+            lambda: _request_runtime_intent_once(
+                workspace_uuid, key, intent_type, received_at, observed_at
+            )
+        )
+    except BaseException as error:
+        _emit_intent_timing(
+            "runtime.operation.failed",
+            operation="runtime.intent",
+            workspace_id=workspace_uuid or workspace_id,
+            request_id=key,
+            duration_ms=(time.monotonic() - started_at) * 1000,
+            outcome="error",
+            error_type=type(error).__name__,
+            error_code=getattr(error, "code", None),
+        )
+        raise
+
+    def emit_committed() -> None:
+        _emit_intent_timing(
+            "runtime.operation.succeeded",
+            operation="runtime.intent",
+            workspace_id=workspace_uuid,
+            request_id=key,
+            correlation_id=receipt.operation_id,
+            duration_ms=(time.monotonic() - started_at) * 1000,
+            outcome=receipt.status,
+            reason_code="replayed" if receipt.replayed else None,
+        )
+
+    transaction.on_commit(emit_committed)
+    return receipt
 
 
 @transaction.atomic
 def _request_runtime_intent_once(
     workspace_id: UUID,
     idempotency_key: UUID,
+    intent_type: RuntimeIntentType,
     received_at: datetime,
     now: datetime,
 ) -> RuntimeIntentReceipt:
@@ -81,7 +126,7 @@ def _request_runtime_intent_once(
         .first()
     )
     if existing is not None:
-        if existing.intent_type != RuntimeIntentType.COMPOSING_STARTED:
+        if existing.intent_type != intent_type:
             raise RuntimeIdempotencyConflictError(
                 "idempotency key already identifies a different intent"
             )
@@ -112,6 +157,7 @@ def _request_runtime_intent_once(
             delete_after,
             RuntimeIntentOutcome.FAILED,
             None,
+            intent_type=intent_type,
         )
 
     window_start = now - timedelta(seconds=WORKSPACE_INTENT_PERIOD_SECONDS)
@@ -130,6 +176,7 @@ def _request_runtime_intent_once(
             delete_after,
             RuntimeIntentOutcome.RATE_LIMITED,
             None,
+            intent_type=intent_type,
         )
 
     if is_runtime_ready(workspace, now=now):
@@ -143,6 +190,7 @@ def _request_runtime_intent_once(
             delete_after,
             RuntimeIntentOutcome.ALREADY_READY,
             None,
+            intent_type=intent_type,
         )
 
     if workspace.provisioning_phase in IN_FLIGHT_PROVISIONING_PHASES:
@@ -154,6 +202,7 @@ def _request_runtime_intent_once(
             delete_after,
             RuntimeIntentOutcome.FAILED,
             None,
+            intent_type=intent_type,
         )
 
     if not _has_existing_binding(workspace):
@@ -165,6 +214,7 @@ def _request_runtime_intent_once(
             delete_after,
             RuntimeIntentOutcome.FIRST_PROVISION_REQUIRED,
             None,
+            intent_type=intent_type,
         )
 
     if workspace.runtime_operation_state != RuntimeOperationState.IDLE:
@@ -201,6 +251,7 @@ def _request_runtime_intent_once(
             delete_after,
             RuntimeIntentOutcome.WAKING,
             operation_id,
+            intent_type=intent_type,
         )
 
     cooldown_seconds = getattr(
@@ -217,6 +268,7 @@ def _request_runtime_intent_once(
             delete_after,
             RuntimeIntentOutcome.RATE_LIMITED,
             None,
+            intent_type=intent_type,
         )
 
     operation_id = uuid4()
@@ -245,6 +297,7 @@ def _request_runtime_intent_once(
         delete_after,
         RuntimeIntentOutcome.WAKING,
         operation_id,
+        intent_type=intent_type,
     )
 
 
@@ -313,6 +366,71 @@ def request_execution_wake_locked(
     )
 
 
+def request_onboarding_wake_locked(
+    workspace: Workspace,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Queue the durable first wake for a permanently assigned pool row."""
+
+    observed_at = now or timezone.now()
+    if timezone.is_naive(observed_at):
+        raise RuntimeValidationError("now must include a timezone")
+    bundle = (
+        ReadyWorkspaceBundle.objects.filter(
+            workspace_id=workspace.id,
+            state=ReadyWorkspaceBundleState.ASSIGNED,
+        )
+        .first()
+    )
+    if (
+        bundle is None
+        or workspace.tenant_ref.startswith("pool:")
+        or bundle.safe_error_code == "onboarding_wake_exhausted"
+    ):
+        return
+    if workspace.runtime_operation_state == RuntimeOperationState.IDLE:
+        workspace.runtime_operation_id = uuid4()
+        workspace.runtime_operation_state = RuntimeOperationState.REQUESTED
+        workspace.runtime_operation_trigger = RuntimeOperationTrigger.ONBOARDING
+        workspace.runtime_operation_requested_at = observed_at
+        workspace.runtime_operation_retry_count = 0
+    elif workspace.runtime_operation_state == RuntimeOperationState.STOPPING:
+        workspace.runtime_operation_id = uuid4()
+        workspace.runtime_operation_state = RuntimeOperationState.REQUESTED
+        workspace.runtime_operation_trigger = RuntimeOperationTrigger.ONBOARDING
+        workspace.runtime_operation_requested_at = observed_at
+        workspace.runtime_operation_retry_count = 0
+        workspace.activation_claim_token = None
+        workspace.activation_claim_expires_at = None
+    elif workspace.runtime_operation_trigger != RuntimeOperationTrigger.ONBOARDING:
+        return
+    workspace.ready_generation = None
+    workspace.ready_start_epoch = None
+    workspace.ready_boot_id = None
+    workspace.ready_at = None
+    workspace.runtime_last_seen_at = None
+    _extend_keep_warm(workspace, observed_at)
+    workspace.save(
+        update_fields=[
+            "runtime_operation_id",
+            "runtime_operation_state",
+            "runtime_operation_trigger",
+            "runtime_operation_requested_at",
+            "runtime_operation_retry_count",
+            "activation_claim_token",
+            "activation_claim_expires_at",
+            "ready_generation",
+            "ready_start_epoch",
+            "ready_boot_id",
+            "ready_at",
+            "runtime_last_seen_at",
+            "speculative_keep_warm_until",
+            "updated_at",
+        ]
+    )
+
+
 def request_activation_recovery_wake(
     workspace_id: UUID | str,
     activation_claim_token: str,
@@ -341,9 +459,8 @@ def request_activation_recovery_wake(
         for value in (observed_app_ref, observed_machine_ref)
     ):
         raise RuntimeValidationError("observed provider references are required")
-    if (
-        observed_volume_ref is not None
-        and (not isinstance(observed_volume_ref, str) or not observed_volume_ref)
+    if observed_volume_ref is not None and (
+        not isinstance(observed_volume_ref, str) or not observed_volume_ref
     ):
         raise RuntimeValidationError("observed_volume_ref must be non-empty")
     if (
@@ -430,7 +547,35 @@ def _request_activation_recovery_wake_once(
     workspace.ready_boot_id = None
     workspace.ready_at = None
     workspace.runtime_last_seen_at = None
-    request_execution_wake_locked(workspace, now=observed_at)
+    assigned_bundle = ReadyWorkspaceBundle.objects.filter(
+        workspace_id=workspace.id,
+        state=ReadyWorkspaceBundleState.ASSIGNED,
+    ).first()
+    queued_execution = Execution.objects.filter(
+        workspace_id=workspace.id,
+        status="queued",
+    ).exists()
+    onboarding_recovery = bool(
+        assigned_bundle is not None
+        and not workspace.tenant_ref.startswith("pool:")
+        and not queued_execution
+        and (
+            workspace.runtime_operation_state == RuntimeOperationState.IDLE
+            or workspace.runtime_operation_state == RuntimeOperationState.STOPPING
+            or workspace.runtime_operation_trigger
+            == RuntimeOperationTrigger.ONBOARDING
+        )
+    )
+    if onboarding_recovery:
+        if assigned_bundle.safe_error_code in {
+            "onboarding_wake_failed",
+            "onboarding_wake_exhausted",
+        }:
+            assigned_bundle.safe_error_code = None
+            assigned_bundle.save(update_fields=["safe_error_code", "updated_at"])
+        request_onboarding_wake_locked(workspace, now=observed_at)
+    else:
+        request_execution_wake_locked(workspace, now=observed_at)
     workspace.save(
         update_fields=[
             "ready_generation",
@@ -464,12 +609,14 @@ def _create_intent(
     delete_after: datetime,
     outcome: str,
     operation_id: UUID | None,
+    *,
+    intent_type: RuntimeIntentType = RuntimeIntentType.COMPOSING_STARTED,
 ) -> RuntimeIntentReceipt:
     try:
         RuntimeIntent.objects.create(
             workspace=workspace,
             idempotency_key=idempotency_key,
-            intent_type=RuntimeIntentType.COMPOSING_STARTED,
+            intent_type=intent_type,
             received_at=received_at,
             expires_at=expires_at,
             delete_after=delete_after,
@@ -490,6 +637,40 @@ def _has_existing_binding(workspace: Workspace) -> bool:
     )
 
 
+def _has_wake_demand(
+    workspace: Workspace,
+    now: datetime | None = None,
+) -> bool:
+    """Return whether a durable operation still has an owner-side demand."""
+
+    observed_at = now or timezone.now()
+    current_trigger = workspace.runtime_operation_trigger
+    if current_trigger == RuntimeOperationTrigger.ONBOARDING:
+        bundle = ReadyWorkspaceBundle.objects.filter(
+            workspace_id=workspace.id,
+            state=ReadyWorkspaceBundleState.ASSIGNED,
+        ).first()
+        return bool(
+            bundle is not None
+            and not workspace.tenant_ref.startswith("pool:")
+            and bundle.safe_error_code != "onboarding_wake_exhausted"
+            and not is_runtime_ready(workspace, now=observed_at)
+        )
+    if current_trigger == RuntimeOperationTrigger.EXECUTION:
+        return Execution.objects.filter(
+            workspace_id=workspace.id,
+            status="queued",
+        ).exists()
+    if current_trigger == RuntimeOperationTrigger.SPECULATIVE:
+        return RuntimeIntent.objects.filter(
+            workspace_id=workspace.id,
+            coalesced_operation_id=workspace.runtime_operation_id,
+            outcome=RuntimeIntentOutcome.WAKING,
+            expires_at__gte=observed_at,
+        ).exists()
+    return False
+
+
 def _extend_keep_warm(workspace: Workspace, now: datetime) -> None:
     seconds = getattr(settings, "ALLIES_RUNTIME_KEEP_WARM_SECONDS", 600)
     deadline = now + timedelta(seconds=seconds)
@@ -506,10 +687,23 @@ def _uuid(value: UUID | str, name: str) -> UUID:
         raise RuntimeValidationError(f"{name} must be a UUID") from exc
 
 
+def _emit_intent_timing(event_name: str, **fields: object) -> None:
+    """Emit a bounded intent event without affecting intent persistence."""
+
+    emit_timing_event(
+        event_name,
+        emitter=emit_event,
+        identifier_names=("workspace_id", "request_id", "correlation_id"),
+        **fields,
+    )
+
+
 __all__ = [
     "RuntimeIntentReceipt",
+    "_has_wake_demand",
     "cleanup_runtime_intents",
     "request_activation_recovery_wake",
     "request_execution_wake_locked",
+    "request_onboarding_wake_locked",
     "request_runtime_intent",
 ]
