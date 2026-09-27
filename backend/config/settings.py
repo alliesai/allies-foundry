@@ -137,8 +137,15 @@ if WORKSPACE_CPU_KIND not in {"shared", "performance"}:
 WORKSPACE_CPUS = env_positive_int("WORKSPACE_CPUS", 2, maximum=16)
 WORKSPACE_MEMORY_MB = env_positive_int("WORKSPACE_MEMORY_MB", 2048, maximum=131072)
 WORKSPACE_VOLUME_SIZE_GB = env_positive_int(
-    "WORKSPACE_VOLUME_SIZE_GB", 10, maximum=1000
+    "WORKSPACE_VOLUME_SIZE_GB", 3, maximum=1000
 )
+WORKSPACE_VOLUME_SIZE_LIMIT_GB = env_positive_int(
+    "WORKSPACE_VOLUME_SIZE_LIMIT_GB", 20, maximum=1000
+)
+if WORKSPACE_VOLUME_SIZE_LIMIT_GB < WORKSPACE_VOLUME_SIZE_GB:
+    raise ImproperlyConfigured(
+        "WORKSPACE_VOLUME_SIZE_LIMIT_GB must be at least WORKSPACE_VOLUME_SIZE_GB"
+    )
 READY_WORKSPACE_POOL_REGION = os.getenv("READY_WORKSPACE_POOL_REGION", "").strip()
 READY_WORKSPACE_POOL_RELEASE_FINGERPRINT = os.getenv(
     "READY_WORKSPACE_POOL_RELEASE_FINGERPRINT", ""
@@ -322,10 +329,10 @@ PROFILE_PROVISIONING_PROVIDER = env_profile_text(
     max_length=128,  # gitleaks:allow - provider identifier, not a credential
 )
 PROFILE_PROVISIONING_MODEL = env_profile_text(
-    "PROFILE_PROVISIONING_MODEL", "gpt-5.6-luna", max_length=255
+    "PROFILE_PROVISIONING_MODEL", "openai/gpt-6-luna", max_length=255
 )
 PROFILE_PROVISIONING_BASE_URL = env_profile_text(
-    "PROFILE_PROVISIONING_BASE_URL", "https://api.openai.com/v1", max_length=512
+    "PROFILE_PROVISIONING_BASE_URL", "https://openrouter.ai/api/v1", max_length=512
 )
 if not re.fullmatch(
     r"[a-z][a-z0-9+.-]{1,31}://[^\s]{1,507}",
