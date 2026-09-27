@@ -149,6 +149,21 @@ def test_profile_provisioning_defaults_to_hermes_openai_api_provider():
     assert result.stdout.splitlines()[-2] == "openai-api"
 
 
+def test_profile_provisioning_defaults_to_openrouter_gpt6():
+    result = run_settings_probe(
+        DJANGO_DEBUG="true",
+        probe=(
+            "import config.settings as settings\n"
+            "print(settings.PROFILE_PROVISIONING_MODEL)\n"
+            "print(settings.PROFILE_PROVISIONING_BASE_URL)\n"
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-2] == "openai/gpt-6-luna"
+    assert result.stdout.splitlines()[-1] == "https://openrouter.ai/api/v1"
+
+
 def test_runtime_reasoning_effort_defaults_to_xhigh_and_accepts_high():
     default = run_settings_probe(DJANGO_DEBUG="true")
     high = run_settings_probe(
@@ -540,11 +555,11 @@ def test_workspace_capacity_defaults_and_idle_window(monkeypatch):
         "PROBE",
         "import config.settings as s; print(s.WORKSPACE_CPU_KIND, s.WORKSPACE_CPUS, "
         "s.WORKSPACE_MEMORY_MB, s.WORKSPACE_VOLUME_SIZE_GB, "
-        "s.ALLIES_RUNTIME_KEEP_WARM_SECONDS)",
+        "s.WORKSPACE_VOLUME_SIZE_LIMIT_GB, s.ALLIES_RUNTIME_KEEP_WARM_SECONDS)",
     )
     result = run_settings_probe(DJANGO_DEBUG="true")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "shared 2 2048 10 1800"
+    assert result.stdout.strip() == "shared 2 2048 3 20 1800"
 
 
 @pytest.mark.parametrize(
@@ -554,6 +569,8 @@ def test_workspace_capacity_defaults_and_idle_window(monkeypatch):
         {"WORKSPACE_CPUS": "17"},
         {"WORKSPACE_MEMORY_MB": "-1"},
         {"WORKSPACE_VOLUME_SIZE_GB": "0"},
+        {"WORKSPACE_VOLUME_SIZE_LIMIT_GB": "0"},
+        {"WORKSPACE_VOLUME_SIZE_GB": "30", "WORKSPACE_VOLUME_SIZE_LIMIT_GB": "20"},
         {"WORKSPACE_CPU_KIND": "unknown"},
     ],
 )

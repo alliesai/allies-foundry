@@ -178,6 +178,9 @@ COPY plugins/routines/ /opt/hermes/plugins/routines/
 COPY allies_routines.py /opt/hermes/tools/allies_routines.py
 COPY plugins/gmail/ /opt/hermes/plugins/gmail/
 COPY allies_gmail.py /opt/hermes/tools/allies_gmail.py
+COPY plugins/safe-inputs/ /opt/hermes/plugins/safe-inputs/
+COPY allies_safe_inputs.py /opt/hermes/tools/allies_safe_inputs.py
+COPY allies_browser_provider.py /opt/hermes/plugins/browser/browser_use/provider.py
 COPY patches/routine-management-tool.patch /tmp/allies-routine-management-tool.patch
 RUN cd /opt/hermes \
     && sed -i 's/\r$//' /tmp/allies-routine-management-tool.patch \
@@ -219,6 +222,10 @@ RUN cd /opt/hermes \
     && git apply --check --whitespace=nowarn /tmp/allies-platform-layer.patch \
     && git apply --whitespace=nowarn /tmp/allies-platform-layer.patch \
     && rm -f /tmp/allies-platform-layer.patch
+
+COPY patches/activity-detail.patch /tmp/allies-activity-detail.patch
+COPY smoke_activity_detail.py /tmp/allies-smoke-activity-detail.py
+RUN cd /opt/hermes     && sed -i 's/$//' /tmp/allies-activity-detail.patch     && git apply --check --whitespace=nowarn /tmp/allies-activity-detail.patch     && git apply --whitespace=nowarn /tmp/allies-activity-detail.patch     && rm -f /tmp/allies-activity-detail.patch     && PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python /tmp/allies-smoke-activity-detail.py     && rm -f /tmp/allies-smoke-activity-detail.py
 
 # Version stamp for the refresh gate: source SHA plus the full overlay patch
 # set, so any Hermes code or config change retires live session prompts once.

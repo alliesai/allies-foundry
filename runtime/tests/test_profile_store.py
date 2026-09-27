@@ -32,6 +32,7 @@ from allies_runtime.profile_store import (
     _process_is_alive,
     _read_lock_metadata,
     _replace_legacy_compression_config,
+    _replace_legacy_model_config,
     derive_profile_key,
     inspect_profile,
     validate_profile_key,
@@ -754,6 +755,165 @@ def test_replace_legacy_compression_config_edge_cases():
     ] == {"threshold_tokens": 100_000}
     with pytest.raises(ValueError):
         _replace_legacy_compression_config(b"compression:\n  threshold_tokens: 1\n", seed)
+
+
+def _openrouter_seed(**overrides):
+    return replace(
+        make_seed(),
+        provider="openai-api",
+        model="openai/gpt-6-luna",
+        base_url="https://openrouter.ai/api/v1",
+        **overrides,
+    )
+
+
+def test_legacy_model_default_is_upgraded_without_replacing_profile_state(tmp_path):
+    store, seed = make_store(tmp_path), _openrouter_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = seed.legacy_model_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["model"] = {
+        "provider": "openai-api",
+        "default": "gpt-5.6-luna",
+        "base_url": "https://api.openai.com/v1",
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    marker = profile_path(store, seed) / "sessions" / "preserved"
+    marker.write_text("keep", encoding="utf-8")
+
+    receipt = store.materialize(seed)
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    assert marker.read_text(encoding="utf-8") == "keep"
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == seed.fingerprint
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["model"] == {
+        "provider": "openai-api",
+        "default": "openai/gpt-6-luna",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+
+
+def test_memory_era_volume_upgrades_compression_and_model_together(tmp_path):
+    store, seed = make_store(tmp_path), _openrouter_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = seed.legacy_compression_model_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del config["compression"]
+    config["model"] = {
+        "provider": "openai-api",
+        "default": "gpt-5.6-luna",
+        "base_url": "https://api.openai.com/v1",
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    marker = profile_path(store, seed) / "sessions" / "preserved"
+    marker.write_text("keep", encoding="utf-8")
+
+    receipt = store.materialize(seed)
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    assert marker.read_text(encoding="utf-8") == "keep"
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == seed.fingerprint
+    final = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert final["model"]["default"] == "openai/gpt-6-luna"
+    assert final["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+
+
+def test_legacy_memory_and_model_defaults_upgrade_together(tmp_path):
+    store = make_store(tmp_path)
+    legacy_seed = replace(
+        make_seed(),
+        memory_mode=CONTEXT_ONLY_MEMORY_MODE,
+        memory_tool_allowlist=(),
+    )
+    assert store.materialize(legacy_seed).status is ProfileProvisionStatus.CREATED
+    manifest_path = profile_path(store, legacy_seed) / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seed_fingerprint"] = _openrouter_seed().legacy_memory_model_fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    config_path = profile_path(store, legacy_seed) / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del config["compression"]
+    config["model"] = {
+        "provider": "openai-api",
+        "default": "gpt-5.6-luna",
+        "base_url": "https://api.openai.com/v1",
+    }
+    config["memory"] = {
+        "provider": "allies_mnemosyne",
+        "mode": "context_only",
+        "policy_version": "allies-mnemosyne-v1",
+        "tools": [],
+        "profile_isolation": True,
+        "sync_roles": [],
+        "mnemosyne": {
+            "profile_isolation": True,
+            "shared_surface_read": False,
+            "storage": "mnemosyne",
+        },
+    }
+    config_path.write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    receipt = store.materialize(_openrouter_seed())
+
+    assert receipt.status is ProfileProvisionStatus.EXISTING
+    upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert upgraded["seed_fingerprint"] == _openrouter_seed().fingerprint
+    final = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert final["memory"]["mode"] == "narrow_tools"
+    assert final["model"]["default"] == "openai/gpt-6-luna"
+    assert final["compression"] == {
+        "threshold_tokens": profile_store_module.DEFAULT_COMPRESSION_THRESHOLD_TOKENS
+    }
+
+
+def test_replace_legacy_model_config_edge_cases():
+    seed = _openrouter_seed()
+    legacy = (
+        b"model:\n"
+        b"  provider: openai-api\n"
+        b"  default: gpt-5.6-luna\n"
+        b"  base_url: https://api.openai.com/v1\n"
+    )
+    upgraded = _replace_legacy_model_config(legacy, seed)
+    assert yaml.safe_load(upgraded)["model"] == {
+        "provider": "openai-api",
+        "default": "openai/gpt-6-luna",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    already = (
+        b"model:\n"
+        b"  provider: openai-api\n"
+        b"  default: openai/gpt-6-luna\n"
+        b"  base_url: https://openrouter.ai/api/v1\n"
+    )
+    assert yaml.safe_load(_replace_legacy_model_config(already, seed))[
+        "model"
+    ]["default"] == "openai/gpt-6-luna"
+    with pytest.raises(ValueError):
+        _replace_legacy_model_config(
+            b"model:\n  provider: custom\n  default: custom-model\n", seed
+        )
 
 
 def test_legacy_memory_upgrade_also_adds_compression_section(tmp_path):
@@ -1905,3 +2065,33 @@ def test_apply_binding_fails_closed_without_touching_live_files(tmp_path):
         key, generation=3, key_refs={"OPENCODE_ZEN_API_KEY": "vault://tenant/zen"}
     )
     assert incomplete.status is BindingApplyStatus.REPAIR_REQUIRED
+
+
+def test_existing_profile_picks_up_a_rotated_provider_key(tmp_path):
+    secrets = {"vault://tenant/openai": PROFILE_SECRET}
+    store, seed = make_store(tmp_path, resolver=secrets), make_seed()
+    assert store.materialize(seed).status is ProfileProvisionStatus.CREATED
+    env = profile_path(store, seed) / ".env"
+    secrets["vault://tenant/openai"] = "sk-or-rotated-provider-key"
+
+    assert store.materialize(seed).status is ProfileProvisionStatus.EXISTING
+
+    lines = env.read_text(encoding="utf-8").splitlines()
+    assert "OPENAI_API_KEY=sk-or-rotated-provider-key" in lines
+    assert lines[0] == "API_SERVER_KEY=profile-local-key-0123456789"
+    assert env.stat().st_mode & 0o777 == 0o600 or os.name == "nt"
+
+
+def test_bound_profile_env_is_left_to_the_binding(tmp_path):
+    secrets = {"vault://tenant/openai": PROFILE_SECRET}
+    store, seed = make_store(tmp_path, resolver=secrets), make_seed()
+    store.materialize(seed)
+    profile = profile_path(store, seed)
+    (profile / profile_store_module.BINDING_SIDECAR_NAME).write_text(
+        '{"generation": 1}', encoding="utf-8"
+    )
+    before = (profile / ".env").read_bytes()
+    secrets["vault://tenant/openai"] = "sk-or-rotated-provider-key"
+
+    assert store.materialize(seed).status is ProfileProvisionStatus.EXISTING
+    assert (profile / ".env").read_bytes() == before
