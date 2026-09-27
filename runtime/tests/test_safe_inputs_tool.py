@@ -104,3 +104,9 @@ def test_provider_keeps_turn_context_for_reaper_close(turn, monkeypatch):
     routines.context.set(None)  # reaper thread: no turn context
     assert provider.BrowserUseBrowserProvider().close_session("b1") is True
     assert requests[1]["arguments"] == {"action": "close", "session_id": "b1"}
+
+
+def test_pending_without_id_returns_instead_of_polling(turn, monkeypatch):
+    requests = _opener(monkeypatch, [{"status": "pending"}])
+    result = json.loads(safe_inputs.handle_safe_inputs({"action": "request_new"}))
+    assert result["status"] == "pending" and len(requests) == 1

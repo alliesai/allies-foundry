@@ -117,14 +117,19 @@ def handle_safe_inputs(args, **kwargs):
         and result.get("status") == "pending"
     ):
         deadline = time.monotonic() + WAIT_SECONDS
-        while result.get("status") == "pending" and time.monotonic() < deadline:
+        request_id = result.get("request_id")
+        while (
+            request_id
+            and result.get("status") == "pending"
+            and time.monotonic() < deadline
+        ):
             time.sleep(POLL_SECONDS)
             polled = relay(
                 "safe_inputs",
-                {"action": "status", "request_id": result["request_id"]},
+                {"action": "status", "request_id": request_id},
                 uuid4().hex,
             )
-            result = {**polled, "request_id": result["request_id"]}
+            result = {**polled, "request_id": request_id}
         if result.get("status") == "pending":
             result["instruction"] = (
                 "The user has not answered yet. Tell them the request is waiting in "

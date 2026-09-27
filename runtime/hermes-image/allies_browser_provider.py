@@ -36,7 +36,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
 
         current = context.get()
         result = relay("browser", {"action": "open"}, uuid.uuid4().hex, current)
-        if "session_id" not in result:
+        if not result.get("session_id") or not result.get("cdp_url"):
             raise RuntimeError(
                 "Allies browser unavailable: " + str(result.get("error"))
             )
