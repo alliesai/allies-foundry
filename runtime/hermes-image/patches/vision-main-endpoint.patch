@@ -1,0 +1,14 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index d66d5d81ac..9cdcf07b39 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -6760,7 +6760,8 @@ def resolve_vision_provider_client(
+                 rpc_base_url = None
+                 rpc_api_key = None
+                 rpc_api_mode = resolved_api_mode
+-                if main_provider == "custom" or main_provider.startswith("custom:"):
++                # Allies: keep a live base_url (openai-api via OpenRouter) for any provider.
++                if main_provider == "custom" or main_provider.startswith("custom:") or runtime.get("base_url"):
+                     runtime_base_url = runtime.get("base_url")
+                     if runtime_base_url:
+                         rpc_base_url = runtime_base_url

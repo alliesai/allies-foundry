@@ -115,6 +115,14 @@ RUN cd /opt/hermes \
     && git apply --whitespace=nowarn /tmp/allies-approval-flow.patch \
     && rm -f /tmp/allies-approval-flow.patch
 
+# Vision must reuse the live OpenRouter base_url, not openai-api's default endpoint.
+COPY patches/vision-main-endpoint.patch /tmp/allies-vision-main-endpoint.patch
+RUN cd /opt/hermes \
+    && sed -i 's/\r$//' /tmp/allies-vision-main-endpoint.patch \
+    && git apply --check --whitespace=nowarn /tmp/allies-vision-main-endpoint.patch \
+    && git apply --whitespace=nowarn /tmp/allies-vision-main-endpoint.patch \
+    && rm -f /tmp/allies-vision-main-endpoint.patch
+
 # The provider publishes its narrow tool schemas during initialization.  Keep
 # Hermes dispatch in sync with that lifecycle so advertised memory tools route
 # in the active profile instead of falling through as unknown tools.
