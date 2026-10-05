@@ -118,5 +118,8 @@ jobs:
             --file runtime/Dockerfile \
             runtime
 
+      - name: Allow unprivileged user namespaces for bwrap
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Run the complete runtime smoke suite
         run: sh runtime/hermes-image/smoke_release.sh allies/hermes-mnemosyne:ci allies/runtime:ci
