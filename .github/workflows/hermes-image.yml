@@ -25,7 +25,7 @@ permissions:
 jobs:
   validate:
     name: Build and smoke-test runtime pair
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Check out source
